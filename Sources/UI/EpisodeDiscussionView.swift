@@ -18,6 +18,16 @@ struct DiscussionControls: View {
     var vertical = false
     let showComments: () -> Void
 
+    static func countLabel(_ count: Int) -> String {
+        guard count >= 1_000 else { return String(count) }
+        let millions = count >= 1_000_000
+        let divisor = millions ? 1_000_000 : 1_000
+        let whole = count / divisor
+        let tenth = (count % divisor) / (divisor / 10)
+        let number = tenth == 0 ? "\(whole)" : "\(whole).\(tenth)"
+        return number + (millions ? "m" : "k")
+    }
+
     var body: some View {
         let layout = vertical ? AnyLayout(VStackLayout(spacing: 4)) : AnyLayout(HStackLayout(spacing: 2))
         let available = preview?.hasDisplayableComments == true
@@ -36,7 +46,7 @@ struct DiscussionControls: View {
                     .offset(y: count == nil ? 0 : -6)
                     .overlay(alignment: .bottom) {
                         if let count {
-                            Text(count.formatted()).font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                            Text(verbatim: Self.countLabel(count)).font(.system(size: 11, weight: .semibold)).monospacedDigit()
                                 .fixedSize()
                         }
                     }
@@ -62,7 +72,6 @@ extension EnvironmentValues {
 private struct EpisodeDiscussionPresentation: ViewModifier {
     let episode: DiscussionEpisode?
     let player: AVPlayer?
-    let playing: Bool
     let foreground: Bool
     let hideDanmaku: Bool
     @Binding var presented: Bool
@@ -99,7 +108,8 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
         content.environment(\.episodeCommentPreview, preview)
         .overlay(alignment: .top) {
             if enabled, foreground, !hideDanmaku, !presented, let preview, preview.hasDisplayableComments, let player {
-                CommentDanmaku(comments: preview.items, player: player, playing: playing)
+                CommentDanmaku(comments: preview.items, player: player)
+                    .id(episode)
                     .padding(.top, 68)
                     .allowsHitTesting(false).accessibilityHidden(true)
             }
@@ -195,9 +205,9 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
 }
 
 extension View {
-    func episodeDiscussion(_ episode: DiscussionEpisode?, player: AVPlayer?, playing: Bool, foreground: Bool,
+    func episodeDiscussion(_ episode: DiscussionEpisode?, player: AVPlayer?, foreground: Bool,
                            hideDanmaku: Bool = false, presented: Binding<Bool>) -> some View {
-        modifier(EpisodeDiscussionPresentation(episode: episode, player: player, playing: playing,
+        modifier(EpisodeDiscussionPresentation(episode: episode, player: player,
                                                foreground: foreground, hideDanmaku: hideDanmaku, presented: presented))
     }
 }
@@ -205,31 +215,55 @@ extension View {
 private struct CommentDanmaku: View {
     let comments: [EpisodeComment]
     let player: AVPlayer
-    let playing: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var elapsed: TimeInterval = 0
+    @State private var startedAt: TimeInterval?
 
     var body: some View {
-        let lines = comments.map { String($0.singleLineText.prefix(70)) }
-        TimelineView(.animation(minimumInterval: reduceMotion ? 0.5 : 1 / 24, paused: !playing)) { _ in
-            let seconds = player.currentTime().seconds
+        let labels = ForEach(comments) { comment in
+            Text(verbatim: String(comment.singleLineText.prefix(70)))
+                .font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                .fixedSize().shadow(color: .black, radius: 1.5, y: 1)
+                .padding(2).tag(comment.id)
+        }
+        TimelineView(.animation(minimumInterval: reduceMotion ? 0.5 : nil, paused: startedAt == nil)) { _ in
+            let seconds = elapsed + (startedAt.map { CACurrentMediaTime() - $0 } ?? 0)
             Canvas { context, size in
-                guard seconds.isFinite, seconds >= 0, seconds < Double(Int32.max), !lines.isEmpty else { return }
-                let lanes = reduceMotion ? 1 : min(3, lines.count)
-                let spacing = reduceMotion ? 6.0 : 8.4 / Double(lanes)
+                guard !comments.isEmpty else { return }
+                let lanes = reduceMotion ? 1 : min(3, comments.count)
+                let spacing = reduceMotion ? 6.0 : 10.0 / Double(lanes)
                 let latest = Int(seconds / spacing)
                 for index in max(0, latest - lanes + 1)...latest {
-                    let text = lines[index % lines.count]
-                    let label = context.resolve(Text(verbatim: text).font(.subheadline.weight(.semibold)).foregroundStyle(.white))
-                    let width = label.measure(in: CGSize(width: CGFloat.greatestFiniteMagnitude, height: 28)).width
+                    let id = comments[index % comments.count].id
+                    guard let label = context.resolveSymbol(id: id) else { continue }
+                    let width = label.size.width
                     let phase = (seconds - Double(index) * spacing) / (spacing * Double(lanes))
                     let entryX = size.width - min(width, 44)
                     let x = reduceMotion ? 12 : entryX - phase * (entryX + width + 12)
                     let y = CGFloat(index % lanes) * 26
-                    var shadow = context
-                    shadow.addFilter(.shadow(color: .black, radius: 1.5, y: 1))
-                    shadow.draw(label, at: CGPoint(x: x, y: y), anchor: .topLeading)
+                    context.draw(label, at: CGPoint(x: x, y: y), anchor: .topLeading)
                 }
-            }.frame(height: reduceMotion ? 28 : 80).clipped()
+            } symbols: { labels }
+            .frame(height: reduceMotion ? 28 : 80).clipped()
         }
+        .onChange(of: player, initial: true) { _, _ in alignToVideo() }
+        .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemTimeJumped, object: player.currentItem)) { event in
+            if let item = event.object as? AVPlayerItem, item === player.currentItem { alignToVideo() }
+        }
+        .onReceive(player.publisher(for: \.timeControlStatus).removeDuplicates().receive(on: RunLoop.main)) { _ in
+            let now = CACurrentMediaTime()
+            if player.timeControlStatus == .playing {
+                if startedAt == nil { startedAt = now }
+            } else if let start = startedAt {
+                elapsed += now - start
+                startedAt = nil
+            }
+        }
+    }
+
+    private func alignToVideo() {
+        let seconds = player.currentTime().seconds
+        elapsed = seconds.isFinite && seconds >= 0 && seconds < Double(Int32.max) ? seconds : 0
+        startedAt = player.timeControlStatus == .playing ? CACurrentMediaTime() : nil
     }
 }

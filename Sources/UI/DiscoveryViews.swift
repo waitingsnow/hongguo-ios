@@ -217,7 +217,7 @@ private struct ImmersiveFeed: View {
         .playbackDestination($playbackRequest)
         .episodeDiscussion(preview.detail.flatMap { detail in
             detail.episodes.first.map { DiscussionEpisode(seriesID: detail.drama.id, episodeID: $0.id, number: $0.index) }
-        }, player: preview.player, playing: preview.rendered && !preview.paused && !preview.ended,
+        }, player: preview.player,
            foreground: visible && scenePhase == .active && model.playback == nil && detailDrama == nil,
            presented: $commentsVisible)
         .onChange(of: commentsVisible) { _, shown in if !shown && preview.ended { continueAfterPreview() } }

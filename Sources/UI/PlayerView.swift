@@ -196,7 +196,7 @@ struct PlayerScreen: View {
                 }
             }
             .episodeDiscussion(DiscussionEpisode(seriesID: session.detail.drama.id, episodeID: session.episode.id, number: session.episode.index),
-                               player: session.player, playing: session.isPlaying,
+                               player: session.player,
                                foreground: inlineForeground, hideDanmaku: explicitCleanScreen,
                                presented: $commentsVisible)
             .background(InteractiveBackSwipe(enabled: inlineForeground && !landscape && !locked && !sheetVisible

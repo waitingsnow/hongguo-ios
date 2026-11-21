@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum AppSymbol {
-    static func favorite(_ selected: Bool = false) -> String { selected ? "bookmark.fill" : "bookmark" }
+    static func favorite(_ selected: Bool = false) -> String { selected ? "star.fill" : "star" }
     static let history = "clock.arrow.circlepath"
     static let settings = "gearshape"
 }
@@ -16,18 +16,11 @@ struct FollowDramaButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 4) {
-                Image(systemName: selected ? "checkmark" : "plus")
-                Text(selected ? "已追" : "追剧")
-            }
-            .font(.caption.weight(.semibold))
-            .fixedSize()
-            .padding(.horizontal, 9)
-            .padding(.vertical, 6)
-            .foregroundStyle(selected ? Color.white : .black)
-            .background(selected ? Color.black.opacity(0.65) : .white, in: Capsule())
-            .frame(minWidth: 44, minHeight: 44)
-            .contentShape(Rectangle())
+            Image(systemName: AppSymbol.favorite(selected))
+                .font(.system(size: 21, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(selected ? "已追" : "追剧")
