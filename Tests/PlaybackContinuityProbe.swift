@@ -32,18 +32,24 @@ struct PlaybackContinuityProbe {
                                     checkDelayedAdvance: Bool = false,
                                     opened: () -> Int?) async throws {
         try await eventually("active series never queued the next episode with native advance enabled") {
-            player.items().count == 2 && player.actionAtItemEnd == .advance
+            player.items().count == (successor == nil ? 2 : 3) && player.actionAtItemEnd == .advance
         }
+        let before = player.items()
         let previous = session.episode
         let nextIndex = session.index + 1
-        let staged = player.items()[1]
+        let staged = before[1]
+        if let successor {
+            try require(before[2] === successor, "second successor was not in the queue before the boundary")
+        }
+        staged.preferredForwardBufferDuration = 3
         let openCount = opened()
         if checkDelayedAdvance {
             guard let current = player.currentItem else { throw Failure(message: "no current item before delayed advance") }
             let ticket = session.playID
             NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: current)
             try await Task.sleep(for: .milliseconds(500))
-            try require(session.playID == ticket && player.currentItem === current && player.items().last === staged
+            try require(session.playID == ticket && player.currentItem === current
+                        && player.items().map(ObjectIdentifier.init) == before.map(ObjectIdentifier.init)
                         && player.actionAtItemEnd == .advance && player.rate == expectedRate && opened() == openCount,
                         "an early end notification interrupted a healthy queue")
             print("PASS: a healthy staged item survived 500 ms after an early end notification")
@@ -80,6 +86,7 @@ struct PlaybackContinuityProbe {
         }
         try require(pauses.withLock { $0 } == 0, "native transition paused playback")
         try require(player.rate == expectedRate && session.isPlaying, "native transition lost playback speed")
+        try require(staged.preferredForwardBufferDuration == 3, "native transition rewrote the promoted item's buffer duration")
         try require(transitions == 1 && opened() == openCount, "native transition duplicated a switch or reopened an item")
         try require(adoptedWithExpectedQueue, "native handoff did not immediately publish the expected successor and end action")
         try require(savedCompletion, "native transition did not settle the previous episode's progress")
@@ -124,9 +131,10 @@ struct PlaybackContinuityProbe {
         nativePlayer.actionAtItemEnd = .pause
         try await eventually("lookahead did not prepare both frames") {
             queue.update(Array(targets[2...3]), depth: 3)
-            queue.stageNext(targets[2], on: nativePlayer)
-            return PlaybackLookahead.frame(targets[3]) != nil && nativePlayer.items().count == 2
+            return queue.preparedEpisode(for: targets[2]) != nil && PlaybackLookahead.frame(targets[3]) != nil
         }
+        guard let prepared = queue.preparedEpisode(for: targets[2]) else { throw Failure(message: "missing prepared episode") }
+        nativePlayer.insert(prepared.item, after: promoted.item)
         let next = try await queue.claim(targets[2]).value
         try require(nativePlayer.items()[1] === next.item, "native player staged the wrong item")
         nativePlayer.advanceToNextItem()
@@ -185,15 +193,17 @@ struct PlaybackContinuityProbe {
         var pauseEvents = 0
         let pauseObservation = nextSession.didPausePlayback.sink { pauseEvents += 1 }
         defer { pauseObservation.cancel() }
-        try await eventually("second episode never reported playback") { nextSession.isPlaying }
-        nextSession.toggle()
-        try require(pauseEvents == 1 && !nextSession.isPlaying, "explicit foreground pause must reveal the controls")
-        nextSession.toggle()
-        try await eventually("second episode did not resume") { nextSession.isPlaying }
         try await eventually("both successors were not preheated before the native handoff") {
-            queue.update(Array(targets[2...3]), depth: 2)
-            return queue.preparedEpisode(for: targets[3]) != nil
-                && seriesPlayer.items().count == 2 && seriesPlayer.actionAtItemEnd == .advance
+            nextSession.isPlaying && seriesPlayer.items().count == 3 && seriesPlayer.actionAtItemEnd == .advance
+        }
+        let pausedQueue = seriesPlayer.items().map(ObjectIdentifier.init)
+        nextSession.toggle()
+        try require(pauseEvents == 1 && !nextSession.isPlaying && seriesPlayer.actionAtItemEnd == .pause,
+                    "explicit foreground pause must reveal the controls and disarm the queue")
+        nextSession.toggle()
+        try await eventually("second episode did not resume with its original queue") {
+            nextSession.isPlaying && seriesPlayer.actionAtItemEnd == .advance
+                && seriesPlayer.items().map(ObjectIdentifier.init) == pausedQueue
         }
         guard let successor = queue.preparedEpisode(for: targets[3]) else { throw Failure(message: "missing preheated successor") }
         nextSession.lockSpeed()
@@ -210,7 +220,7 @@ struct PlaybackContinuityProbe {
         try await verifyNativeAdvance(nextSession, player: seriesPlayer, expectedRate: 2, successor: nil) { opened[3] }
         try require(endActions.withLock { $0 } == [.pause], "end action must change exactly once, on entry to the last episode")
         endActionObservation.invalidate()
-        print("PASS: two native 2× advances with continuous .advance until the final episode")
+        print("PASS: both successors queued before the boundary, continuous .advance at 2× and buffer settings retained")
         try require(nextSession.speedLocked && pauseEvents == 1, "autoplay changed the speed lock or reported a user pause")
         let lastTicket = nextSession.playID
         let lastItem = seriesPlayer.currentItem
@@ -229,19 +239,23 @@ struct PlaybackContinuityProbe {
         let nextOpenCount = opened[1, default: 0]
         failNextOpen = 1
         fallback.start()
-        try await eventually("fallback session never attempted lookahead") { fallback.rendered && failNextOpen == nil }
+        try await eventually("distant candidate did not prepare after the immediate candidate failed") {
+            fallback.rendered && failNextOpen == nil && queue.preparedEpisode(for: targets[2]) != nil
+        }
         guard let fallbackPlayer = fallback.player as? AVQueuePlayer,
               let first = fallbackPlayer.currentItem else { throw Failure(message: "no fallback player") }
         try require(fallbackPlayer.items().count == 1 && fallbackPlayer.actionAtItemEnd == .pause,
-                    "failed preloading armed an unavailable next item")
+                    "failed preloading armed an unavailable next item or staged a nonconsecutive episode")
         try await seekNearEnd(fallbackPlayer)
         try await eventually("failed lookahead did not fall back to opening the next episode") {
             fallback.index == 1 && fallbackPlayer.currentItem !== first && fallbackPlayer.currentTime().seconds > 0.15
         }
         try require(opened[1] == nextOpenCount + 2, "fallback did not open the next item exactly once after its preload failed")
         try await eventually("fallback session did not stage its next episode") {
-            fallbackPlayer.items().count == 2 && fallbackPlayer.actionAtItemEnd == .advance
+            fallbackPlayer.items().count == 3 && fallbackPlayer.actionAtItemEnd == .advance
         }
+        let manualNext = fallbackPlayer.items()[1]
+        let manualNextOpens = opened[2]
         let timerItem = fallbackPlayer.currentItem
         let timerTicket = fallback.playID
         fallback.stopAtEpisodeEnd()
@@ -257,6 +271,8 @@ struct PlaybackContinuityProbe {
         app.autoNext = true
         fallback.go(to: 2)
         try await eventually("next episode did not start after disabled autoplay") { fallback.rendered && fallback.index == 2 }
+        try require(fallbackPlayer.currentItem === manualNext && opened[2] == manualNextOpens,
+                    "selecting the next item reopened it or used the old tail")
         try await eventually("timer session did not stage its next episode") {
             fallbackPlayer.items().count == 2 && fallbackPlayer.actionAtItemEnd == .advance
         }
@@ -267,6 +283,27 @@ struct PlaybackContinuityProbe {
         try require(fallback.index == 2 && fallbackPlayer.currentItem === stoppedItem && fallbackPlayer.rate == 0,
                     "end-of-episode timer advanced to a queued episode")
         fallback.stop()
-        print("PASS: bounded lookahead, decoded frames, live handoff, manual pause, failed-preload fallback, final episode, disabled autoplay and end-of-episode timer")
+
+        let manual = PlayerSession(request: fallbackRequest, app: app)
+        manual.start()
+        try await eventually("manual session never queued two successors") {
+            (manual.player as? AVQueuePlayer)?.items().count == 3
+        }
+        guard let manualPlayer = manual.player as? AVQueuePlayer else { throw Failure(message: "missing manual queue") }
+        let originalItems = manualPlayer.items()
+        let secondNextOpens = opened[2]
+        manual.go(to: 2)
+        try await eventually("direct selection of the second successor did not play") { manual.index == 2 && manual.rendered }
+        try require(manualPlayer.currentItem === originalItems[2] && opened[2] == secondNextOpens,
+                    "direct selection reopened or skipped the prepared item")
+        try require(!manualPlayer.items().contains { $0 === originalItems[1] },
+                    "the stale predecessor remained in the queue after direct selection")
+        try await eventually("manual session did not queue the final episode") { manualPlayer.items().count == 2 }
+        manual.setSleepTimer(minutes: 0)
+        try require(manual.pausedBySleepTimer && manualPlayer.rate == 0 && manualPlayer.items().count == 1
+                    && manualPlayer.actionAtItemEnd == .pause, "immediate timer left pending playback")
+        manual.stop()
+        try require(manualPlayer.items().isEmpty, "stopping the session left items attached")
+        print("PASS: bounded lookahead, live handoff, manual selection, failed-preload fallback, last episode, disabled autoplay and timers")
     }
 }

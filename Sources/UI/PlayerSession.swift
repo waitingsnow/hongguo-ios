@@ -57,7 +57,11 @@ final class PlayerSession: ObservableObject {
     private var currentEpisode: OpenEpisode?
     private var currentStream: ProgressivePlayback? { currentEpisode?.stream }
     var currentPlaybackItem: AVPlayerItem? { currentEpisode?.item }
-    private var stagedEpisode: OpenEpisode?
+    private var stagedEpisodes: [OpenEpisode] = [] {
+        didSet {
+            if oldValue.first !== stagedEpisodes.first { observeStagedHead() }
+        }
+    }
     private var stagedItemObservation: NSKeyValueObservation?
     private var pendingItemEnd: UUID?
     /// The previous episode's stream stays open until the next item replaces it, so the layer never shows an empty player.
@@ -193,8 +197,7 @@ final class PlayerSession: ObservableObject {
         handoff?.live?.player.pause()
         pause()
         buffering = false
-        if let queue = player as? AVQueuePlayer { lookahead.stageNext(nil, on: queue) }
-        setStagedEpisode(nil)
+        clearStagedEpisodes()
         lookahead.clear()
         finishPendingItemEnd()
         endMessage = "定时结束，已暂停播放"
@@ -204,16 +207,17 @@ final class PlayerSession: ObservableObject {
     func load(index target: Int, startAt: Double? = nil, recovering: Bool = false) {
         guard detail.episodes.indices.contains(target), !stopped, !pauseIfSleepTimerExpired(), !pausedBySleepTimer else { return }
         adoptQueuedEpisodeIfNeeded()
-        if target != index, stopsAtEpisodeEnd { clearSleepTimer() }
         cancelSeasonAdvance()
         if !recovering { saveProgress(flush: true) }
         requestTask?.cancel()
         let nextEpisode = detail.episodes[target]
         let chosen = app.quality
         let destination = PlaybackTarget(detail, index: target, quality: chosen)
+        let queuedNext = target == index + 1 && chosen == quality ? stagedEpisodes.first?.item : nil
         let opening = lookahead.claim(destination)
         transitionFrame = PlaybackLookahead.frame(destination)
-        detachItem()
+        detachItem(keeping: queuedNext)
+        if target != index, stopsAtEpisodeEnd { clearSleepTimer() }
         pausedByRequest = false
         if !recovering { recoveries = 0 }
         index = target; playID = UUID(); quality = chosen
@@ -313,11 +317,10 @@ final class PlayerSession: ObservableObject {
             if let queue = player as? AVQueuePlayer, queue.items().dropFirst().first === item {
                 queue.advanceToNextItem()
             } else {
-                if let queue = player as? AVQueuePlayer { lookahead.stageNext(nil, on: queue) }
+                clearStagedEpisodes()
                 player.replaceCurrentItem(with: item)
             }
         }
-        item.preferredForwardBufferDuration = 0
         retiringEpisode = nil
         player.defaultRate = playbackSpeed
         if startAt > 0.5 && !continuing {
@@ -349,7 +352,7 @@ final class PlayerSession: ObservableObject {
     }
 
     private func tick() {
-        adoptQueuedEpisodeIfNeeded()
+        let didAdvance = adoptQueuedEpisodeIfNeeded()
         finishPendingItemEnd()
         guard let player, let item = currentPlaybackItem, player.currentItem === item,
               !stopped, !preparing, !finished else { return }
@@ -361,7 +364,7 @@ final class PlayerSession: ObservableObject {
         // The layer reports its first frame; time moving forward is the backup for a swapped item that kept it set.
         if !rendered, player.timeControlStatus == .playing, now.isFinite, now > startPosition + 0.2 { firstFrame(ticket: playID) }
         if Date().timeIntervalSince(lastSave) > 5 { saveProgress() }
-        prepareUpcomingIfReady()
+        if !didAdvance { prepareUpcomingIfReady() }
     }
 
     /// A failed item reloads from where it was, quietly, a couple of times before the error is shown.
@@ -386,6 +389,7 @@ final class PlayerSession: ObservableObject {
         } else if shouldResume, resumeAfterInterruption, !finished, error == nil {
             resumeAfterInterruption = false
             pausedByRequest = false
+            updateEndAction(autoNext: app.autoNext)
             currentStream?.resume(); player?.playImmediately(atRate: playbackSpeed)
         }
     }
@@ -422,6 +426,7 @@ final class PlayerSession: ObservableObject {
                 retry()
             } else {
                 pausedByRequest = false
+                updateEndAction(autoNext: app.autoNext)
                 currentStream?.resume(); player?.playImmediately(atRate: playbackSpeed)
             }
         } else if finished {
@@ -431,12 +436,14 @@ final class PlayerSession: ObservableObject {
             didPausePlayback.send()
         } else {
             pausedByRequest = false
+            updateEndAction(autoNext: app.autoNext)
             endHold(); endMessage = nil; currentStream?.resume(); player?.playImmediately(atRate: playbackSpeed)
         }
     }
     func pause() {
         adoptQueuedEpisodeIfNeeded()
         pausedByRequest = true
+        updateEndAction(autoNext: app.autoNext)
         endHold(); player?.pause(); currentStream?.pause(); lookahead.pause(); isPlaying = false; saveProgress(flush: true)
     }
     /// A drag across the full width moves through the whole episode, or through this much of a longer one.
@@ -531,8 +538,7 @@ final class PlayerSession: ObservableObject {
     func suspend() {
         guard !stopped, !pauseIfSleepTimerExpired(), !pausedBySleepTimer else { return }
         pause()
-        if let queue = player as? AVQueuePlayer { lookahead.stageNext(nil, on: queue) }
-        setStagedEpisode(nil)
+        clearStagedEpisodes()
         updateEndAction(autoNext: app.autoNext)
         lookahead.clear()
         finishPendingItemEnd()
@@ -558,23 +564,23 @@ final class PlayerSession: ObservableObject {
 
     @discardableResult
     private func adoptQueuedEpisodeIfNeeded() -> Bool {
-        guard let player = player as? AVQueuePlayer, let next = stagedEpisode, player.currentItem === next.item,
-              detail.episodes.indices.contains(index + 1), !stopped, !preparing, !finished else { return false }
-        let target = PlaybackTarget(detail, index: index + 1, quality: quality)
+        guard let player = player as? AVQueuePlayer, let item = player.currentItem, !stopped, !preparing, !finished,
+              let offset = stagedEpisodes.firstIndex(where: { $0.item === item }) else { return false }
+        let next = stagedEpisodes[offset]
+        let nextIndex = index + offset + 1
         pendingItemEnd = nil
-        lookahead.consumePrepared(next, for: target)
-        let successor = detail.episodes.indices.contains(target.index + 1)
-            ? PlaybackTarget(detail, index: target.index + 1, quality: quality) : nil
-        let staged = lookahead.stageNext(successor, on: player)
-        setStagedEpisode(staged)
+        for (distance, episode) in stagedEpisodes.prefix(offset + 1).enumerated() {
+            lookahead.consumePrepared(episode, for: PlaybackTarget(detail, index: index + distance + 1, quality: quality))
+        }
+        stagedEpisodes.removeFirst(offset + 1)
         updateEndAction(autoNext: app.autoNext)
-        trace("native-advance nextSize=\(next.item.presentationSize) nextDuration=\(next.item.duration.seconds) successorPrepared=\(successor.flatMap { lookahead.preparedEpisode(for: $0) } != nil) successorStaged=\(staged != nil) successorStatus=\(staged.map { String($0.item.status.rawValue) } ?? "none")")
+        let successor = stagedEpisodes.first?.item
+        trace("native-advance target=\(nextIndex + 1) nextSize=\(item.presentationSize) nextDuration=\(item.duration.seconds) successorStaged=\(successor != nil) successorStatus=\(successor.map { String($0.status.rawValue) } ?? "none")")
         recordCompletion()
         removeItemObservers()
         frameTask?.cancel(); frameTask = nil
         endHold()
         currentEpisode = next
-        next.item.preferredForwardBufferDuration = 0
         transitionFrame = nil; rendered = false; scrubbing = false
         let now = player.currentTime().seconds
         position = now.isFinite ? max(0, now) : 0
@@ -582,8 +588,8 @@ final class PlayerSession: ObservableObject {
         error = nil; endMessage = nil; recoveries = 0
         isPlaying = player.timeControlStatus == .playing
         buffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
-        index = target.index; playID = UUID()
-        observeItem(next.item, ticket: playID)
+        index = nextIndex; playID = UUID()
+        observeItem(item, ticket: playID)
         return true
     }
 
@@ -597,7 +603,7 @@ final class PlayerSession: ObservableObject {
         guard let ticket = pendingItemEnd, playID == ticket, !stopped, !finished,
               !adoptQueuedEpisodeIfNeeded() else { return }
         if let queue = player as? AVQueuePlayer, queue.actionAtItemEnd == .advance,
-           let next = stagedEpisode?.item, next.status != .failed,
+           let next = stagedEpisodes.first?.item, next.status != .failed,
            queue.items().contains(where: { $0 === next }) { return }
         guard !adoptQueuedEpisodeIfNeeded() else { return }
         trace("finish-without-advance autoNext=\(app.autoNext) stoppedByUser=\(pausedByRequest)")
@@ -647,31 +653,42 @@ final class PlayerSession: ObservableObject {
     /// A few seconds into an episode, the next one is opened and its start downloaded (the whole episode when
     /// 下一集整集预加载 is on), so autoplay, a swipe or the next button start it without waiting.
     private func prepareUpcomingIfReady() {
-        adoptQueuedEpisodeIfNeeded()
+        guard !adoptQueuedEpisodeIfNeeded() else { return }
         guard rendered, !stopped, !pausedBySleepTimer, !scrubbing, let player else { lookahead.pause(); return }
         let targets = detail.episodes.indices.dropFirst(index + 1).prefix(2).map { PlaybackTarget(detail, index: $0, quality: quality) }
         let depth = PlaybackLookahead.depth(player: player, speed: player.rate)
         lookahead.update(targets, depth: depth, wholeFirst: app.preloadNext)
-        if let queue = player as? AVQueuePlayer, !finished, player.timeControlStatus != .paused,
-           player.currentItem === currentPlaybackItem {
-            let next = lookahead.stageNext(targets.first, on: queue)
-            guard !adoptQueuedEpisodeIfNeeded() else { return }
-            setStagedEpisode(next)
-            updateEndAction(autoNext: app.autoNext)
+        guard let queue = player as? AVQueuePlayer, let current = currentPlaybackItem,
+              !finished, error == nil, !pausedByRequest, player.timeControlStatus == .playing else { return }
+        var predecessor = stagedEpisodes.last?.item ?? current
+        for target in targets.dropFirst(stagedEpisodes.count) {
+            if !stagedEpisodes.isEmpty {
+                let remaining = current.duration.seconds - player.currentTime().seconds
+                guard depth > 0, remaining > 0.5 * Double(max(1, player.rate)) else { break }
+            }
+            guard predecessor.status != .failed, let prepared = lookahead.preparedEpisode(for: target),
+                  queue.canInsert(prepared.item, after: predecessor), queue.currentItem === current else { break }
+            queue.insert(prepared.item, after: predecessor)
+            stagedEpisodes.append(prepared)
+            predecessor = prepared.item
+            trace("staged target=\(target.index + 1) itemDuration=\(predecessor.duration.seconds)")
         }
+        guard !adoptQueuedEpisodeIfNeeded() else { return }
+        updateEndAction(autoNext: app.autoNext)
     }
 
-    private func setStagedEpisode(_ episode: OpenEpisode?) {
-        guard stagedEpisode !== episode else { return }
-        stagedEpisode = episode
-        if let episode {
-            trace("staged itemDuration=\(episode.item.duration.seconds)")
-        } else {
-            trace("unstaged")
+    private func clearStagedEpisodes(keeping next: AVPlayerItem? = nil) {
+        if let queue = player as? AVQueuePlayer {
+            for item in queue.items().dropFirst() where item !== next { queue.remove(item) }
         }
-        stagedItemObservation = episode?.item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+        stagedEpisodes.removeAll()
+    }
+
+    private func observeStagedHead() {
+        stagedItemObservation = stagedEpisodes.first?.item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor in
-                guard let self, self.stagedEpisode?.item === item, item.status == .failed else { return }
+                guard let self, self.stagedEpisodes.first?.item === item, item.status == .failed else { return }
+                guard !self.adoptQueuedEpisodeIfNeeded() else { return }
                 self.updateEndAction(autoNext: self.app.autoNext)
                 self.finishPendingItemEnd()
             }
@@ -680,8 +697,9 @@ final class PlayerSession: ObservableObject {
 
     private func updateEndAction(autoNext: Bool) {
         guard let player else { return }
-        let shouldAdvance = autoNext && stagedEpisode != nil && stagedEpisode?.item.status != .failed
-            && !stopsAtEpisodeEnd && !pausedBySleepTimer
+        let next = stagedEpisodes.first?.item
+        let shouldAdvance = autoNext && next != nil && next?.status != .failed
+            && !stopsAtEpisodeEnd && !pausedBySleepTimer && !pausedByRequest
             && (sleepDeadline.map { sleepClock.now < $0 } ?? true)
             && !stopped && !finished && error == nil
         setEndAction(shouldAdvance ? .advance : .pause, on: player)
@@ -707,11 +725,11 @@ final class PlayerSession: ObservableObject {
     }
 
     /// Lets go of the current item's observers and keeps the player and its last picture until the next item arrives.
-    private func detachItem() {
+    private func detachItem(keeping next: AVPlayerItem? = nil) {
         pendingItemEnd = nil
-        setStagedEpisode(nil)
-        updateEndAction(autoNext: app.autoNext)
+        if let player { setEndAction(.pause, on: player) }
         endHold(); player?.pause()
+        clearStagedEpisodes(keeping: next)
         removeItemObservers()
         isPlaying = false; buffering = false
         if let currentEpisode {

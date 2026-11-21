@@ -167,24 +167,9 @@ final class PlaybackLookahead {
         return episode
     }
 
-    @discardableResult
-    func stageNext(_ target: PlaybackTarget?, on player: AVQueuePlayer) -> OpenEpisode? {
-        let episode = target.flatMap { preparedEpisode(for: $0) }
-        let next = episode?.item
-        let queued = player.items().dropFirst()
-        if let next, player.currentItem === next || queued.first === next { return episode }
-        for item in queued { player.remove(item) }
-        if let next, let current = player.currentItem, current !== next, player.canInsert(next, after: current) {
-            next.preferredForwardBufferDuration = 2
-            player.insert(next, after: current)
-            return episode
-        }
-        return nil
-    }
-
     func consumePrepared(_ episode: OpenEpisode, for target: PlaybackTarget) {
         guard slots[target.key]?.preparedEpisode === episode else { return }
-        _ = claim(target)
+        slots.removeValue(forKey: target.key)
     }
 
     func update(_ targets: [PlaybackTarget], depth: Int, wholeFirst: Bool = false) {

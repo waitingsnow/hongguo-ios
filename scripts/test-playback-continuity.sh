@@ -13,7 +13,7 @@ trap 'rm -r "$scratch"' EXIT
 xcodebuild -project Hongguo-QA.xcodeproj -scheme HongguoQA -configuration Debug \
     -destination "platform=iOS Simulator,id=$1" -derivedDataPath "$derived" \
     -clonedSourcePackagesDirPath "$packages" build-for-testing -quiet
-ffmpeg -v error -f lavfi -i testsrc2=size=320x180:rate=24 -t 8 -an -c:v libx264 \
+ffmpeg -v error -f lavfi -i testsrc2=size=320x180:rate=24 -t 14 -an -c:v libx264 \
     -pix_fmt yuv420p -movflags +faststart "$scratch/fixture.mp4"
 sdk="$(xcrun --sdk iphonesimulator --show-sdk-path)"
 xcrun --sdk iphonesimulator swiftc -parse-as-library -target "$(uname -m)-apple-ios17.0-simulator" \
