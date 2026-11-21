@@ -68,6 +68,7 @@ struct PlaybackRequest: Identifiable {
     let position: Double
     let recordsLocalHistory: Bool
     var handoff: FeedHandoff? = nil
+    var sleepDeadline: ContinuousClock.Instant? = nil
 }
 
 @MainActor
@@ -93,6 +94,7 @@ final class AppModel: ObservableObject {
     @Published var openingDramaID: String?
     @Published var openError: String?
     private var openTask: Task<Void, Never>?
+    private var openID: UUID?
     let library = LibraryStore.shared
     var currentMode: AppearanceMode { appearanceMode ?? (theme.defaultDark ? .dark : .light) }
     private var modeDark: Bool {
@@ -135,14 +137,14 @@ final class AppModel: ObservableObject {
         quality = defaults.string(forKey: "quality").flatMap(VideoQuality.init) ?? .p1080
     }
 
-    func play(_ detail: DramaDetail, index: Int? = nil, resume: LibraryEntry? = nil) {
+    func play(_ detail: DramaDetail, index: Int? = nil, resume: LibraryEntry? = nil, sleepDeadline: ContinuousClock.Instant? = nil) {
         guard !detail.episodes.isEmpty else { openError = "这部剧暂时没有可播放剧集。"; return }
         DramaDetails.remember(detail)
         let entry = resume ?? latestProgress(for: detail.drama.id)
         let selected = index ?? entry.flatMap { entry in detail.episodes.firstIndex { $0.id == entry.episodeID } ?? detail.episodes.firstIndex { $0.index == entry.episodeIndex } } ?? 0
         let bounded = min(max(selected, 0), detail.episodes.count - 1)
         let savedPosition = entry.map { ($0.episodeID == detail.episodes[bounded].id || $0.episodeIndex == detail.episodes[bounded].index) ? $0.position : 0 } ?? 0
-        playback = PlaybackRequest(detail: detail, index: bounded, position: savedPosition, recordsLocalHistory: resume == nil)
+        playback = PlaybackRequest(detail: detail, index: bounded, position: savedPosition, recordsLocalHistory: resume == nil, sleepDeadline: sleepDeadline)
     }
 
     /// Where this drama was left: this device's history or the account's, whichever was watched more recently, so
@@ -155,20 +157,37 @@ final class AppModel: ObservableObject {
     }
 
     func play(_ drama: Drama) {
+        openPlayback(drama)
+    }
+
+    @discardableResult
+    func openPlayback(_ drama: Drama, canPresent: @escaping @MainActor () -> Bool = { true },
+                      sleepDeadline: @escaping @MainActor () -> ContinuousClock.Instant? = { nil }) -> Task<Void, Never> {
         openTask?.cancel()
+        let ticket = UUID()
+        openID = ticket
         openingDramaID = drama.id
-        openTask = Task { [weak self] in
+        let task = Task { [weak self] in
+            defer {
+                if let self, self.openID == ticket {
+                    self.openID = nil
+                    self.openingDramaID = nil
+                }
+            }
             do {
                 async let progress: Void = AccountService.shared.refreshProgress()
                 let detail = try await DramaDetails.load(drama)
                 await progress
                 try Task.checkCancellation()
-                guard let self else { return }
-                self.openingDramaID = nil
-                self.play(detail)
+                guard let self, self.openID == ticket, canPresent() else { return }
+                self.play(detail, sleepDeadline: sleepDeadline())
             } catch is CancellationError { }
-            catch { self?.openingDramaID = nil; self?.openError = friendlyError(error) }
+            catch {
+                if let self, self.openID == ticket, !Task.isCancelled, canPresent() { self.openError = friendlyError(error) }
+            }
         }
+        openTask = task
+        return task
     }
 }
 

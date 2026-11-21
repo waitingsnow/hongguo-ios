@@ -1,5 +1,26 @@
 import SwiftUI
 
+struct PlaybackEpisodeStrip: View {
+    let title: String
+    let detail: String
+    var symbol = "rectangle.stack"
+    var chevron = "chevron.up"
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol).font(.subheadline.weight(.medium))
+            Text(title).font(.subheadline.weight(.semibold)).lineLimit(1)
+            Spacer(minLength: 6)
+            Text(detail).font(.footnote).foregroundStyle(.white.opacity(0.74))
+                .fixedSize(horizontal: true, vertical: false)
+            Image(systemName: chevron).font(.caption.weight(.semibold))
+        }
+        .foregroundStyle(.white).padding(.horizontal, 14).frame(minHeight: 44)
+        .background(.white.opacity(0.13), in: RoundedRectangle(cornerRadius: 10))
+        .contentShape(Rectangle())
+    }
+}
+
 struct PosterView: View {
     let drama: Drama
     var ratio: CGFloat = 0.72

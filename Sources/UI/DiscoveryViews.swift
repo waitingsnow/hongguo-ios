@@ -277,6 +277,7 @@ private struct ImmersiveFeed: View {
             NavigationLink { SearchView() } label: { Image(systemName: "magnifyingglass").font(.system(size: 18, weight: .semibold)).frame(width: 44, height: 44) }
                 .accessibilityLabel("搜索")
         }.foregroundStyle(.white).padding(.horizontal, 8).padding(.top, 2)
+            .shadow(color: .black.opacity(0.85), radius: 3, y: 1)
     }
 
     @ViewBuilder private var placeholder: some View {
@@ -353,79 +354,88 @@ private struct ImmersivePage: View {
                         .frame(height: min(380, page.size.height * 0.68))
                 }
             }.allowsHitTesting(false)
-            VStack(alignment: .leading, spacing: 8) {
-                Button(action: openDetails) {
-                    HStack(spacing: 7) {
-                        Text(drama.title).font(.system(size: 20, weight: .bold)).foregroundStyle(.white).lineLimit(2)
-                        Image(systemName: "chevron.right").font(.caption2.weight(.semibold)).foregroundStyle(.white.opacity(0.72))
-                            .accessibilityHidden(true)
-                    }.multilineTextAlignment(.leading).frame(minHeight: 44).contentShape(Rectangle())
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .bottom, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        titleButton
+                        if roomy && !drama.summary.isEmpty {
+                            Text(drama.summary).font(.footnote).foregroundStyle(.white.opacity(0.8)).lineLimit(2)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(spacing: 4) {
+                        favoriteButton
+                        if activeDetail != nil { DiscussionControls(vertical: true, showComments: openComments) }
+                    }.shadow(color: .black.opacity(0.8), radius: 2, y: 1)
                 }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("immersive_title_\(index)")
-                .accessibilityHint("打开剧集详情")
-                let episodeInfo = [active && preview.player != nil ? "第 1 集" : nil, drama.episodeCount > 0 ? "全 \(drama.episodeCount) 集" : nil].compactMap { $0 }
-                if !episodeInfo.isEmpty {
-                    Text(episodeInfo.joined(separator: " · ")).font(.footnote).foregroundStyle(.white.opacity(0.8))
-                }
-                if roomy && !drama.summary.isEmpty { Text(drama.summary).font(.footnote).foregroundStyle(.white.opacity(0.82)).lineLimit(2) }
-                HStack(spacing: 8) {
-                    playButton
-                    favoriteButton
-                    Spacer(minLength: 2)
-                    if active, preview.detail != nil { DiscussionControls(showComments: openComments) }
-                }
+                episodeStrip
             }.padding(.leading, 16 + insets.leading).padding(.trailing, 16 + insets.trailing).padding(.bottom, 12 + insets.bottom)
         }
     }
 
     private var active: Bool { preview.dramaID == drama.id }
-    private var continueEpisode: Episode? { active && preview.ended ? preview.detail?.episodes.dropFirst().first : nil }
+    private var activeDetail: DramaDetail? { active ? preview.detail : nil }
+    private var continueEpisode: Episode? { preview.ended ? activeDetail?.episodes.dropFirst().first : nil }
 
-    private var playButton: some View {
-        let next = continueEpisode
-        let symbol = next == nil ? "play.fill" : "forward.end.fill"
-        return Button { playFull() } label: {
-            HStack(spacing: 6) {
-                Group {
-                    if model.openingDramaID == drama.id || (active && preview.awaitingHandoff) {
-                        DelayedPlaybackLoading {
-                            ProgressView().controlSize(.small).tint(.white)
-                        } fallback: {
-                            Image(systemName: symbol)
-                        }
-                    } else {
-                        Image(systemName: symbol)
-                    }
+    private var titleButton: some View {
+        let currentEpisode = "第 \(activeDetail?.episodes.first?.index ?? 1) 集"
+        return Button(action: openDetails) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(drama.title).font(.title3.weight(.semibold)).lineLimit(2)
+                    Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.white.opacity(0.7))
                 }
-                .frame(width: 18, height: 18)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-                Text(next.map { "继续播放 · 第 \($0.index) 集" } ?? "立即播放").lineLimit(1)
+                Text(currentEpisode).font(.footnote).foregroundStyle(.white.opacity(0.74))
             }
-            .font(.subheadline.weight(.semibold))
+            .multilineTextAlignment(.leading)
             .foregroundStyle(.white)
-            .padding(.horizontal, 12)
-            .frame(height: 32)
-            .background(next == nil ? Color.white.opacity(0.16) : Color(hex: 0xC94426), in: Capsule())
-            .frame(minHeight: 44)
+            .frame(minWidth: 44, minHeight: 44, alignment: .leading)
             .contentShape(Rectangle())
-        }.buttonStyle(.plain).accessibilityIdentifier("immersive_play_\(index)")
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(drama.title)
+        .accessibilityValue(currentEpisode)
+        .accessibilityHint("打开剧集详情")
+        .accessibilityIdentifier("immersive_title_\(index)")
+    }
+
+    private var episodeStrip: some View {
+        let episodeCount = activeDetail.map { $0.episodes.count } ?? drama.episodeCount
+        let total = episodeCount > 0 ? "全 \(episodeCount) 集" : ""
+        let title = continueEpisode.map { "继续播放 · 第 \($0.index) 集" } ?? "看全集"
+        let strip = PlaybackEpisodeStrip(title: title, detail: total, chevron: "chevron.right")
+        return Button(action: playFull) {
+            if model.openingDramaID == drama.id || (active && preview.awaitingHandoff) {
+                DelayedPlaybackLoading {
+                    PlaybackEpisodeStrip(title: "正在打开…", detail: total, symbol: "hourglass", chevron: "chevron.right")
+                } fallback: {
+                    strip
+                }
+            } else {
+                strip
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityValue(total)
+        .accessibilityHint("进入播放器，可在播放器选集")
+        .accessibilityIdentifier("immersive_play_\(index)")
     }
 
     private var favoriteButton: some View {
         let favorite = library.isFavorite(drama)
         return Button { library.toggleFavorite(drama) } label: {
-            Label(favorite ? "已追" : "追剧", systemImage: favorite ? "star.fill" : "star")
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(favorite ? Color(hex: 0xFFC56B) : .white)
-                .lineLimit(1)
-                .frame(minWidth: 44, minHeight: 44)
+            Image(systemName: favorite ? "star.fill" : "star")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
-        }.buttonStyle(.plain).accessibilityIdentifier("immersive_favorite_\(index)")
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(favorite ? "已追" : "追剧")
+        .accessibilityHint(favorite ? "取消本机收藏" : "添加本机收藏")
+        .accessibilityIdentifier("immersive_favorite_\(index)")
     }
 
-    /// 立即播放 continues the preview in the full player from where it is; after episode 1 ends, 继续播放 opens episode 2.
     private func playFull() {
         let continuing = continueEpisode != nil
         if active, !preview.failed, continuing || !preview.ended {

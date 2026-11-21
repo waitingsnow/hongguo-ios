@@ -57,6 +57,7 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
     let player: AVPlayer?
     let playing: Bool
     let foreground: Bool
+    let hideDanmaku: Bool
     @Binding var presented: Bool
     @AppStorage("playback.commentDanmaku") private var enabled = false
     @State private var loadedEpisode: DiscussionEpisode?
@@ -77,7 +78,7 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
     func body(content: Content) -> some View {
         content.environment(\.episodeCommentCount, loadedEpisode == episode && loadedEpisode != nil && failure == nil && !previewUnavailable ? (totalCount ?? comments.count) : nil)
         .overlay(alignment: .top) {
-            if enabled, foreground, !presented, loadedEpisode == episode, !comments.isEmpty, let player {
+            if enabled, foreground, !hideDanmaku, !presented, loadedEpisode == episode, !comments.isEmpty, let player {
                 CommentDanmaku(comments: comments, player: player, playing: playing)
                     .padding(.top, 68)
                     .allowsHitTesting(false).accessibilityHidden(true)
@@ -155,9 +156,9 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
 
 extension View {
     func episodeDiscussion(_ episode: DiscussionEpisode?, player: AVPlayer?, playing: Bool, foreground: Bool,
-                           presented: Binding<Bool>) -> some View {
+                           hideDanmaku: Bool = false, presented: Binding<Bool>) -> some View {
         modifier(EpisodeDiscussionPresentation(episode: episode, player: player, playing: playing,
-                                               foreground: foreground, presented: presented))
+                                               foreground: foreground, hideDanmaku: hideDanmaku, presented: presented))
     }
 }
 
