@@ -242,7 +242,8 @@ actor DramaAPI {
         throw failure
     }
 
-    func track(episodeID: String) async throws -> VideoTrack {
+    /// `quality`: the highest row at or below that size is preferred, falling back to the nearest available one.
+    func track(episodeID: String, quality: VideoQuality? = nil) async throws -> VideoTrack {
         guard ProtocolJSON.identifier(episodeID) != nil else { throw HGError.message("分集编号无效") }
         // device_level=3 makes the server ship some episodes' 360P–720P as undecodable bytevc2, leaving only
         // 1080P; level 1 serves normal episodes the same ladder (synchronized from hongguoTV 0.1.12).
@@ -259,31 +260,31 @@ actor DramaAPI {
             },
             use: { [self] model in
                 guard !model.isEmpty else { throw HGError.message("服务暂未返回当前分集片源") }
-                return try await modelTrack(model)
+                return try await modelTrack(model, quality: quality)
             })
     }
 
     /// Picks a track from a playback model. Inline rows with neither a key nor a declared encryption state may use the
     /// model's fallback_api, whose answer must separately match id, full duration, quality and encryption
     /// (synchronized from hongguo-drama 5.5).
-    func modelTrack(_ model: [String: Any], readFallback: (@Sendable (String) async throws -> [String: Any])? = nil) async throws -> VideoTrack {
+    func modelTrack(_ model: [String: Any], quality: VideoQuality? = nil, readFallback: (@Sendable (String) async throws -> [String: Any])? = nil) async throws -> VideoTrack {
         let read: @Sendable (String) async throws -> [String: Any] = readFallback ?? { [self] in try await request(url: try await checkedFallback($0), body: nil, headers: ["User-Agent":PlaybackRegistration.userAgent]) }
         let address = fallbackURL(model["fallback_api"])
         let inlineRows = (model["video_list"] as? [Any])?.count ?? (model["video_list"] as? [String: Any])?.count ?? 0
         guard inlineRows > 0 else {
-            return try await fallbackTrack(try fallbackInfo(try await read(address)), address: address, read: read)
+            return try await fallbackTrack(try fallbackInfo(try await read(address)), address: address, quality: quality, read: read)
         }
         do {
-            return try selectTrack(model, requireEncryption: true, minimumPixels: 0)
+            return try selectTrack(model, requireEncryption: true, minimumPixels: 0, quality: quality)
         } catch let onlyByteVC2 as ByteVC2Only {
             // Inline rows are all ByteVC2: the fallback model, and its compatibility request, may still carry HEVC.
             guard !address.isEmpty else { throw onlyByteVC2 }
             let info = try fallbackInfo(try await read(address))
             try Self.confirmSameVideo(model, info)
-            return try await fallbackTrack(info, address: address, read: read)
+            return try await fallbackTrack(info, address: address, quality: quality, read: read)
         } catch let incomplete as IncompleteEncryption {
             do {
-                return try await verifiedFallback(model, address: address, incomplete: incomplete, read: read)
+                return try await verifiedFallback(model, address: address, incomplete: incomplete, quality: quality, read: read)
             } catch is CancellationError { throw CancellationError()
             } catch {
                 try Task.checkCancellation()
@@ -291,14 +292,14 @@ actor DramaAPI {
                 // for episodes whose media is plain hvc1. When no fallback confirms a source, those undeclared rows play as
                 // plain; ProgressiveSource and MP4Processor.validate(requirePlain:) refuse an index with encv/enca/sinf/senc.
                 // Rows that declare encryption but lack spade_a are still refused.
-                if let plain = try? selectTrack(model, requireEncryption: true, minimumPixels: 0, acceptUndeclared: true) { return plain }
+                if let plain = try? selectTrack(model, requireEncryption: true, minimumPixels: 0, quality: quality, acceptUndeclared: true) { return plain }
                 throw error
             }
         }
     }
 
     /// A fallback for inline rows without encryption metadata must match the model's id, full duration and quality.
-    private func verifiedFallback(_ model: [String: Any], address: String, incomplete: IncompleteEncryption,
+    private func verifiedFallback(_ model: [String: Any], address: String, incomplete: IncompleteEncryption, quality: VideoQuality?,
                                   read: @Sendable (String) async throws -> [String: Any]) async throws -> VideoTrack {
         let id = ProtocolJSON.text(model["video_id"]).trimmingCharacters(in: .whitespacesAndNewlines), duration = Double(ProtocolJSON.text(model["video_duration"])) ?? 0
         guard !id.isEmpty, duration > 0, incomplete.minimumPixels > 0, !address.isEmpty else { throw incomplete }
@@ -306,7 +307,7 @@ actor DramaAPI {
         guard ProtocolJSON.text(info["video_id"]) == id, other > 0, abs(other - duration) <= 0.5 else {
             throw HGError.message("备用片源编号或完整时长无法确认，已停止取址")
         }
-        return try selectTrack(info, requireEncryption: true, minimumPixels: incomplete.minimumPixels)
+        return try selectTrack(info, requireEncryption: true, minimumPixels: incomplete.minimumPixels, quality: quality)
     }
 
     private func checkedFallback(_ address: String) throws -> URL { try checkedURL(address, domains: ["fqnovel.com","snssdk.com"]) }
@@ -323,16 +324,16 @@ actor DramaAPI {
     /// Selects from a fallback model. When every row is ByteVC2, reads the same address again with each compatibility
     /// codec parameter in turn. The parameter names do not guarantee a codec, so each answer is still filtered by its
     /// actual codec and must name the same video and full duration.
-    private func fallbackTrack(_ info: [String: Any], address: String, read: @Sendable (String) async throws -> [String: Any]) async throws -> VideoTrack {
+    private func fallbackTrack(_ info: [String: Any], address: String, quality: VideoQuality?, read: @Sendable (String) async throws -> [String: Any]) async throws -> VideoTrack {
         do {
-            return try selectTrack(info, requireEncryption: false, minimumPixels: 0)
+            return try selectTrack(info, requireEncryption: false, minimumPixels: 0, quality: quality)
         } catch let onlyByteVC2 as ByteVC2Only {
             for query in Self.compatibleCodecQueries {
                 guard let compatible = compatibleFallback(address, codec: query) else { break }
                 do {
                     let other = try fallbackInfo(try await read(compatible))
                     try Self.confirmSameVideo(info, other)
-                    return try selectTrack(other, requireEncryption: false, minimumPixels: 0)
+                    return try selectTrack(other, requireEncryption: false, minimumPixels: 0, quality: quality)
                 } catch is CancellationError { throw CancellationError()
                 } catch {
                     try Task.checkCancellation()
@@ -380,7 +381,7 @@ actor DramaAPI {
 
     /// `acceptUndeclared`: rows whose encrypt_info carries no encrypt flag at all are taken as plain; the media index
     /// is checked separately before playback.
-    private func selectTrack(_ info: [String: Any], requireEncryption: Bool, minimumPixels: Int, acceptUndeclared: Bool = false) throws -> VideoTrack {
+    private func selectTrack(_ info: [String: Any], requireEncryption: Bool, minimumPixels: Int, quality: VideoQuality? = nil, acceptUndeclared: Bool = false) throws -> VideoTrack {
         let rawList = info["video_list"]
         let items = (rawList as? [Any] ?? Array(ProtocolJSON.dictionary(rawList).values)).map { ProtocolJSON.dictionary($0) }
         let compatible = items.compactMap { item -> (item: [String: Any], rank: Int, pixels: Int, shortSide: Int, quality: String)? in
@@ -392,7 +393,16 @@ actor DramaAPI {
             let shortSide = width > 0 && height > 0 ? min(width,height) : 0
             let pixels = shortSide > 0 ? shortSide : Int(quality.filter(\.isNumber)) ?? 0
             return (item,rank,pixels,shortSide,quality)
-        }.sorted { $0.rank == $1.rank ? $0.pixels > $1.pixels : $0.rank < $1.rank }
+        }.sorted { a, b in
+            // With a quality preference, rows at or below it come first (largest first), then the smallest larger ones;
+            // the codec order applies within the same size.
+            if let limit = quality?.shortSide {
+                func order(_ pixels: Int) -> (Int, Int) { pixels > 0 && pixels <= limit ? (0, -pixels) : pixels > limit ? (1, pixels) : (2, 0) }
+                let x = order(a.pixels), y = order(b.pixels)
+                return x != y ? x < y : a.rank < b.rank
+            }
+            return a.rank == b.rank ? a.pixels > b.pixels : a.rank < b.rank
+        }
         // Only the fallback compatibility requests have been seen to change the codec (see fallbackTrack).
         if compatible.isEmpty, items.contains(where: { ["bytevc2","bvc2"].contains(firstText($0["codec_type"],ProtocolJSON.dictionary($0["video_meta"])["codec_type"]).lowercased()) }) {
             throw ByteVC2Only()
@@ -413,7 +423,7 @@ actor DramaAPI {
                 do {
                     let address = seedText.isEmpty ? cleanURL(candidate) : try decryptURL(candidate, seed: seed)
                     let url = try checkedURL(address, domains: ["qznovelvod.com","fqnovelvod.com","douyinvod.com"])
-                    return VideoTrack(url: url, spadeA: spade, encrypted: !spade.isEmpty, definition: row.quality)
+                    return VideoTrack(url: url, spadeA: spade, encrypted: !spade.isEmpty, definition: row.quality, shortSide: row.pixels)
                 } catch { continue }
             }
         }

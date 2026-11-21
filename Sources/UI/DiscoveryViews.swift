@@ -7,6 +7,8 @@ struct HomeView: View {
     @StateObject private var loader = CatalogLoader()
     @State private var feed = "guess"
     @State private var guessPager: GuessPager?
+    /// 刷剧: the full-screen feed of the same list in the card layouts, kept across launches.
+    @AppStorage("home.feedMode") private var feedMode = false
     // 推荐 is the default channel and sits at the far right; the row opens scrolled to it.
     private let feeds = [("recommend", "热度精选"), ("latest", "最新短剧"), ("comic", "漫剧榜单"), ("guess", "推荐")]
     private var gridDramas: [Drama] {
@@ -16,23 +18,29 @@ struct HomeView: View {
 
     var body: some View {
         Group {
-            if model.appearance == .immersive {
+            if model.appearance == .immersive || feedMode {
                 ImmersiveFeed(loader: loader, feed: $feed, feeds: [("recommend", "热度"), ("latest", "最新"), ("comic", "漫剧"), ("guess", "推荐")],
-                              load: { load(reset: $0) }).toolbar(.hidden, for: .navigationBar)
+                              load: { more in if more { load() } else { refresh() } },
+                              exit: model.appearance == .immersive ? nil : { feedMode = false }).toolbar(.hidden, for: .navigationBar)
             } else {
                 classicHome.appBackground(model.appearance).tabRoot(model.appearance)
             }
         }
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
-        .task { if loader.dramas.isEmpty { load(reset: true) } }
-        .onChange(of: feed) { _, _ in load(reset: true) }
+        .task { if loader.dramas.isEmpty && !loader.isLoading { start() } }
+        .onChange(of: feed) { _, _ in start() }
         // Login, logout or switching account changes whose feed 猜你喜欢 shows.
-        .onChange(of: account.guessOwner) { _, _ in if feed == "guess" { load(reset: true) } }
+        .onChange(of: account.guessOwner) { _, _ in if feed == "guess" { start() } }
     }
 
     private var refreshButton: some View {
-        Button { load(reset: true) } label: { HeaderIcon(symbol: "arrow.clockwise") }.buttonStyle(.plain).accessibilityLabel("刷新首页")
+        Button { refresh() } label: { HeaderIcon(symbol: "arrow.clockwise") }.buttonStyle(.plain).accessibilityLabel("刷新首页")
+    }
+
+    private var feedModeButton: some View {
+        Button { feedMode = true } label: { HeaderIcon(symbol: "play.rectangle.on.rectangle") }.buttonStyle(.plain)
+            .accessibilityLabel("全屏刷剧").accessibilityIdentifier("home.feedMode")
     }
 
     private var classicHome: some View {
@@ -42,6 +50,7 @@ struct HomeView: View {
                     Image("BrandLogo").resizable().scaledToFit().frame(width: 40, height: 40).accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 2) { Text("红果剧场").font(.title2.bold()).foregroundStyle(model.appearance.ink); Text("好故事，随时接着看").font(.caption).foregroundStyle(model.appearance.muted) }
                     Spacer()
+                    feedModeButton
                     refreshButton
                 }
                 SearchEntry()
@@ -55,7 +64,7 @@ struct HomeView: View {
                 if loader.dramas.isEmpty && !loader.isLoading && loader.error == nil { EmptyStateView(symbol: "sparkles.tv", title: "这一页暂时没有剧集", message: "可以刷新，或切换上方的内容类型。") }
                 LoadMoreView(loader: loader) { load(reset: loader.dramas.isEmpty) }
             }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 24)
-        }.refreshable { load(reset: true) }
+        }.refreshable { refresh() }
     }
 
     private var feedSelector: some View {
@@ -64,19 +73,27 @@ struct HomeView: View {
         }.defaultScrollAnchor(.trailing)
     }
 
+    /// The card opens the detail page and 立即播放 plays; the two are siblings so neither swallows the other's taps,
+    /// and the cover cannot reach past the card (it used to cover the search bar above).
     private func featured(_ drama: Drama) -> some View {
-        NavigationLink { DetailView(drama: drama) } label: {
-            ZStack(alignment: .bottomLeading) {
-                AsyncImage(url: URL(string: drama.coverURL)) { image in image.resizable().scaledToFill() } placeholder: { model.appearance.soft }
-                    .frame(height: 210).frame(maxWidth: .infinity).clipped()
-                LinearGradient(colors: [.clear, .black.opacity(0.86)], startPoint: .top, endPoint: .bottom)
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("今日推荐").font(.caption.weight(.semibold)).foregroundStyle(.white.opacity(0.85))
-                    Text(drama.title).font(.title3.bold()).foregroundStyle(.white).lineLimit(2)
-                    HStack { Text(drama.episodeCount > 0 ? "全 \(drama.episodeCount) 集" : "精彩短剧").font(.caption).foregroundStyle(.white.opacity(0.8)); Spacer(); Button { model.play(drama) } label: { Label("立即播放", systemImage: "play.fill").font(.caption.bold()).padding(.horizontal, 13).padding(.vertical, 10).background(.white, in: Capsule()).foregroundStyle(Color(hex: 0xA9341F)) }.buttonStyle(.plain) }
-                }.padding(18)
-            }.frame(height: 210).clipShape(RoundedRectangle(cornerRadius: 20))
-        }.buttonStyle(.plain).accessibilityIdentifier("home.featured.\(drama.id)")
+        let shape = RoundedRectangle(cornerRadius: 20)
+        return ZStack(alignment: .bottomTrailing) {
+            NavigationLink { DetailView(drama: drama) } label: {
+                ZStack(alignment: .bottomLeading) {
+                    RemoteImage(address: drama.coverURL, priority: .high) { model.appearance.soft }
+                    LinearGradient(colors: [.clear, .black.opacity(0.86)], startPoint: .top, endPoint: .bottom)
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text("今日推荐").font(.caption.weight(.semibold)).foregroundStyle(.white.opacity(0.85))
+                        Text(drama.title).font(.title3.bold()).foregroundStyle(.white).lineLimit(2)
+                        Text(drama.episodeCount > 0 ? "全 \(drama.episodeCount) 集" : "精彩短剧").font(.caption).foregroundStyle(.white.opacity(0.8))
+                    }.padding(18).padding(.trailing, 110)
+                }.frame(height: 210).frame(maxWidth: .infinity).clipShape(shape).contentShape(shape)
+            }.buttonStyle(.plain).accessibilityIdentifier("home.featured.\(drama.id)")
+            Button { model.play(drama) } label: {
+                Label("立即播放", systemImage: "play.fill").font(.caption.bold()).padding(.horizontal, 13).padding(.vertical, 10)
+                    .background(.white, in: Capsule()).foregroundStyle(Color(hex: 0xA9341F))
+            }.buttonStyle(.plain).padding(18).accessibilityIdentifier("home.featured.play")
+        }.frame(height: 210).clipShape(shape)
     }
 
     private var continueWatching: some View {
@@ -106,15 +123,29 @@ struct HomeView: View {
         }.padding(16).background(model.appearance.surface, in: RoundedRectangle(cornerRadius: 18))
     }
 
-    private func load(reset: Bool = false) {
+    /// The saved copy of this feed shows at once; it is refreshed behind it when older than half an hour.
+    private func start() {
+        let key = feed == "guess" ? "home.guess." + account.guessHistoryKey : "home." + feed
+        switch loader.restore(key: key) {
+        case .fresh: break
+        case .stale: load(inPlace: true)
+        case .none: load(reset: true)
+        }
+    }
+
+    /// Refresh keeps what is on screen until the new first page arrives.
+    private func refresh() { if loader.dramas.isEmpty { load(reset: true) } else { load(inPlace: true) } }
+
+    private func load(reset: Bool = false, inPlace: Bool = false) {
         let selected = feed
-        guard selected == "guess" else { loader.load(reset: reset) { try await DramaAPI.shared.home(feed: selected, offset: $0) }; return }
-        // Signed in: the account's own feed; otherwise the anonymous one. A changed owner restarts the round.
+        guard selected == "guess" else { loader.load(reset: reset, inPlace: inPlace) { try await DramaAPI.shared.home(feed: selected, offset: $0) }; return }
+        // Signed in: the account's own feed; otherwise the anonymous one. A changed owner restarts the round. A list
+        // restored from disk has no round yet: the next page starts one and adds to the list.
         let owner = account.guessOwner
-        let restart = reset || guessPager == nil || guessPager?.owner != owner
+        let restart = reset || inPlace || guessPager == nil || guessPager?.owner != owner
         if restart { guessPager = GuessPager(owner: owner, previous: guessPager, history: .shared, historyKey: account.guessHistoryKey) { cursor in try await AccountService.shared.guessBatch(owner: owner, cursor: cursor) } }
         guard let pager = guessPager else { return }
-        loader.load(reset: restart) { _ in try await pager.next() }
+        loader.load(reset: reset, inPlace: inPlace) { _ in try await pager.next() }
     }
 }
 
@@ -123,7 +154,10 @@ private struct ImmersiveFeed: View {
     @ObservedObject var loader: CatalogLoader
     @Binding var feed: String
     let feeds: [(String, String)]
+    /// true for the next page, false to refresh.
     let load: (Bool) -> Void
+    /// Back to the card layout, for themes whose home is not this feed.
+    var exit: (() -> Void)? = nil
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var library: LibraryStore
     @State private var current: String?
@@ -162,7 +196,9 @@ private struct ImmersiveFeed: View {
                 topBar.padding(.top, insets.top).padding(.leading, insets.leading).padding(.trailing, insets.trailing)
             }.ignoresSafeArea()
         }
-        .onChange(of: current) { _, _ in prefetch(); syncPreview() }
+        .onChange(of: current) { _, id in loader.anchorID = id; prefetch(); syncPreview() }
+        // Not swiping on: when episode 1 ends, the drama continues with episode 2 in the full player.
+        .onChange(of: preview.ended) { _, ended in if ended { continueAfterPreview() } }
         .onChange(of: loader.dramas.first?.id) { _, _ in current = loader.dramas.first?.id; syncPreview() }
         // Only the visible, foreground feed plays: pushing a page, switching tab, opening the full player or
         // backgrounding releases the preview, and coming back starts the current page again.
@@ -174,7 +210,17 @@ private struct ImmersiveFeed: View {
 
     private func syncPreview() {
         guard visible, scenePhase == .active, model.playback == nil, loader.dramas.indices.contains(index) else { preview.stop(); return }
-        preview.play(loader.dramas[index])
+        preview.play(loader.dramas[index], quality: model.quality)
+        if loader.dramas.indices.contains(index + 1) { preview.prepare(loader.dramas[index + 1], quality: model.quality) }
+    }
+
+    private func continueAfterPreview() {
+        guard visible, model.playback == nil, model.autoNext, let detail = preview.detail, preview.dramaID == detail.drama.id else { return }
+        if detail.episodes.count > 1 {
+            model.playback = PlaybackRequest(detail: detail, index: 1, position: 0, recordsLocalHistory: true)
+        } else if loader.dramas.indices.contains(index + 1) {
+            withAnimation(.easeInOut(duration: 0.3)) { current = loader.dramas[index + 1].id }
+        }
     }
 
     private var index: Int { current.flatMap { id in loader.dramas.firstIndex { $0.id == id } } ?? 0 }
@@ -182,12 +228,16 @@ private struct ImmersiveFeed: View {
 
     private func prefetch() {
         if loader.dramas.indices.contains(index) { loader.preloadCovers(after: loader.dramas[index]) }
-        if index >= loader.dramas.count - 3 && loader.hasMore && loader.error == nil && !loader.isLoading { load(false) }
+        if index >= loader.dramas.count - 3 && loader.hasMore && loader.error == nil && !loader.isLoading { load(true) }
     }
 
     private var topBar: some View {
         HStack(spacing: 0) {
-            Button { load(true) } label: { Image(systemName: "arrow.clockwise").font(.system(size: 18, weight: .semibold)).frame(width: 44, height: 44) }
+            if let exit {
+                Button(action: exit) { Image(systemName: "square.grid.2x2").font(.system(size: 18, weight: .semibold)).frame(width: 44, height: 44) }
+                    .accessibilityLabel("返回卡片首页").accessibilityIdentifier("immersive_exit")
+            }
+            Button { load(false) } label: { Image(systemName: "arrow.clockwise").font(.system(size: 18, weight: .semibold)).frame(width: 44, height: 44) }
                 .accessibilityLabel("刷新推荐")
             HStack(spacing: 16) {
                 ForEach(feeds, id: \.0) { value, name in
@@ -212,15 +262,15 @@ private struct ImmersiveFeed: View {
         } else {
             VStack(spacing: 12) {
                 Text(loader.error ?? "这一组暂时没有剧集").font(.subheadline).foregroundStyle(.white).multilineTextAlignment(.center)
-                Button("重新加载") { load(true) }.buttonStyle(.bordered).tint(.white)
+                Button("重新加载") { load(false) }.buttonStyle(.bordered).tint(.white)
             }.padding(24)
         }
     }
 
     private var banner: (String, String?, () -> Void)? {
-        if let error = loader.error { return (error, "重试", { load(false) }) }
+        if let error = loader.error { return (error, "重试", { load(true) }) }
         if loader.isLoading { return ("正在加载更多…", nil, {}) }
-        if !loader.hasMore { return ("已经看到最后一部了", "刷新", { load(true) }) }
+        if !loader.hasMore { return ("已经看到最后一部了", "刷新", { load(false) }) }
         return nil
     }
 
@@ -246,9 +296,8 @@ private struct ImmersivePage: View {
         ZStack(alignment: .bottomLeading) {
             // The cover only paints the page; a fill-scaled image must not widen the layout of the overlays.
             Color.black.overlay {
-                AsyncImage(url: URL(string: drama.coverURL)) { phase in
-                    if let image = phase.image { image.resizable().scaledToFill() }
-                    else { LinearGradient(colors: [Color(hex: 0x3A2A26), Color(hex: 0x141416)], startPoint: .top, endPoint: .bottom) }
+                RemoteImage(address: drama.coverURL, priority: .high) {
+                    LinearGradient(colors: [Color(hex: 0x3A2A26), Color(hex: 0x141416)], startPoint: .top, endPoint: .bottom)
                 }.opacity(active && preview.rendered ? 0 : 1)
             }.clipped()
             if active, let player = preview.player {
@@ -257,7 +306,7 @@ private struct ImmersivePage: View {
             if active && preview.player != nil {
                 FeedGestureView(tap: preview.toggle, holdBegan: preview.beginHold, holdEnded: preview.endHold)
             } else if active && preview.failed {
-                FeedGestureView(tap: { preview.play(drama) }, holdBegan: {}, holdEnded: {})
+                FeedGestureView(tap: { preview.play(drama, quality: model.quality) }, holdBegan: {}, holdEnded: {})
             }
             if active && preview.paused && !preview.ended {
                 Image(systemName: "play.fill").font(.system(size: 54)).foregroundStyle(.white.opacity(0.8))
@@ -342,6 +391,8 @@ struct DiscoverView: View {
     @State private var filtersVisible = false
     @State private var filtersError: String?
     @State private var filtersLoading = false
+    /// The genre whose list and filters are loaded; coming back from a detail page keeps them as they were.
+    @State private var loadedGenre: String?
     private let genres = [("short_play", "短剧"), ("comic_series", "漫剧"), ("ai_series", "AI 剧")]
 
     var body: some View {
@@ -369,8 +420,11 @@ struct DiscoverView: View {
             }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 20)
         }.navigationTitle(model.appearance == .immersive ? "剧场" : "发现")
             .appBackground(model.appearance).tabRoot(model.appearance)
-            .refreshable { load(reset: true) }
-            .task(id: genre) { selection = [:]; draft = [:]; load(reset: true); await loadFilters() }
+            .refreshable { if loader.dramas.isEmpty { load(reset: true) } else { load(inPlace: true) } }
+            .task(id: genre) {
+                guard loadedGenre != genre else { return }
+                loadedGenre = genre; selection = [:]; draft = [:]; start(); await loadFilters()
+            }
             .sheet(isPresented: $filtersVisible) { filterSheet }
     }
 
@@ -395,11 +449,19 @@ struct DiscoverView: View {
                 }.padding(20)
             }.appBackground(model.appearance).navigationTitle("筛选").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { filtersVisible = false } } }
-                .safeAreaInset(edge: .bottom) { HStack(spacing: 12) { Button("重置") { draft = [:] }.buttonStyle(.bordered).frame(maxWidth: .infinity); Button("查看结果") { selection = draft; filtersVisible = false; load(reset: true) }.buttonStyle(.borderedProminent).frame(maxWidth: .infinity) }.tint(model.appearance.accent).controlSize(.large).padding().background(model.appearance.surface) }
+                .safeAreaInset(edge: .bottom) { HStack(spacing: 12) { Button("重置") { draft = [:] }.buttonStyle(.bordered).frame(maxWidth: .infinity); Button("查看结果") { selection = draft; filtersVisible = false; start() }.buttonStyle(.borderedProminent).frame(maxWidth: .infinity) }.tint(model.appearance.accent).controlSize(.large).padding().background(model.appearance.surface) }
         }.presentationDetents([.medium, .large]).presentationDragIndicator(.visible)
     }
 
-    private func load(reset: Bool = false) { let kind = genre, filters = selection; loader.load(reset: reset) { try await DramaAPI.shared.browse(genre: kind, filters: filters, offset: $0) } }
+    /// Only the unfiltered list of a genre keeps a disk copy.
+    private func start() {
+        switch loader.restore(key: selection.isEmpty ? "discover." + genre : nil) {
+        case .fresh: break
+        case .stale: load(inPlace: true)
+        case .none: load(reset: true)
+        }
+    }
+    private func load(reset: Bool = false, inPlace: Bool = false) { let kind = genre, filters = selection; loader.load(reset: reset, inPlace: inPlace) { try await DramaAPI.shared.browse(genre: kind, filters: filters, offset: $0) } }
     private func loadFilters() async {
         filtersLoading = true; filtersError = nil
         let selected = genre

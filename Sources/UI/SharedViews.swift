@@ -4,17 +4,11 @@ struct PosterView: View {
     let drama: Drama
     var ratio: CGFloat = 0.72
     var body: some View {
-        GeometryReader { geometry in
-            AsyncImage(url: URL(string: drama.coverURL)) { phase in
-                if let image = phase.image { image.resizable().scaledToFill() }
-                else {
-                    ZStack {
-                        LinearGradient(colors: [Color(hex: 0xDDC3AF), Color(hex: 0x8E7062)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                        VStack(spacing: 8) { Image(systemName: "film").font(.title); Text(drama.title).font(.caption).multilineTextAlignment(.center).lineLimit(3) }.foregroundStyle(.white.opacity(0.9)).padding(12)
-                    }
-                }
+        RemoteImage(address: drama.coverURL) {
+            ZStack {
+                LinearGradient(colors: [Color(hex: 0xDDC3AF), Color(hex: 0x8E7062)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                VStack(spacing: 8) { Image(systemName: "film").font(.title); Text(drama.title).font(.caption).multilineTextAlignment(.center).lineLimit(3) }.foregroundStyle(.white.opacity(0.9)).padding(12)
             }
-            .frame(width: geometry.size.width, height: geometry.size.height).clipped()
         }
         .aspectRatio(ratio, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 13))

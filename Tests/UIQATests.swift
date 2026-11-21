@@ -34,6 +34,41 @@ final class HongguoQATests: XCTestCase {
         app.buttons["关闭播放器"].tap()
     }
 
+    /// Search entry above 今日推荐, the 刷剧 feed, 清晰度 and the saved home list. Anonymous live catalogue only.
+    func testHomeSearchFeedModeAndQuality() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        app.launchArguments = ["-theme", "warm", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO"]
+        app.launch()
+        XCTAssertTrue(app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH %@", "home.featured.")).firstMatch.waitForExistence(timeout: 60))
+        // The search bar sits just above 今日推荐; a tap on it must open search, not the featured drama.
+        app.buttons["搜索短剧"].tap()
+        XCTAssertTrue(app.textFields["搜索剧名或关键词"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.navigationBars["剧集详情"].exists)
+        capture("home-search-entry")
+        app.navigationBars.buttons.firstMatch.tap()
+        app.buttons["home.feedMode"].tap()
+        XCTAssertTrue(app.descendants(matching: .any)["immersive_feed"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.buttons["immersive_play_0"].waitForExistence(timeout: 30))
+        capture("home-feed-mode")
+        app.buttons["immersive_play_0"].tap()
+        XCTAssertTrue(app.buttons["暂停"].waitForExistence(timeout: 60))
+        let quality = app.buttons["player.quality"]
+        XCTAssertTrue(quality.waitForExistence(timeout: 5))
+        XCTAssertEqual(quality.value as? String, "1080P")
+        quality.tap()
+        XCTAssertTrue(app.buttons["720P"].waitForExistence(timeout: 5)); app.buttons["720P"].tap()
+        XCTAssertTrue(app.buttons["暂停"].waitForExistence(timeout: 60))
+        XCTAssertEqual(app.buttons["player.quality"].value as? String, "720P")
+        capture("player-quality-720")
+        app.buttons["关闭播放器"].tap()
+        XCTAssertTrue(app.buttons["immersive_exit"].waitForExistence(timeout: 10)); app.buttons["immersive_exit"].tap()
+        XCTAssertTrue(app.buttons["home.feedMode"].waitForExistence(timeout: 10))
+        // A relaunch paints the saved home list without waiting for the network.
+        app.terminate(); app.launch()
+        XCTAssertTrue(app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH %@", "home.featured.")).firstMatch.waitForExistence(timeout: 3))
+    }
+
     /// Anonymous live catalogue only, using a task-specific simulator with no personal account.
     func testHomeSectionsDoNotRepeat() throws {
         continueAfterFailure = false

@@ -135,7 +135,8 @@ final class AccountService: ObservableObject {
     @Published private(set) var stats: AccountStats?
     @Published private(set) var listErrors: [String] = []
     @Published private(set) var pendingFavorites = Set<String>()
-    @Published var progressUploadsEnabled = UserDefaults.standard.bool(forKey: "account.progressUploadsEnabled") {
+    /// On unless the user turned it off: progress written to the account is what lets another device continue.
+    @Published var progressUploadsEnabled = UserDefaults.standard.object(forKey: "account.progressUploadsEnabled") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(progressUploadsEnabled, forKey: "account.progressUploadsEnabled")
             if !progressUploadsEnabled { cancelUploads(); pendingProgress = [:]; try? persist() }
@@ -150,6 +151,8 @@ final class AccountService: ObservableObject {
     private var uploadWaiting = false
     private var forceUploadPending = false
     private var lastUpload = Date.distantPast
+    private var recentProgress = [String:LibraryEntry]()
+    private var progressReadAt = Date.distantPast
     private var session: URLSession { AccountTransport.shared.session }
 
     private init() {
@@ -245,7 +248,7 @@ final class AccountService: ObservableObject {
     }
 
     func logout() {
-        cancelUploads(); pendingProgress = [:]
+        cancelUploads(); pendingProgress = [:]; recentProgress = [:]; progressReadAt = .distantPast
         AccountTransport.shared.cancelAndReset()
         generation = UUID(); credentials = nil; profileID = ""; nickname = ""; avatarURL = ""
         authenticated = false; busy = false; state = "未登录"
@@ -328,6 +331,27 @@ final class AccountService: ObservableObject {
 
     func isFavorite(_ drama: Drama) -> Bool { favorites.contains { $0.id == drama.id } }
     func resumePendingUploads() { scheduleUploads(force: false) }
+
+    /// The account's latest known progress for one drama: from 云端历史 or the last `refreshProgress`, whichever is newer.
+    func cloudProgress(for dramaID: String) -> LibraryEntry? {
+        guard authenticated else { return nil }
+        let listed = history.first { $0.id == dramaID }, read = recentProgress[dramaID]
+        guard let listed, let read else { return listed ?? read }
+        return read.updatedAt > listed.updatedAt ? read : listed
+    }
+
+    /// Reads the account's recent progress once more (one request, at most every 30 seconds and waiting at most
+    /// 2.5 seconds), so a drama opened right after watching it on another device starts where that device stopped.
+    func refreshProgress() async {
+        guard authenticated, let candidate = credentials, Date().timeIntervalSince(progressReadAt) > 30 else { return }
+        progressReadAt = Date()
+        let ticket = generation
+        let read = Task { try await self.fetchProgressRows(candidate) }
+        let timeout = Task { try await Task.sleep(nanoseconds: 2_500_000_000); read.cancel() }
+        defer { timeout.cancel() }
+        guard let rows = try? await read.value, ticket == generation else { return }
+        for row in rows { recentProgress[row.id] = row }
+    }
     /// Called only for the current player after a displayed frame; never scans local history.
     func observePlayback(drama: Drama, episode: Episode, position: Double, duration: Double, token: UUID, force: Bool) {
         guard progressUploadsEnabled, authenticated, token == generation, position.isFinite, duration.isFinite,
@@ -591,11 +615,12 @@ final class AccountService: ObservableObject {
         return (try? AccountRules.readHistory(raw)) ?? []
     }
 
-    private func fetchHistory(_ candidate: AccountCredentials) async throws -> [LibraryEntry] {
+    /// The account's recent progress rows, without titles or covers.
+    private func fetchProgressRows(_ candidate: AccountCredentials) async throws -> [LibraryEntry] {
         let (raw,_) = try await appJSON(candidate, path: "/reading/bookapi/read_progress/list/v1/", params: ["book_types":"2","limit":"50"])
         let data = ProtocolJSON.dictionary(raw["data"])
         guard let rows = (raw["video_data"] ?? data["video_data"]) as? [[String:Any]] else { throw HGError.message("账户历史数据格式发生变化") }
-        var result = rows.compactMap { row -> LibraryEntry? in
+        let result = rows.compactMap { row -> LibraryEntry? in
             guard let id = ProtocolJSON.identifier(row["series_id"] ?? row["book_id"]), let episode = ProtocolJSON.identifier(row["vid"]) else { return nil }
             var stamp = Double(ProtocolJSON.text(row["last_watch_time"])) ?? 0
             if stamp > 1e11 { stamp /= 1000 }
@@ -603,6 +628,11 @@ final class AccountService: ObservableObject {
             return LibraryEntry(drama: drama, episodeID: episode, episodeIndex: max(1, ProtocolJSON.integer(row["vid_index"])), position: max(0, (Double(ProtocolJSON.text(row["current_play_time"])) ?? 0) / 1000), updatedAt: Date(timeIntervalSince1970: stamp))
         }
         guard rows.isEmpty || !result.isEmpty else { throw HGError.message("账户历史条目格式发生变化") }
+        return result
+    }
+
+    private func fetchHistory(_ candidate: AccountCredentials) async throws -> [LibraryEntry] {
+        var result = try await fetchProgressRows(candidate)
         for record in await fetchRecords(candidate) {
             if let index = result.firstIndex(where: { $0.id == record.id }) { if record.updatedAt > result[index].updatedAt { result[index] = record } }
             else { result.append(record) }
@@ -671,7 +701,7 @@ final class AccountService: ObservableObject {
         expire(); return true
     }
     private func expire() {
-        cancelUploads(); pendingProgress = [:]
+        cancelUploads(); pendingProgress = [:]; recentProgress = [:]; progressReadAt = .distantPast
         generation = UUID(); AccountTransport.shared.cancelAndReset()
         credentials = nil; authenticated = false; busy = false; state = "登录已过期"
         nickname = ""; avatarURL = ""; profileID = ""; favorites = []; history = []; reservations = []; likes = []; stats = nil; pendingFavorites = []

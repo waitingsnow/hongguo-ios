@@ -10,6 +10,13 @@ struct PlayerScreen: View {
     @StateObject private var surface = PlayerSurface()
     @State private var episodesVisible = false
     @State private var speedsVisible = false
+    @State private var qualitiesVisible = false
+    /// 锁定屏幕 in landscape: the controls and every gesture are off; a tap only shows the lock button for a moment.
+    @State private var locked = false
+    @State private var lockButtonVisible = false
+    @State private var maskBeforeLock: UIInterfaceOrientationMask?
+    /// The app went to the background while this screen was up; coming back closes the small window into this screen.
+    @State private var backgrounded = false
     /// 短剧详情 over the player; the episode waits paused underneath and goes on when the sheet closes.
     @State private var detailVisible = false
     @State private var resumeAfterDetail = false
@@ -29,7 +36,8 @@ struct PlayerScreen: View {
     /// Set when the episode changed under a hold-then-drag; the rest of that gesture moves nothing.
     @State private var seekDragAbandoned = false
     /// Holding for 2× hides the same elements, for as long as the hold lasts.
-    private var chromeHidden: Bool { cleanScreen || session.holding }
+    private var chromeHidden: Bool { cleanScreen || session.holding || locked }
+    private var sheetVisible: Bool { episodesVisible || speedsVisible || qualitiesVisible || detailVisible }
     /// Just under a picture wider than tall, as in the official app.
     private var fullScreenOffered: Bool {
         !landscape && !chromeHidden && session.rendered && session.error == nil && !dragging && !sliding && !surface.pipActive
@@ -45,8 +53,8 @@ struct PlayerScreen: View {
             ZStack {
                 VStack(spacing: 0) {
                     // The insets keep touches near the controls from reaching the picture; with the controls gone the whole screen responds.
-                    Color.clear.frame(height: cleanScreen ? 0 : (geometry.size.height < 420 ? 58 : 70)).allowsHitTesting(false)
-                    VideoGestureView(enabled: !sliding && !episodesVisible && !speedsVisible && !detailVisible && (!session.scrubbing || seekDragStart != nil),
+                    Color.clear.frame(height: cleanScreen || locked ? 0 : (geometry.size.height < 420 ? 58 : 70)).allowsHitTesting(false)
+                    VideoGestureView(enabled: !sliding && !sheetVisible && (!session.scrubbing || seekDragStart != nil), locked: locked,
                                      tap: videoTapped, doubleTap: videoDoubleTapped, holdBegan: { seekDragAbandoned = false; session.beginHold() }, holdEnded: session.endHold,
                                      dragChanged: dragChanged, dragEnded: dragEnded, dragCancelled: dragCancelled,
                                      seekChanged: seekDragChanged, seekEnded: seekDragEnded, seekCancelled: seekDragCancelled,
@@ -56,8 +64,12 @@ struct PlayerScreen: View {
                         .accessibilityAction(named: cleanScreen ? "退出清屏" : "清屏播放") { cleanScreen.toggle() }
                         .accessibilityAction(named: "下一集") { session.next() }
                         .accessibilityAction(named: "上一集") { session.previous() }
-                    Color.clear.frame(height: cleanScreen ? 0 : (geometry.size.height < 420 ? 112 : 174)).allowsHitTesting(false)
-                }.ignoresSafeArea(edges: cleanScreen ? .all : []).zIndex(1)
+                    Color.clear.frame(height: cleanScreen || locked ? 0 : (geometry.size.height < 420 ? 112 : 174)).allowsHitTesting(false)
+                }.ignoresSafeArea(edges: cleanScreen || locked ? .all : []).zIndex(1)
+                if landscape && (locked ? lockButtonVisible : !chromeHidden) {
+                    lockButton.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading).padding(.leading, 18)
+                        .transition(.opacity).zIndex(3)
+                }
                 if let start = seekDragStart, session.duration > 0 {
                     SeekDragBadge(target: session.previewPosition, duration: session.duration, delta: session.previewPosition - start)
                         .allowsHitTesting(false).transition(.opacity).zIndex(1.7)
@@ -91,6 +103,7 @@ struct PlayerScreen: View {
                 }.padding(.horizontal, 20).padding(.top, 6).padding(.bottom, landscape ? 0 : 12).zIndex(2).allowsHitTesting(!sliding)
             }.foregroundStyle(.white)
             .animation(.easeOut(duration: 0.18), value: chromeHidden)
+            .animation(.easeOut(duration: 0.18), value: lockButtonVisible)
         }
         // The picture sits behind everything at the full screen size, under the home indicator and the camera
         // housing as well, so full screen reaches every edge whatever space the controls take.
@@ -104,6 +117,7 @@ struct PlayerScreen: View {
         .preferredColorScheme(.dark).statusBarHidden(landscape).persistentSystemOverlays(landscape && chromeHidden ? .hidden : .automatic)
             .sheet(isPresented: $episodesVisible) { episodeSheet }
             .sheet(isPresented: $speedsVisible) { speedSheet }
+            .sheet(isPresented: $qualitiesVisible) { qualitySheet }
             .sheet(isPresented: $detailVisible, onDismiss: detailClosed) { detailSheet }
             .task {
                 surface.bind(session)
@@ -114,27 +128,35 @@ struct PlayerScreen: View {
             // Only a real move to the background pauses: an episode that is playing then goes on in the small window
             // (the system starts it as the app leaves), and anything else stops as before.
             .onChange(of: scenePhase) { _, phase in
+                // Opening the app while the small window plays brings the episode back into this screen.
+                if phase == .active, backgrounded { backgrounded = false; if surface.pipActive { surface.stopPictureInPicture() } }
+                if phase == .background { backgrounded = true }
                 guard phase == .background, !surface.pipActive, !surface.pipStarting else { return }
                 Task { @MainActor in
                     try? await Task.sleep(for: .milliseconds(700))
                     if UIApplication.shared.applicationState == .background, !surface.pipActive, !surface.pipStarting { session.suspend() }
                 }
             }
-            .onChange(of: landscape) { _, _ in cleanScreen = false }
+            .onChange(of: landscape) { _, wide in cleanScreen = false; if !wide { unlock() } }
             // An episode that changes mid-drag (autoplay at the end of a 2× hold, for example) ends that drag. The
             // gesture view's own cancellation can arrive during a view update, where its state change is dropped.
             .onChange(of: session.index) { _, _ in if seekDragStart != nil { seekDragCancelled(); seekDragAbandoned = true } }
             // In full screen the controls step aside after a few seconds of playback.
             .task(id: autoHideKey) {
-                guard landscape, !cleanScreen, session.isPlaying, !session.scrubbing, !episodesVisible, !speedsVisible, !detailVisible else { return }
+                guard landscape, !cleanScreen, !locked, session.isPlaying, !session.scrubbing, !sheetVisible else { return }
                 try? await Task.sleep(for: .seconds(4))
                 if !Task.isCancelled { cleanScreen = true }
             }
+            .task(id: lockButtonVisible) {
+                guard locked, lockButtonVisible else { return }
+                try? await Task.sleep(for: .seconds(3))
+                if !Task.isCancelled { lockButtonVisible = false }
+            }
             .onChange(of: episodesVisible) { _, shown in if shown { session.endHold() } }
             .onChange(of: speedsVisible) { _, shown in if shown { session.endHold() } }
-            .onChange(of: session.app.preloadNext) { _, _ in session.preferencesChanged() }
+            .onChange(of: qualitiesVisible) { _, shown in if shown { session.endHold() } }
             // Anything the viewer has to act on brings the controls back: an error, the end of the last episode, a pause they did not ask for.
-            .onChange(of: session.error) { _, error in if error != nil { cleanScreen = false } }
+            .onChange(of: session.error) { _, error in if error != nil { cleanScreen = false; unlock() } }
             .onChange(of: session.endMessage) { _, message in if message != nil { cleanScreen = false } }
             .onChange(of: session.isPlaying) { _, playing in
                 if !playing, !session.buffering, !session.preparing, session.rendered, !dragging, !sliding { cleanScreen = false }
@@ -143,7 +165,32 @@ struct PlayerScreen: View {
 
     /// A tap shows or hides the controls and a double tap anywhere pauses or resumes; a pause brings the controls back by
     /// itself. There are no side double-tap skips: the progress moves only by holding and then dragging (Android issue #3).
-    private func videoTapped(at fraction: CGFloat) { cleanScreen.toggle() }
+    private func videoTapped(at fraction: CGFloat) { if locked { lockButtonVisible.toggle() } else { cleanScreen.toggle() } }
+
+    /// Locking also holds the current landscape, so turning the phone does not leave full screen either.
+    private func toggleLock() {
+        if locked { unlock(); return }
+        session.endHold(); cleanScreen = false
+        maskBeforeLock = InterfaceOrientationLock.mask
+        InterfaceOrientationLock.lock(.landscape, rotate: false)
+        locked = true; lockButtonVisible = true
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    private func unlock() {
+        guard locked else { return }
+        locked = false; lockButtonVisible = false
+        if let mask = maskBeforeLock { InterfaceOrientationLock.lock(mask, rotate: false) }
+        maskBeforeLock = nil
+    }
+
+    private var lockButton: some View {
+        Button(action: toggleLock) {
+            Image(systemName: locked ? "lock.fill" : "lock.open.fill").font(.system(size: 20, weight: .semibold))
+                .frame(width: 48, height: 48).background(.black.opacity(0.4), in: Circle())
+        }.buttonStyle(.plain).foregroundStyle(.white)
+            .accessibilityLabel(locked ? "解锁屏幕" : "锁定屏幕").accessibilityIdentifier("player.lock")
+    }
 
     private func videoDoubleTapped(at fraction: CGFloat) { if session.player != nil { session.toggle() } }
 
@@ -187,7 +234,7 @@ struct PlayerScreen: View {
         resumeAfterDetail = false
     }
 
-    private var autoHideKey: String { "\(landscape)-\(cleanScreen)-\(session.isPlaying)-\(session.scrubbing)-\(episodesVisible || speedsVisible || detailVisible)" }
+    private var autoHideKey: String { "\(landscape)-\(cleanScreen)-\(locked)-\(session.isPlaying)-\(session.scrubbing)-\(sheetVisible)" }
 
     /// 全屏观看 holds landscape; leaving it holds portrait until the player closes, even with the phone held sideways.
     private func enterFullScreen() { InterfaceOrientationLock.lock(.landscape, rotate: true) }
@@ -281,7 +328,7 @@ struct PlayerScreen: View {
                 session.load(index: target, startAt: 0)
                 dragOffset = 0; slideTarget = nil; sliding = false
             }
-            if scenePhase != .active { session.suspend() }
+            if scenePhase != .active, !surface.pipActive, !surface.pipStarting { session.suspend() }
         }
     }
 
@@ -322,6 +369,7 @@ struct PlayerScreen: View {
                 Button(action: session.toggle) { Image(systemName: session.isPlaying ? "pause.fill" : "play.fill").frame(width: 38, height: 44).contentShape(Rectangle()) }.disabled(session.player == nil).accessibilityLabel(session.isPlaying ? "暂停" : "播放")
                 Button(action: session.next) { Image(systemName: "forward.end.fill").frame(width: 38, height: 44).contentShape(Rectangle()) }.disabled(session.index + 1 >= session.detail.episodes.count).accessibilityLabel("下一集")
                 Spacer(minLength: 0)
+                Button { qualitiesVisible = true } label: { Text(session.quality.label).font(.subheadline.weight(.semibold)).frame(minWidth: 52, minHeight: 44).contentShape(Rectangle()) }.accessibilityLabel("清晰度").accessibilityValue(session.quality.label).accessibilityIdentifier("player.quality")
                 Button { speedsVisible = true } label: { Text(String(format: "%g×", session.app.speed)).font(.subheadline.weight(.semibold)).frame(minWidth: 52, minHeight: 44).contentShape(Rectangle()) }.accessibilityLabel("播放倍速").accessibilityValue(String(format: "%g×", session.app.speed)).accessibilityIdentifier("player.speed")
                 Button { episodesVisible = true } label: { Label("选集", systemImage: "square.grid.2x2").font(.subheadline.weight(.semibold)).frame(minHeight: 44).contentShape(Rectangle()) }.accessibilityIdentifier("player.episodes")
                 if landscape {
@@ -351,6 +399,23 @@ struct PlayerScreen: View {
     }
 }
 
+extension PlayerScreen {
+    fileprivate var qualitySheet: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(VideoQuality.allCases.reversed()) { quality in
+                        Button { qualitiesVisible = false; session.setQuality(quality) } label: {
+                            HStack { Text(quality.label); Spacer(); if session.quality == quality { Image(systemName: "checkmark").foregroundStyle(Color(hex: 0xF08058)) } }.foregroundStyle(.white).frame(minHeight: 33)
+                        }
+                    }
+                } footer: { Text("从当前位置切换，并作为之后剧集的默认清晰度。片源没有所选清晰度时使用最接近的一档。") }
+            }.navigationTitle("清晰度").navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { qualitiesVisible = false } } }
+        }.presentationDetents([.height(300)]).presentationDragIndicator(.visible).preferredColorScheme(.dark)
+    }
+}
+
 private struct SeekDragBadge: View {
     let target: Double
     let duration: Double
@@ -377,6 +442,8 @@ private struct EpisodePlaceholder: View {
 
 private struct VideoGestureView: UIViewRepresentable {
     let enabled: Bool
+    /// Only the single tap stays on, to show the lock button.
+    let locked: Bool
     /// Where the tap landed across the picture, 0 at the left edge and 1 at the right.
     let tap: (CGFloat) -> Void
     let doubleTap: (CGFloat) -> Void
@@ -404,18 +471,27 @@ private struct VideoGestureView: UIViewRepresentable {
         let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.panned(_:))); pan.maximumNumberOfTouches = 1; pan.delegate = context.coordinator
         let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.pinchChanged(_:)))
         let recognizers: [UIGestureRecognizer] = [hold, doubleTap, tap, pan, pinch]
-        recognizers.forEach { $0.isEnabled = enabled; view.addGestureRecognizer($0) }
+        context.coordinator.singleTap = tap
+        recognizers.forEach { view.addGestureRecognizer($0) }
+        apply(to: view, coordinator: context.coordinator)
         return view
     }
     func updateUIView(_ uiView: UIView, context: Context) {
         context.coordinator.parent = self
-        uiView.gestureRecognizers?.forEach { if $0.isEnabled != enabled { $0.isEnabled = enabled } }
+        apply(to: uiView, coordinator: context.coordinator)
+    }
+    private func apply(to view: UIView, coordinator: Coordinator) {
+        view.gestureRecognizers?.forEach { recognizer in
+            let on = enabled && (!locked || recognizer === coordinator.singleTap)
+            if recognizer.isEnabled != on { recognizer.isEnabled = on }
+        }
     }
     /// Only the session is told: this runs while SwiftUI tears the player screen down, and writing the screen's
     /// `@State` from here aborts on iOS 18 as an exclusive-access conflict (issue #6). The session's stop covers the rest.
     static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) { coordinator.parent.holdEnded() }
     @MainActor final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var parent: VideoGestureView
+        weak var singleTap: UIGestureRecognizer?
         private var pinchDecided = false
         /// Where the finger was when the hold began, then where the seek began once it moved past the threshold.
         private var holdAnchorX: CGFloat?

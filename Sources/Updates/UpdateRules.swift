@@ -15,7 +15,7 @@ enum UpdateRoute: String, CaseIterable, Identifiable, Sendable {
     var sourceURL: URL {
         let filename: String
         switch self { case .ghProxy: filename = "source-cn.json"; case .ghfast: filename = "source-cn-backup.json"; default: filename = "source.json" }
-        return URL(string: prefix + "https://raw.githubusercontent.com/OOIUa/hongguo-ios/main/distribution/" + filename)!
+        return URL(string: prefix + UpdateRules.distributionURL.appendingPathComponent(filename).absoluteString)!
     }
 }
 
@@ -58,7 +58,9 @@ enum UpdateError: LocalizedError {
 }
 
 enum UpdateRules {
-    static let manifestURL = URL(string: "https://raw.githubusercontent.com/OOIUa/hongguo-ios/main/distribution/update.json")!
+    static let repositoryOwner = "waitingsnow"
+    static let distributionURL = URL(string: "https://raw.githubusercontent.com/\(repositoryOwner)/hongguo-ios/main/distribution/")!
+    static let manifestURL = distributionURL.appendingPathComponent("update.json")
     static let maximumManifestBytes = 64 * 1024
     static let maximumIPABytes = 512 * 1024 * 1024
 
@@ -101,7 +103,7 @@ enum UpdateRules {
     static func officialAsset(_ value: String) -> URL? {
         guard let url = secureURL(value), url.host?.lowercased() == "github.com", url.query == nil else { return nil }
         let path = url.path.split(separator: "/", omittingEmptySubsequences: false)
-        guard path.count == 7, path[0].isEmpty, path[1].lowercased() == "ooiua", path[2] == "hongguo-ios", path[3] == "releases", path[4] == "download",
+        guard path.count == 7, path[0].isEmpty, path[1].lowercased() == repositoryOwner, path[2] == "hongguo-ios", path[3] == "releases", path[4] == "download",
               safeComponent(String(path[5]), maximum: 128), safeComponent(String(path[6]), maximum: 200), path[6].lowercased().hasSuffix(".ipa") else { return nil }
         return url
     }

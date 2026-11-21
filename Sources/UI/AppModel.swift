@@ -74,11 +74,13 @@ final class AppModel: ObservableObject {
     @Published var theme: AppTheme { didSet { UserDefaults.standard.set(theme.rawValue, forKey: "theme") } }
     /// nil until the user picks a mode, so each layout keeps its natural look.
     @Published var appearanceMode: AppearanceMode? { didSet { UserDefaults.standard.set(appearanceMode?.rawValue, forKey: "appearanceMode") } }
-    /// 沉浸暗场's video feed stays dark in every mode, including its status bar and tab bar.
+    /// The full-screen video feed (沉浸暗场's home, or 刷剧 in the other layouts) stays dark in every mode, including its status bar and tab bar.
     @Published var feedOnScreen = false
     @Published var autoNext: Bool { didSet { UserDefaults.standard.set(autoNext, forKey: "autoNext") } }
     @Published var preloadNext: Bool { didSet { UserDefaults.standard.set(preloadNext, forKey: "preloadNext") } }
     @Published var speed: Float { didSet { UserDefaults.standard.set(speed, forKey: "speed") } }
+    /// 默认清晰度 for every new episode; the player's 清晰度 button changes it too, like the speed.
+    @Published var quality: VideoQuality { didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") } }
     @Published var tab = 0
     @Published var systemDark = UITraitCollection.current.userInterfaceStyle == .dark
     @Published var playback: PlaybackRequest?
@@ -90,7 +92,7 @@ final class AppModel: ObservableObject {
     private var modeDark: Bool {
         switch currentMode { case .system: return systemDark; case .light: return false; case .dark: return true }
     }
-    private var feedForcesDark: Bool { feedOnScreen && theme == .immersive }
+    private var feedForcesDark: Bool { feedOnScreen }
     var isDark: Bool { modeDark || feedForcesDark }
     var appearance: ThemeColors { theme.colors(dark: isDark) }
     /// Applied to the window directly: `preferredColorScheme(nil)` does not reliably return to the system after an explicit value.
@@ -124,15 +126,26 @@ final class AppModel: ObservableObject {
         preloadNext = defaults.object(forKey: "preloadNext") as? Bool ?? false
         let saved = defaults.float(forKey: "speed")
         speed = [Float(0.5), 0.75, 1, 1.25, 1.5, 2].contains(saved) ? saved : 1
+        quality = defaults.string(forKey: "quality").flatMap(VideoQuality.init) ?? .p1080
     }
 
     func play(_ detail: DramaDetail, index: Int? = nil, resume: LibraryEntry? = nil) {
         guard !detail.episodes.isEmpty else { openError = "这部剧暂时没有可播放剧集。"; return }
-        let entry = resume ?? library.progress(for: detail.drama.id)
+        DramaDetails.remember(detail)
+        let entry = resume ?? latestProgress(for: detail.drama.id)
         let selected = index ?? entry.flatMap { entry in detail.episodes.firstIndex { $0.id == entry.episodeID } ?? detail.episodes.firstIndex { $0.index == entry.episodeIndex } } ?? 0
         let bounded = min(max(selected, 0), detail.episodes.count - 1)
         let savedPosition = entry.map { ($0.episodeID == detail.episodes[bounded].id || $0.episodeIndex == detail.episodes[bounded].index) ? $0.position : 0 } ?? 0
         playback = PlaybackRequest(detail: detail, index: bounded, position: savedPosition, recordsLocalHistory: resume == nil)
+    }
+
+    /// Where this drama was left: this device's history or the account's, whichever was watched more recently, so
+    /// an episode watched on another device continues here.
+    func latestProgress(for dramaID: String) -> LibraryEntry? {
+        let local = library.progress(for: dramaID)
+        guard let cloud = AccountService.shared.cloudProgress(for: dramaID) else { return local }
+        guard let local else { return cloud }
+        return cloud.updatedAt > local.updatedAt.addingTimeInterval(5) ? cloud : local
     }
 
     func play(_ drama: Drama) {
@@ -140,7 +153,9 @@ final class AppModel: ObservableObject {
         openingDramaID = drama.id
         openTask = Task { [weak self] in
             do {
-                let detail = try await DramaAPI.shared.detail(drama: drama)
+                async let progress: Void = AccountService.shared.refreshProgress()
+                let detail = try await DramaDetails.load(drama)
+                await progress
                 try Task.checkCancellation()
                 guard let self else { return }
                 self.openingDramaID = nil
@@ -153,43 +168,82 @@ final class AppModel: ObservableObject {
 
 @MainActor
 final class CatalogLoader: ObservableObject {
+    enum Restored { case none, fresh, stale }
     @Published private(set) var dramas: [Drama] = []
     @Published private(set) var isLoading = false
     @Published private(set) var hasMore = false
     @Published private(set) var error: String?
+    /// Lists with a disk copy (home feeds, unfiltered 发现) set this; every loaded page updates the copy.
+    private(set) var cacheKey: String?
+    /// The drama on screen in a paged feed. A background refresh keeps it and the pages before it in place.
+    var anchorID: String?
     private var offset = 0
     private var generation = UUID()
     private var task: Task<Void, Never>?
     private var preloadedCovers = Set<String>()
+    /// A saved list this recent is shown without asking the network again; older ones are shown and then refreshed.
+    static let freshFor: TimeInterval = 30 * 60
+    static let keptFor: TimeInterval = 7 * 24 * 3600
 
-    func load(reset: Bool = false, fetch: @escaping (Int) async throws -> DramaPage) {
-        if isLoading && !reset { return }
-        if !reset && !dramas.isEmpty && !hasMore { return }
+    /// Shows the saved copy for `key` straight away. Without one the list is emptied, ready for a network load.
+    @discardableResult
+    func restore(key: String?) -> Restored {
+        task?.cancel(); generation = UUID(); isLoading = false; error = nil
+        cacheKey = key; anchorID = nil; preloadedCovers = []
+        guard let key, let saved = ContentCache.shared.value(CatalogSnapshot.self, for: "catalog." + key),
+              saved.age < Self.keptFor, !saved.value.dramas.isEmpty else {
+            dramas = []; offset = 0; hasMore = false; return .none
+        }
+        dramas = saved.value.dramas; offset = saved.value.nextOffset; hasMore = saved.value.hasMore
+        ImageLoading.prefetch(dramas.prefix(12).map(\.coverURL))
+        return saved.age < Self.freshFor ? .fresh : .stale
+    }
+
+    /// `inPlace` refreshes the first page behind what is already shown (a saved copy) and swaps it in when it
+    /// arrives; a failure then keeps the saved copy instead of showing an error.
+    func load(reset: Bool = false, inPlace: Bool = false, fetch: @escaping (Int) async throws -> DramaPage) {
+        if isLoading && !reset && !inPlace { return }
+        if !reset && !inPlace && !dramas.isEmpty && !hasMore { return }
         task?.cancel()
         let ticket = UUID(); generation = ticket
-        let requestedOffset = reset ? 0 : offset
-        if reset { dramas = []; offset = 0; hasMore = false; preloadedCovers = [] }
+        let requestedOffset = reset || inPlace ? 0 : offset
+        if reset && !inPlace { dramas = []; offset = 0; hasMore = false; preloadedCovers = [] }
         isLoading = true; error = nil
         task = Task { [weak self] in
             do {
                 let page = try await fetch(requestedOffset)
                 try Task.checkCancellation()
                 guard let self, self.generation == ticket else { return }
-                var existing = Set(self.dramas.map(\.id))
-                let fresh = page.dramas.filter { existing.insert($0.id).inserted }
-                self.dramas += fresh
-                self.hasMore = page.hasMore && !fresh.isEmpty && page.nextOffset > requestedOffset
+                if inPlace {
+                    let kept = self.anchorID.flatMap { id in self.dramas.firstIndex { $0.id == id } }.map { Array(self.dramas[...$0]) } ?? []
+                    var seen = Set(kept.map(\.id))
+                    self.dramas = kept + page.dramas.filter { seen.insert($0.id).inserted }
+                    self.preloadedCovers = []
+                } else {
+                    var existing = Set(self.dramas.map(\.id))
+                    let fresh = page.dramas.filter { existing.insert($0.id).inserted }
+                    self.dramas += fresh
+                }
+                self.hasMore = page.hasMore && !page.dramas.isEmpty && page.nextOffset > requestedOffset
                 self.offset = page.nextOffset
                 self.isLoading = false
+                self.persist()
             } catch is CancellationError { }
             catch {
                 guard let self, self.generation == ticket else { return }
-                self.isLoading = false; self.error = friendlyError(error)
+                self.isLoading = false
+                if !inPlace || self.dramas.isEmpty { self.error = friendlyError(error) }
             }
         }
     }
 
     func cancel() { task?.cancel(); generation = UUID(); isLoading = false }
+
+    private func persist() {
+        guard let cacheKey, !dramas.isEmpty else { return }
+        let kept = Array(dramas.prefix(200))
+        ContentCache.shared.store(CatalogSnapshot(dramas: kept, hasMore: hasMore || kept.count < dramas.count, nextOffset: offset), for: "catalog." + cacheKey)
+    }
 
     /// Call as a row appears. Requests the next page once it is within 12 of the end, so it is in the list before the
     /// user gets there. A failed page waits for the retry button, so a dead network cannot turn scrolling into a loop.
@@ -199,13 +253,11 @@ final class CatalogLoader: ObservableObject {
         load()
     }
 
-    /// Fills URLCache, which AsyncImage reads, with the next covers (about 50 KB each, cacheable for a year).
+    /// Puts the next covers into the image disk cache before they scroll into view.
     func preloadCovers(after drama: Drama) {
         guard let index = dramas.firstIndex(where: { $0.id == drama.id }) else { return }
-        for next in dramas[(index + 1)...].prefix(9) where preloadedCovers.insert(next.coverURL).inserted {
-            guard let url = URL(string: next.coverURL), url.scheme == "https" else { continue }
-            URLSession.shared.dataTask(with: url).resume()
-        }
+        let next = dramas[(index + 1)...].prefix(9).map(\.coverURL).filter { preloadedCovers.insert($0).inserted }
+        ImageLoading.prefetch(next)
     }
 }
 

@@ -15,7 +15,7 @@ struct Episode: Identifiable, Codable, Hashable, Sendable {
     let title: String
 }
 
-struct DramaDetail: Sendable {
+struct DramaDetail: Codable, Sendable {
     let drama: Drama
     let episodes: [Episode]
 }
@@ -31,6 +31,17 @@ struct VideoTrack: Sendable {
     let spadeA: String
     let encrypted: Bool
     let definition: String
+    /// The picture's shorter side in pixels (720 for 720P), 0 when the server did not say.
+    var shortSide: Int = 0
+}
+
+/// The player's 清晰度 choice. The server's ladder differs per episode, so this is a preference: the highest row at or
+/// below it, otherwise the nearest one above.
+enum VideoQuality: String, CaseIterable, Identifiable, Codable, Sendable {
+    case p720 = "720p", p1080 = "1080p"
+    var id: String { rawValue }
+    var shortSide: Int { self == .p720 ? 720 : 1080 }
+    var label: String { self == .p720 ? "720P" : "1080P" }
 }
 
 struct FilterOption: Identifiable, Hashable, Sendable {

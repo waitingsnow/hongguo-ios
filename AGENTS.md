@@ -3,7 +3,7 @@
 ## 用户已确认的交付方式
 
 - iOS 原生移植项目，Android 参考仓库为 https://github.com/OOIUa/hongguo-android 。
-- iOS 代码独立托管于公开仓库 `OOIUa/hongguo-ios`；不要向 Android 仓库推送 iOS 代码。
+- iOS 代码独立托管于公开仓库 `waitingsnow/hongguo-ios`；不要向 Android 仓库推送 iOS 代码。
 - Git 作者和提交者统一使用 `OOIUa <79910828+OOIUa@users.noreply.github.com>`，包括发布脚本生成的更新源提交。
 - 用户先在自己的 iPhone 测试，已有自己的测试签名。**每次只打包无签名 iPhone IPA**，由用户自行签名安装。
 - 构建始终传入 `CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=''`。不申请、生成、导入或提交签名证书、描述文件、私钥。
@@ -17,10 +17,10 @@
 - **每次推送新版本都必须同步更新全能签源和应用内更新清单**，不能仅上传 IPA 或只修改版本号。
 - 实际 IPA 的大小、SHA-256、版本、build 校验通过后，才能运行 `scripts/generate-feeds.py` 生成 `distribution/update.json`、`source.json`、`source-cn.json`、`source-cn-backup.json`。
 - 全能签源统一托管于 GitHub。官方源使用 GitHub Raw + GitHub Releases；加速源分别通过 `https://gh-proxy.com/`、`https://ghfast.top/` 代理相同的官方文件。代理可失效，保留官方直连与切换线路。
-- 稳定官方源：`https://raw.githubusercontent.com/OOIUa/hongguo-ios/main/distribution/source.json`。
-- 加速源一：`https://gh-proxy.com/https://raw.githubusercontent.com/OOIUa/hongguo-ios/main/distribution/source-cn.json`。
-- 加速源二：`https://ghfast.top/https://raw.githubusercontent.com/OOIUa/hongguo-ios/main/distribution/source-cn-backup.json`。
-- 应用更新清单：`https://raw.githubusercontent.com/OOIUa/hongguo-ios/main/distribution/update.json`，同样支持上述两种代理前缀。
+- 稳定官方源：`https://raw.githubusercontent.com/waitingsnow/hongguo-ios/main/distribution/source.json`。
+- 加速源一：`https://gh-proxy.com/https://raw.githubusercontent.com/waitingsnow/hongguo-ios/main/distribution/source-cn.json`。
+- 加速源二：`https://ghfast.top/https://raw.githubusercontent.com/waitingsnow/hongguo-ios/main/distribution/source-cn-backup.json`。
+- 应用更新清单：`https://raw.githubusercontent.com/waitingsnow/hongguo-ios/main/distribution/update.json`，同样支持上述两种代理前缀。
 - 优先用仓库发布工作流或 `scripts/release*` 完成上传和源同步；任一步失败必须修复或明确报告，不能称为已发布。
 - 发版后验证 Releases 资产和仓库源链接可访问、版本/大小/SHA-256一致；区分本地已生成、已推送与线上验证通过。
 

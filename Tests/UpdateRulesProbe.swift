@@ -10,7 +10,7 @@ import CryptoKit
             guard condition() else { throw NSError(domain: "UpdateRulesProbe", code: 1, userInfo: [NSLocalizedDescriptionKey: "FAIL: " + label]) }
             count += 1
         }
-        let asset = "https://github.com/OOIUa/hongguo-ios/releases/download/v0.2.0/Hongguo-iOS-0.2.0-unsigned.ipa"
+        let asset = "https://github.com/waitingsnow/hongguo-ios/releases/download/v0.2.0/Hongguo-iOS-0.2.0-unsigned.ipa"
         let base: [String: Any] = ["version":"0.2.0", "build":2, "minimumOSVersion":"17.0", "releaseNotes":["更新检查与安装包校验"],
             "publishedAt":"2026-10-28T10:00:00Z", "downloadURL":asset, "sha256":String(repeating: "a", count: 64), "size":4,
             "mirrors":["gh-proxy":"https://gh-proxy.com/" + asset, "ghfast":"https://ghfast.top/" + asset]]
@@ -43,7 +43,7 @@ import CryptoKit
         try rejected(["minimumOSVersion":"unknown"], "invalid minimum OS")
         try rejected(["releaseNotes":[String(repeating:"x",count:1201)]], "oversized notes")
         for bad in [asset.replacingOccurrences(of:"https:",with:"http:"), asset.replacingOccurrences(of:"github.com",with:"github.com.evil.example"),
-            asset.replacingOccurrences(of:"OOIUa",with:"someone-else"), asset.replacingOccurrences(of:"hongguo-ios",with:"hongguo-android"),
+            asset.replacingOccurrences(of:"waitingsnow",with:"OOIUa"), asset.replacingOccurrences(of:"hongguo-ios",with:"hongguo-android"),
             asset.replacingOccurrences(of:"https://",with:"https://user:password@"), asset + "#fragment", asset + "?download=1",
             asset.replacingOccurrences(of:"github.com/",with:"github.com:8443/"), asset.replacingOccurrences(of:"v0.2.0/",with:"%2e%2e/"),
             asset.replacingOccurrences(of:".ipa",with:".zip")] {
@@ -97,7 +97,7 @@ private func transferChecks() async throws {
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: folder) }
     let configuration = URLSessionConfiguration.ephemeral; configuration.protocolClasses = [UpdateProbeProtocol.self]
-    let official = URL(string:"https://github.com/OOIUa/hongguo-ios/releases/download/v0.2.0/test.ipa")!
+    let official = URL(string:"https://github.com/waitingsnow/hongguo-ios/releases/download/v0.2.0/test.ipa")!
     let payload = Data([0x50,0x4b,0x03,0x04]) + Data("synthetic test IPA bytes".utf8)
     let hash = SHA256.hash(data:payload).map { String(format:"%02x",$0) }.joined()
     UpdateProbeProtocol.payload = payload

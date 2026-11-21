@@ -408,6 +408,15 @@ import JavaScriptCore
             fatalError("A model without fallback_api must not read one")
         }
         precondition(noFallback.url.absoluteString == "https://v1.qznovelvod.com/plain.mp4" && !noFallback.encrypted && noFallback.spadeA.isEmpty)
+        // 清晰度: the largest row at or below the choice, otherwise the smallest one above it.
+        let ladder: [String: Any] = ["video_list":[videoRow("bytevc1","https://v1.qznovelvod.com/540.mp4",540), videoRow("bytevc1","https://v1.qznovelvod.com/1080.mp4",1080), videoRow("bytevc1","https://v1.qznovelvod.com/720.mp4",720)]]
+        let at720 = try await trackAPI.modelTrack(ladder, quality: .p720)
+        precondition(at720.url.lastPathComponent == "720.mp4" && at720.shortSide == 720, at720.url.absoluteString)
+        let at1080 = try await trackAPI.modelTrack(ladder, quality: .p1080)
+        precondition(at1080.url.lastPathComponent == "1080.mp4", at1080.url.absoluteString)
+        let highOnly: [String: Any] = ["video_list":[videoRow("bytevc1","https://v1.qznovelvod.com/1440.mp4",1440), videoRow("bytevc1","https://v1.qznovelvod.com/1080.mp4",1080)]]
+        let above = try await trackAPI.modelTrack(highOnly, quality: .p720)
+        precondition(above.url.lastPathComponent == "1080.mp4", above.url.absoluteString)
         let failedRead = try await trackAPI.modelTrack(incompleteModel) { _ in throw URLError(.timedOut) }
         precondition(failedRead.url.absoluteString == "https://v1.qznovelvod.com/nokey.mp4" && !failedRead.encrypted)
         // A keyed row still wins over an undeclared one of the same rank and size.

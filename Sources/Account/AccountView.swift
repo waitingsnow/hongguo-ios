@@ -8,10 +8,7 @@ struct AccountAvatar<Placeholder: View>: View {
     let size: CGFloat
     @ViewBuilder var placeholder: Placeholder
     var body: some View {
-        AsyncImage(url: URL(string: url)) { phase in
-            if let image = phase.image { image.resizable().scaledToFill().frame(width: size, height: size).clipShape(Circle()) }
-            else { placeholder }
-        }.accessibilityHidden(true)
+        RemoteImage(address: url) { placeholder }.frame(width: size, height: size).clipShape(Circle()).accessibilityHidden(true)
     }
 }
 
@@ -65,7 +62,7 @@ struct AccountView: View {
                 }
                 if let message = account.message { Text(message).font(.footnote).foregroundStyle(model.appearance.muted) }
                 AccountPosterLists()
-                Text("历史每次读取最近 50 部，历史与收藏各缓存最多 200 部，预约分类各读取 20 部，不代表完整云端备份。\n“同步此后观看进度”默认关闭，开启后只同步此后实际播放的集数和位置，本机旧历史不会上传。退出账号不会删除本机收藏与历史。")
+                Text("历史每次读取最近 50 部，历史与收藏各缓存最多 200 部，预约分类各读取 20 部，不代表完整云端备份。\n“同步此后观看进度”默认开启，只同步此后实际播放的集数和位置，换设备打开同一部剧会从最近一次观看处继续；本机旧历史不会上传。退出账号不会删除本机收藏与历史。")
                     .font(.caption2).lineSpacing(3).foregroundStyle(model.appearance.muted)
             }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 24)
         }.appBackground(model.appearance)

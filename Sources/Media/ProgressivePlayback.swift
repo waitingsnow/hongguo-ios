@@ -18,9 +18,9 @@ final class ProgressivePlayback: NSObject, AVAssetResourceLoaderDelegate, @unche
         super.init()
         asset.resourceLoader.setDelegate(self, queue: queue)
     }
-    static func open(track: VideoTrack, episodeID: String,
-                     progress: @Sendable @escaping (String, Double) -> Void = { _, _ in }) async throws -> ProgressivePlayback {
-        let source = try await ProgressiveSource.open(track: track, episodeID: episodeID, progress: progress)
+    static func open(track: VideoTrack, episodeID: String, renew: MediaLocator.Renew? = nil,
+                     progress: @escaping ProgressiveSource.Progress = { _, _ in }) async throws -> ProgressivePlayback {
+        let source = try await ProgressiveSource.open(track: track, episodeID: episodeID, renew: renew, progress: progress)
         do {
             try Task.checkCancellation()
             return await make(source: source)

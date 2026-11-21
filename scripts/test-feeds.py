@@ -25,7 +25,7 @@ class FeedTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="hongguo-feed-tests-")
         self.root = Path(self.temporary.name)
-        self.config = {"version": "0.1.1", "build": 2, "repository": "OOIUa/hongguo-ios", "minimumOSVersion": "17.0", "releaseNotes": ["合成发布测试"]}
+        self.config = {"version": "0.1.1", "build": 2, "repository": "waitingsnow/hongguo-ios", "minimumOSVersion": "17.0", "releaseNotes": ["合成发布测试"]}
         self.config_path = self.root / "Release.json"
         self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
         self.output = self.root / "distribution"
@@ -68,13 +68,13 @@ class FeedTests(unittest.TestCase):
         self.assertEqual(update["size"], self.ipa.stat().st_size)
         self.assertEqual(update["build"], 2)
         self.assertTrue(report["unsigned"])
-        direct = "https://github.com/OOIUa/hongguo-ios/releases/download/v0.1.1/Hongguo-iOS-0.1.1-unsigned.ipa"
+        direct = "https://github.com/waitingsnow/hongguo-ios/releases/download/v0.1.1/Hongguo-iOS-0.1.1-unsigned.ipa"
         for filename, prefix in [("source.json", ""), ("source-cn.json", "https://gh-proxy.com/"), ("source-cn-backup.json", "https://ghfast.top/")]:
             source = json.loads((self.output / filename).read_text())
             app = source["apps"][0]
             self.assertEqual(app["downloadURL"], prefix + direct)
-            self.assertEqual(source["sourceURL"], prefix + "https://raw.githubusercontent.com/OOIUa/hongguo-ios/main/distribution/" + filename)
-            self.assertEqual(app["iconURL"], prefix + "https://raw.githubusercontent.com/OOIUa/hongguo-ios/v0.1.1/distribution/icon.png")
+            self.assertEqual(source["sourceURL"], prefix + "https://raw.githubusercontent.com/waitingsnow/hongguo-ios/main/distribution/" + filename)
+            self.assertEqual(app["iconURL"], prefix + "https://raw.githubusercontent.com/waitingsnow/hongguo-ios/v0.1.1/distribution/icon.png")
             for key in ("version", "build", "minimumOSVersion", "sha256"):
                 self.assertEqual(app[key], update[key])
             self.assertEqual(int(app["size"]), update["size"])

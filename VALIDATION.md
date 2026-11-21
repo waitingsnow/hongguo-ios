@@ -1,5 +1,19 @@
 # iOS 验证记录
 
+## 0.1.29 / build 31（2026-11-21）
+
+- 发布仓库与更新目标切换为 `waitingsnow/hongguo-ios`。更新规则 50 项、传输 6 项及清单生成 10 项离线检查通过，包括拒绝原仓库的 IPA 地址。
+- `verify-ipa.py` 确认设备包为 iPhone arm64、无签名，大小 2,345,539 字节，SHA-256 为 `351321685a22d917cb5079ce62280ecde0ef9451f285c6c4095195af1b265d04`。
+
+## 0.1.29 / build 30：缓存、刷剧、清晰度与播放链路（2026-11-21，未发布）
+
+- 离线：`test-progressive.sh`（新增合并 Range 预读、`warm`、地址续签合并/拒绝异密钥、重定向复用）、`test-network.sh`（新增 720P/1080P 选轨）、`test-media.sh`、`test-library.sh`、`test-account-rules.sh`、`test-updates.sh`、`test-feeds.py` 通过。修复 `ProgressiveCache` 用量索引的并发访问冲突（Swift exclusivity 崩溃）。
+- 实网 `test-progressive-live.sh --live`：22,013,835 字节加密分集，首帧时下载 1,310,720 字节（约 6%）；预读窗口改为随顺序读取增长前曾为 5–7 MB。临时探针（不入库）：冷启动取址+索引 1.30 秒，换 item 到播放 0.53 秒；预先准备的下一集换 item 到播放 0.45 秒，此后 8 秒持续播放无停顿；720P/1080P 分别取到对应档位。
+- iPhone 16 Pro / iOS 18.4 模拟器 `testHomeSearchFeedModeAndQuality` 1 项通过（29 秒）：暖白首页点搜索栏进入搜索页而非详情；刷剧入口打开全屏推荐流；立即播放后切换 720P 继续播放；重启后 3 秒内显示缓存的首页列表。
+- 无签名 IPA：Xcode 27.2 / SDK 27.2，arm64，2,345,037 字节，SHA-256 `033aa65d1070ebef8d532984a7989fe6b22db427ac1b3ef7daac4e6cf75d4f39`，`verify-ipa.py` 通过。
+- 真机安装：Omega 使用已有开发签名，iPhone 16 Pro Max 安装后回读版本为 0.1.29（30），应用启动成功。
+- 未验证：真机小窗后台连播与回前台自动恢复、横屏锁定（模拟器无法覆盖画中画），账号进度上报与跨设备接力（无用户账号实测），首页不滑动时自动进入第 2 集。
+
 ## 0.1.27 / build 28：新版 v5 播放接口（2026-11-16）
 
 - 来源：N3urda/hongguoTV `6672b55`（GPL-3.0-only），包含 0.16.5 的 v5 签名和 0.16.6 的 `device_level=1` 修复。本机 JavaScriptCore 生成 v04.10.03 Medusa / Helios / Khronos，对最终 query 与实际 gzip 正文字节签名；优先 `/novel/player/multi_video_model/player/v1`，兼容 flat / data.1004 模型映射并精确匹配分集。

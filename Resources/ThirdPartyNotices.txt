@@ -94,3 +94,11 @@ Playback v5 model endpoint (2026-11-16)
   catalogue, search and account signing stays unchanged. SDK-derived synthetic digest
   vectors and carrier vectors verify the pure-code ports; the referenced research VM
   was not copied or included.
+
+Image loading and caches (iOS 0.1.29)
+
+- kean/Nuke 13.2.3 (Nuke and NukeUI), MIT. Copyright (c) 2015-2026 Alexander Grebenyuk.
+  https://github.com/kean/Nuke/tree/13.2.3
+- Added as a Swift Package (exact version) for cover/avatar memory and disk caches, prefetching, and the
+  size-limited DataCache that also stores the last home lists and drama details. The MIT notice is included
+  as Nuke-MIT.txt.

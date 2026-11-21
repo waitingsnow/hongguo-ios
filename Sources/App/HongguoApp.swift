@@ -6,8 +6,8 @@ struct HongguoApp: App {
     @UIApplicationDelegateAdaptor(HongguoAppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
     @StateObject private var library = LibraryStore.shared
-    /// The default cache is small; covers are preloaded into it, and are about 50 KB each.
-    init() { URLCache.shared = URLCache(memoryCapacity: 32 * 1024 * 1024, diskCapacity: 200 * 1024 * 1024) }
+    /// Covers go through Nuke's memory and disk caches (`ImageLoading`).
+    init() { ImageLoading.configure() }
     var body: some Scene { WindowGroup { RootView().environmentObject(model).environmentObject(library) } }
 }
 

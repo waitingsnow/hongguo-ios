@@ -142,14 +142,21 @@ struct DetailView: View {
     }
 
     private func load() async {
-        loading = true; error = nil
+        error = nil
+        // A saved copy shows the episodes at once; the network then replaces it.
+        if detail == nil, let saved = DramaDetails.cached(drama.id) { show(saved.detail) }
+        loading = detail == nil
         do {
-            let loaded = try await DramaAPI.shared.detail(drama: drama)
+            let loaded = try await DramaDetails.load(drama, maxAge: 0)
             try Task.checkCancellation()
-            detail = loaded
-            if let entry = resume ?? library.progress(for: drama.id) { selected = loaded.episodes.firstIndex { $0.id == entry.episodeID } ?? loaded.episodes.firstIndex { $0.index == entry.episodeIndex } ?? 0 }
+            show(loaded)
             loading = false
         } catch is CancellationError { }
-        catch { loading = false; self.error = friendlyError(error) }
+        catch { loading = false; if detail == nil { self.error = friendlyError(error) } }
+    }
+
+    private func show(_ loaded: DramaDetail) {
+        detail = loaded
+        if let entry = resume ?? model.latestProgress(for: drama.id) { selected = loaded.episodes.firstIndex { $0.id == entry.episodeID } ?? loaded.episodes.firstIndex { $0.index == entry.episodeIndex } ?? 0 }
     }
 }

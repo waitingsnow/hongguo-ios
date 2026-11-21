@@ -6,5 +6,5 @@ trap 'rm -rf "$test_dir"' EXIT
 cd "$project_dir"
 xcrun swiftc -swift-version 5 -O -suppress-warnings \
   Sources/Core/Models.swift Sources/Core/HGCrypto.swift Sources/Media/*.swift \
-  Tests/ProgressiveFixture.swift Tests/ProgressiveTransportChecks.swift Tests/ProgressiveSelfTest.swift -lz -o "$test_dir/progressive-test"
+  Tests/ProgressiveFixture.swift Tests/ProgressiveTransportChecks.swift Tests/ProgressiveReadAheadChecks.swift Tests/ProgressiveSelfTest.swift -lz -o "$test_dir/progressive-test"
 "$test_dir/progressive-test"

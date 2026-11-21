@@ -8,9 +8,9 @@
 
 基于 SwiftUI 与 AVFoundation 构建的原生 iOS 短剧客户端。<br>请求签名、媒体解密、缓存与播放均在本机完成，无需部署服务器或配置 API key。
 
-[![Release](https://img.shields.io/github/v/release/OOIUa/hongguo-ios?label=Release&color=F15A2B)](https://github.com/OOIUa/hongguo-ios/releases/latest) [![iOS](https://img.shields.io/badge/iOS-17.0%2B-000000?logo=apple&logoColor=white)](#下载与安装) [![UI](https://img.shields.io/badge/UI-SwiftUI-F05138?logo=swift&logoColor=white)](#功能一览) [![License](https://img.shields.io/badge/License-GPL--3.0--only-blue)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/waitingsnow/hongguo-ios?label=Release&color=F15A2B)](https://github.com/waitingsnow/hongguo-ios/releases/latest) [![iOS](https://img.shields.io/badge/iOS-17.0%2B-000000?logo=apple&logoColor=white)](#下载与安装) [![UI](https://img.shields.io/badge/UI-SwiftUI-F05138?logo=swift&logoColor=white)](#功能一览) [![License](https://img.shields.io/badge/License-GPL--3.0--only-blue)](LICENSE)
 
-[**添加全能签源**](#全能签在线源) · [下载 IPA](https://github.com/OOIUa/hongguo-ios/releases/latest) · [功能一览](#功能一览) · [源码构建](#源码构建) · [反馈问题](https://github.com/OOIUa/hongguo-ios/issues)
+[**添加全能签源**](#全能签在线源) · [下载 IPA](https://github.com/waitingsnow/hongguo-ios/releases/latest) · [功能一览](#功能一览) · [源码构建](#源码构建) · [反馈问题](https://github.com/waitingsnow/hongguo-ios/issues)
 
 </div>
 
@@ -24,15 +24,15 @@
 
 | 线路 | 软件源地址 |
 | --- | --- |
-| 官方 GitHub | `https://raw.githubusercontent.com/OOIUa/hongguo-ios/main/distribution/source.json` |
-| 加速一 gh-proxy | `https://gh-proxy.com/https://raw.githubusercontent.com/OOIUa/hongguo-ios/main/distribution/source-cn.json` |
-| 加速二 ghfast | `https://ghfast.top/https://raw.githubusercontent.com/OOIUa/hongguo-ios/main/distribution/source-cn-backup.json` |
+| 官方 GitHub | `https://raw.githubusercontent.com/waitingsnow/hongguo-ios/main/distribution/source.json` |
+| 加速一 gh-proxy | `https://gh-proxy.com/https://raw.githubusercontent.com/waitingsnow/hongguo-ios/main/distribution/source-cn.json` |
+| 加速二 ghfast | `https://ghfast.top/https://raw.githubusercontent.com/waitingsnow/hongguo-ios/main/distribution/source-cn-backup.json` |
 
 加速线路由第三方提供，可用性取决于当地网络；连不上时换一条，或切回官方直连。源格式参考[全能签官方源](https://qnq.nuosike.cn/)。
 
 ### 手动下载
 
-在 [GitHub Releases](https://github.com/OOIUa/hongguo-ios/releases/latest) 下载 `Hongguo-iOS-<版本>-unsigned.ipa`，同页附有 SHA-256 校验文件和对应源码。
+在 [GitHub Releases](https://github.com/waitingsnow/hongguo-ios/releases/latest) 下载 `Hongguo-iOS-<版本>-unsigned.ipa`，同页附有 SHA-256 校验文件和对应源码。
 
 > **已安装旧版？** 覆盖安装即可保留收藏、历史与续播位置。签名时保持相同的 Bundle ID 和兼容的签名配置，否则系统会当成新应用，本机数据和账号登录无法恢复。
 
@@ -42,15 +42,15 @@
 
 | 功能 | 说明 |
 | --- | --- |
-| 首页与推荐 | 本机最近观看一键续播；推荐（猜你喜欢）、热度、最新短剧与榜单；沉浸暗场风格上下滑动自动试看第 1 集 |
+| 首页与推荐 | 本机最近观看一键续播；推荐（猜你喜欢）、热度、最新短剧与榜单；任意风格可进入全屏刷剧，上下滑动试看第 1 集，不滑动则播完自动进入该剧连播第 2 集 |
 | 发现与搜索 | 浏览短剧、漫剧、AI 剧，按上游提供的条件筛选；按剧名或关键词搜索 |
 | 剧集详情 | 简介、选集、相关作品（其他季与同 IP 作品，待上线作品可预约） |
-| 边下边播 | 读取视频索引后即可起播，不等整集下完；拖动时按需补齐目标片段，已校验的分块缓存复用 |
+| 边下边播 | 读取视频索引后即可起播，不等整集下完；随播放进度逐步预读、复用连接，地址失效自动换新；拖动时按需补齐目标片段，已校验的分块缓存复用 |
 | 播放手势 | 轻点显示或隐藏控件；双击任意位置暂停或继续；长按临时 2 倍速，长按后左右拖动调整进度；上下滑动切集；双指外拉清屏 |
-| 播放控制 | 选集面板、六档倍速（0.5×–2×，自动记住）、自动连播、可选下一集预加载；点击顶部剧名打开详情 |
-| 全屏与小窗 | 横屏片源可「全屏观看」；支持画中画小窗，播放时离开应用自动转为小窗 |
+| 播放控制 | 选集面板、720P / 1080P 清晰度与六档倍速（均自动记住，可在设置中设默认值）、自动连播、提前准备下一集开头、可选整集预加载；点击顶部剧名打开详情 |
+| 全屏与小窗 | 横屏片源可「全屏观看」，横屏可锁定屏幕防误触；支持画中画小窗，播放时离开应用自动转为小窗并继续连播，回到应用自动恢复全屏 |
 | 片单与历史 | 本机收藏与播放历史，退出后恢复集数和位置；登录后可查看账号收藏、最近历史与预约 |
-| 红果账号 | 扫码、手机号或官网登录；账号收藏写入后回读核对；云进度上报默认关闭 |
+| 红果账号 | 扫码、手机号或官网登录；账号收藏写入后回读核对；观看进度默认上报，打开剧集时取本机与账号中较新的进度 |
 | 界面风格 | 暖白精修、沉浸暗场、内容卡片三种布局，浅色、深色或跟随系统 |
 | iPhone Duo | 用 iOS 27.1 以上 SDK 构建，展开后按内屏尺寸运行；海报网格随屏幕宽度增加列数 |
 
@@ -59,23 +59,24 @@
 1. 从「首页」「发现」或搜索选剧，进入详情后选择集数开始播放。
 2. 播放中轻点画面呼出控件，双击任意位置暂停；长按临时 2 倍速，长按后左右拖动调整进度。
 3. 退出播放器后，在首页或「我的 → 播放历史」继续上次的集数与位置。
-4. 「我的 → 设置」切换主题样式、浅色或深色，调整自动连播与下一集预加载。
+4. 「我的 → 设置」切换主题样式、浅色或深色，调整自动连播、下一集整集预加载、默认清晰度与倍速。
 5. 「我的」顶部的账号卡片进入红果账号登录。官网会话和手机业务身份分别验证，云账号确认后才开放账号收藏、历史与预约。
 
 ## 当前版本边界
 
 - 支持 HTTP 分段读取的普通 MP4 与全样本 CENC 视频，按需下载并解密；索引位于文件尾部也能先读索引再起播。碎片化 MP4、子样本或模式加密暂不支持。
-- 当前集的完整分块校验后缓存，退出时保留已完成分块并取消未完成的请求。下一集预加载默认关闭，开启后在当前集缓存完成时准备完整下一集。
-- 只在前台播放（小窗除外）。三种风格按 iOS 原生控件适配，共用同一个播放器。
+- 当前集的完整分块校验后缓存，退出时保留已完成分块并取消未完成的请求。播放几秒后自动准备下一集的地址、索引和开头约 1.5 MB；「下一集整集预加载」默认关闭，开启后分段下载完整下一集。
+- 首页各频道与发现页（未筛选）列表、剧集详情在本机保留 7 天，30 分钟内直接显示，较旧时先显示再后台刷新；封面由 Nuke 做内存与 300 MB 磁盘缓存。
+- 前台或小窗播放。三种风格按 iOS 原生控件适配，共用同一个播放器。
 - 本机收藏与历史各最多 200 部，与账号数据分开管理。账号历史读取最近 50 部，预约读取 20 部，收藏展示已读取的批次；不提供完整的云端备份。
 - 推荐会在本机记住最近 540 部已推荐作品，刷新或重开应用后继续去重；匿名与不同账号分别保存，不上传推荐浏览记录。超过窗口的旧作品仍可能再次出现。
 - 本机片单读取失败时保留原文件并暂停写入，可在片单页面重试读取，避免空记录覆盖原数据。
 - 账号收藏响应不确定时保留「待核对」状态，不会自动重发收藏请求。
-- 云进度上报需主动开启，只上报开启后实际观看的内容，待发送记录按账号隔离并加密保存。
+- 云进度上报默认开启（可在账号菜单关闭），只上报此后实际观看的内容，待发送记录按账号隔离并加密保存。
 
 ## 源码构建
 
-需要完整 Xcode 及 **iOS 27.1 或更新的 SDK**（`Configuration/Release.json` 的 `minimumBuildSDK`），旧 SDK 构建的包在 iPhone Duo 展开后会按普通 iPhone 尺寸加黑边显示，构建脚本会直接拒绝。部署最低版本 iOS 17.0，无外部 Swift Package 依赖。
+需要完整 Xcode 及 **iOS 27.1 或更新的 SDK**（`Configuration/Release.json` 的 `minimumBuildSDK`），旧 SDK 构建的包在 iPhone Duo 展开后会按普通 iPhone 尺寸加黑边显示，构建脚本会直接拒绝。部署最低版本 iOS 17.0。唯一的外部 Swift Package 是 [Nuke](https://github.com/kean/Nuke) 13.2.3（固定版本，首次构建需联网解析）。
 
 ```sh
 bash scripts/build-unsigned.sh
@@ -128,10 +129,10 @@ bash scripts/test-progressive-live.sh --live
 
 ## Star History
 
-<a href="https://www.star-history.com/#OOIUa/hongguo-ios&Date">
+<a href="https://www.star-history.com/#waitingsnow/hongguo-ios&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=OOIUa/hongguo-ios&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=OOIUa/hongguo-ios&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=OOIUa/hongguo-ios&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=waitingsnow/hongguo-ios&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=waitingsnow/hongguo-ios&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=waitingsnow/hongguo-ios&type=Date" />
   </picture>
 </a>

@@ -14,6 +14,8 @@ excluded = {'build', 'dist', '.git', 'xcuserdata', '__pycache__', '.DS_Store', '
 count = 0
 with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
     for directory, children, files in os.walk(root):
+        if Path(directory) == root and 'local' in children:
+            children.remove('local')
         children[:] = sorted(d for d in children if d not in excluded)
         for filename in sorted(files):
             if filename in excluded or filename.endswith('.xcuserstate'): continue

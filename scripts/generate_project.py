@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the dependency-free Xcode project from checked-in source files."""
+"""Generate the Xcode projects from checked-in source files and the pinned Swift packages below."""
 import hashlib
 import json
 import xml.etree.ElementTree as ET
@@ -15,6 +15,12 @@ def uid(value):
 
 def quote(value):
     return json.dumps(str(value), ensure_ascii=False)
+
+# Swift packages linked into the app. Pinned to an exact version so builds stay reproducible without a
+# committed Package.resolved (project.xcworkspace is not tracked).
+packages = [
+    {'name': 'Nuke', 'url': 'https://github.com/kean/Nuke.git', 'version': '13.2.3', 'products': ['Nuke', 'NukeUI']},
+]
 
 objects = {}
 sources = sorted((root / 'Sources').rglob('*.swift'))
@@ -38,7 +44,17 @@ objects[products] = f'{{isa = PBXGroup; children = ({product},); name = Products
 objects[group] = f'{{isa = PBXGroup; children = ({",".join(file_refs + [products])},); sourceTree = "<group>"; }}'
 objects[source_phase] = f'{{isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = ({",".join(source_builds)},); runOnlyForDeploymentPostprocessing = 0; }}'
 objects[resource_phase] = f'{{isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = ({",".join(resource_builds)},); runOnlyForDeploymentPostprocessing = 0; }}'
-objects[framework_phase] = '{isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; }'
+package_refs, product_deps, framework_builds = [], [], []
+for package in packages:
+    package_id = uid('package:' + package['url'])
+    package_refs.append(package_id)
+    objects[package_id] = f'{{isa = XCRemoteSwiftPackageReference; repositoryURL = {quote(package["url"])}; requirement = {{kind = exactVersion; version = {quote(package["version"])}; }}; }}'
+    for name in package['products']:
+        dependency_id, build_id = uid('product:' + name), uid('product-build:' + name)
+        product_deps.append(dependency_id); framework_builds.append(build_id)
+        objects[dependency_id] = f'{{isa = XCSwiftPackageProductDependency; package = {package_id}; productName = {quote(name)}; }}'
+        objects[build_id] = f'{{isa = PBXBuildFile; productRef = {dependency_id}; }}'
+objects[framework_phase] = f'{{isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ({",".join(framework_builds)},); runOnlyForDeploymentPostprocessing = 0; }}'
 
 project_configs, target_configs = [], []
 for config in ('Debug', 'Release'):
@@ -59,14 +75,16 @@ for config in ('Debug', 'Release'):
         'DEBUG_INFORMATION_FORMAT': 'dwarf' if config == 'Debug' else 'dwarf-with-dsym',
         'SWIFT_ACTIVE_COMPILATION_CONDITIONS': 'DEBUG' if config == 'Debug' else '',
         'ENABLE_TESTABILITY': 'YES' if config == 'Debug' else 'NO',
+        # Swift packages build Debug for the running architecture only; the app must match to find their modules.
+        'ONLY_ACTIVE_ARCH': 'YES' if config == 'Debug' else 'NO',
     }
     objects[tc] = '{isa = XCBuildConfiguration; buildSettings = {' + ''.join(f'{k} = {quote(v)};' for k,v in settings.items()) + '}; name = ' + config + '; }'
 
 pc_list, tc_list = uid('projectConfigs'), uid('targetConfigs')
 objects[pc_list] = f'{{isa = XCConfigurationList; buildConfigurations = ({",".join(project_configs)},); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; }}'
 objects[tc_list] = f'{{isa = XCConfigurationList; buildConfigurations = ({",".join(target_configs)},); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; }}'
-objects[target] = f'{{isa = PBXNativeTarget; buildConfigurationList = {tc_list}; buildPhases = ({source_phase},{framework_phase},{resource_phase},); buildRules = (); dependencies = (); name = Hongguo; productName = Hongguo; productReference = {product}; productType = "com.apple.product-type.application"; }}'
-objects[proj] = f'{{isa = PBXProject; attributes = {{BuildIndependentTargetsInParallel = YES; LastUpgradeCheck = 2700; }}; buildConfigurationList = {pc_list}; compatibilityVersion = "Xcode 14.0"; developmentRegion = zh-Hans; hasScannedForEncodings = 0; knownRegions = ("zh-Hans",en,Base,); mainGroup = {group}; productRefGroup = {products}; projectDirPath = ""; projectRoot = ""; targets = ({target},); }}'
+objects[target] = f'{{isa = PBXNativeTarget; buildConfigurationList = {tc_list}; buildPhases = ({source_phase},{framework_phase},{resource_phase},); buildRules = (); dependencies = (); name = Hongguo; packageProductDependencies = ({",".join(product_deps)},); productName = Hongguo; productReference = {product}; productType = "com.apple.product-type.application"; }}'
+objects[proj] = f'{{isa = PBXProject; attributes = {{BuildIndependentTargetsInParallel = YES; LastUpgradeCheck = 2700; }}; buildConfigurationList = {pc_list}; compatibilityVersion = "Xcode 14.0"; developmentRegion = zh-Hans; hasScannedForEncodings = 0; knownRegions = ("zh-Hans",en,Base,); mainGroup = {group}; packageReferences = ({",".join(package_refs)},); productRefGroup = {products}; projectDirPath = ""; projectRoot = ""; targets = ({target},); }}'
 body = '\n'.join(f'{key} = {value};' for key,value in sorted(objects.items()))
 (project / 'project.pbxproj').write_text('// !$*UTF8*$!\n{archiveVersion = 1; classes = {}; objectVersion = 56; objects = {\n' + body + '\n}; rootObject = ' + proj + '; }\n')
 schemes = project / 'xcshareddata' / 'xcschemes'

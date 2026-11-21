@@ -9,9 +9,10 @@ import SwiftUI
     static func holdSpeedBegan() { let generator = UIImpactFeedbackGenerator(style: .medium); generator.prepare(); generator.impactOccurred() }
 }
 
-/// Plays episode 1 of the drama on the current 沉浸暗场 feed page, like a short-video feed. One player at a time:
-/// switching pages, leaving the home tab, opening the full player or going to background releases it. A preview
-/// never writes local history or account progress; 立即播放 hands its position to the full player.
+/// Plays episode 1 of the drama on the current feed page, like a short-video feed. One player at a time: switching
+/// pages, leaving the home tab, opening the full player or going to background releases it. The next page's drama is
+/// opened and its first seconds downloaded meanwhile, so a swipe starts playing at once. A preview never writes local
+/// history or account progress; 立即播放 hands its position to the full player.
 @MainActor
 final class FeedPreview: ObservableObject {
     @Published private(set) var dramaID: String?
@@ -25,58 +26,82 @@ final class FeedPreview: ObservableObject {
     private var task: Task<Void, Never>?
     private var ticket = UUID()
     private var stream: ProgressivePlayback?
-    private var pinnedURL: URL?
     private var observations: [NSKeyValueObservation] = []
     private var endObserver: NSObjectProtocol?
+    private struct Prepared { let dramaID: String; let quality: VideoQuality; let detail: DramaDetail; let stream: ProgressivePlayback }
+    private var prepared: Prepared?
+    private var preparing: (dramaID: String, task: Task<Void, Never>)?
 
     var position: Double { player.map { max(0, $0.currentTime().seconds.isFinite ? $0.currentTime().seconds : 0) } ?? 0 }
 
-    func play(_ drama: Drama, retry: Bool = true) {
+    func play(_ drama: Drama, quality: VideoQuality, retry: Bool = true) {
         guard dramaID != drama.id || failed else { if paused, !ended { toggle() }; return }
-        stop()
+        stop(keepPrepared: true)
         dramaID = drama.id
         let ticket = UUID(); self.ticket = ticket
+        let ready = takePrepared(drama.id, quality: quality)
         task = Task { [weak self] in
             do {
-                let detail = try await DramaAPI.shared.detail(drama: drama)
-                guard let first = detail.episodes.first else { throw HGError.message("这部剧暂时没有可播放剧集") }
-                let track = try await DramaAPI.shared.track(episodeID: first.id)
-                try Task.checkCancellation()
-                let item: AVPlayerItem
-                if let url = try await MediaPreparer.shared.cachedPlayback(track: track, episodeID: first.id) {
-                    await MediaPreparer.shared.pin(url)
-                    guard let self, self.ticket == ticket, !Task.isCancelled else { await MediaPreparer.shared.unpin(url); return }
-                    self.pinnedURL = url
-                    item = AVPlayerItem(url: url)
-                } else {
-                    let stream = try await ProgressivePlayback.open(track: track, episodeID: first.id) { _, _ in }
-                    guard let self, self.ticket == ticket, !Task.isCancelled else { stream.close(); return }
-                    self.stream = stream
-                    item = AVPlayerItem(asset: stream.asset)
-                    item.preferredForwardBufferDuration = 3
+                let detail: DramaDetail, stream: ProgressivePlayback
+                if let ready { detail = ready.detail; stream = ready.stream }
+                else {
+                    detail = try await DramaDetails.load(drama)
+                    guard let first = detail.episodes.first else { throw HGError.message("这部剧暂时没有可播放剧集") }
+                    stream = try await EpisodeStream.open(episodeID: first.id, quality: quality)
                 }
-                guard let self, self.ticket == ticket else { return }
+                guard let self, self.ticket == ticket, !Task.isCancelled else { stream.close(); return }
+                self.stream = stream
                 self.detail = detail
-                self.install(item, ticket: ticket)
+                self.install(AVPlayerItem(asset: stream.asset), ticket: ticket)
             } catch is CancellationError {
             } catch {
                 guard let self, self.ticket == ticket else { return }
                 // The playback API intermittently rejects a fresh anonymous identity; try this page once more.
                 if retry {
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
                     guard self.ticket == ticket, !Task.isCancelled else { return }
-                    self.dramaID = nil; self.play(drama, retry: false); return
+                    self.dramaID = nil; self.play(drama, quality: quality, retry: false); return
                 }
                 self.failed = true
             }
         }
     }
 
+    /// Opens the drama on the next page in the background; only one is kept.
+    func prepare(_ drama: Drama, quality: VideoQuality) {
+        guard drama.id != dramaID, prepared?.dramaID != drama.id || prepared?.quality != quality, preparing?.dramaID != drama.id else { return }
+        cancelPrepared()
+        let task = Task { [weak self] in
+            // The current page goes first.
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard !Task.isCancelled,
+                  let detail = try? await DramaDetails.load(drama), let first = detail.episodes.first, !Task.isCancelled,
+                  let stream = try? await EpisodeStream.open(episodeID: first.id, quality: quality) else { return }
+            guard let self, !Task.isCancelled, self.preparing?.dramaID == drama.id else { stream.close(); return }
+            self.prepared = Prepared(dramaID: drama.id, quality: quality, detail: detail, stream: stream)
+            await EpisodeStream.warm(stream, whole: false)
+            if self.preparing?.dramaID == drama.id { self.preparing = nil }
+        }
+        preparing = (drama.id, task)
+    }
+
+    private func takePrepared(_ id: String, quality: VideoQuality) -> Prepared? {
+        guard let ready = prepared, ready.dramaID == id, ready.quality == quality else { return nil }
+        prepared = nil
+        if preparing?.dramaID == id { preparing = nil }
+        return ready
+    }
+
+    private func cancelPrepared() {
+        preparing?.task.cancel(); preparing = nil
+        prepared?.stream.close(); prepared = nil
+    }
+
     private func install(_ item: AVPlayerItem, ticket: UUID) {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         try? AVAudioSession.sharedInstance().setActive(true)
         let player = AVPlayer(playerItem: item)
-        player.automaticallyWaitsToMinimizeStalling = stream == nil
+        player.automaticallyWaitsToMinimizeStalling = true
         observations.append(item.observe(\.status, options: [.new]) { [weak self] item, _ in
             Task { @MainActor in guard let self, self.ticket == ticket, item.status == .failed else { return }; self.failed = true }
         })
@@ -84,7 +109,7 @@ final class FeedPreview: ObservableObject {
             Task { @MainActor in guard let self, self.ticket == ticket else { return }; self.endHold(); self.ended = true; self.paused = true }
         }
         self.player = player
-        player.play()
+        player.playImmediately(atRate: 1)
     }
 
     func markRendered() { rendered = true }
@@ -109,13 +134,14 @@ final class FeedPreview: ObservableObject {
         paused.toggle()
     }
 
-    func stop() {
+    /// `keepPrepared` keeps the next page's drama, which is usually the one about to play.
+    func stop(keepPrepared: Bool = false) {
         task?.cancel(); task = nil; ticket = UUID()
         observations.removeAll()
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }; endObserver = nil
         player?.pause(); player?.replaceCurrentItem(with: nil); player = nil
         stream?.close(); stream = nil
-        if let url = pinnedURL { Task { await MediaPreparer.shared.unpin(url) } }; pinnedURL = nil
+        if !keepPrepared { cancelPrepared() }
         holding = false; dramaID = nil; detail = nil; rendered = false; paused = false; ended = false; failed = false
     }
 }

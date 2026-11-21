@@ -1,6 +1,12 @@
 # 渐进播放
 
-`PlayerSession` 默认打开 `ProgressivePlayback`。已有的完整本机缓存和可选下一集预加载仍走 `MediaPreparer`。
+`PlayerSession` 和首页试看都通过 `EpisodeStream` 打开 `ProgressivePlayback`。整个播放会话复用一个 `AVPlayer`，换集只替换 item，小窗因此可在后台连播。下一集在当前集播放几秒后预先取址、读索引并预读开头（`warm`）；「整集预加载」打开时继续分段预读整集。`MediaPreparer` 只保留给旧版整集缓存的容量统计与清理。
+
+- `MediaLocator` 复用上次重定向到的 CDN 地址；失败后回到原地址重试，仍失败或返回 4xx 时用同一清晰度重新取址，只接受加密密钥相同的新地址，并发失败共用一次续签。
+- 预读窗口从 1 块起，随顺序读取增长到 6 MB，每次最多合并 4 块为一个 Range、同时 2 个；跳转后从小窗口重新开始，首帧和跳播不必等多余数据。
+- `MediaRangeHTTP` 共用一个 URLSession（每主机 6 个连接），减少每段重新握手。
+
+KTVHTTPCache 等本地 HTTP 代理缓存只能缓存原始加密字节，无法完成 CENC 按样本解密与 moov 修复，播放仍须走 AVAssetResourceLoader，因此未引入，而在自有链路上实现连接复用、预读、分块缓存和预加载。
 
 1. `MediaRangeHTTP` 只接受受信视频域的 HTTPS，发送有界 Range 请求，核对 HTTP 206、Content-Range、总长度和实际响应长度。拒绝忽略 Range 的整文件响应，不把上游地址、身份或密钥带入错误文案。
 2. `ProgressiveSource` 跳过 mdat 读取顶层 box 与 moov 索引；moov 位于尾部时直接读取尾部范围。索引、文件、样本数量和大小均有上限。

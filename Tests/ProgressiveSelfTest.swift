@@ -37,7 +37,8 @@ private func check(_ condition: Bool, _ label: String) throws {
         let cache = ProgressiveCache(root: base.appendingPathComponent("cache"))
         let track = VideoTrack(url: URL(string: "https://test.qznovelvod.com/video.mp4")!, spadeA: fixture.spade, encrypted: true, definition: "test")
         let server = FixtureServer(fixture.encrypted, delay: 80_000_000)
-        let source = try await ProgressiveSource.open(track: track, episodeID: "test", cache: cache, fetch: { try await server.fetch($0) })
+        // Read-ahead off: these checks measure what the first frame itself needed (read-ahead is checked separately).
+        let source = try await ProgressiveSource.open(track: track, episodeID: "test", cache: cache, fetch: { try await server.fetch($0) }, readAhead: 0)
         let opened = await source.metrics()
         try check(opened.networkBytes < opened.length / 2, "Opening fetched half or more of the movie")
         let playback = await ProgressivePlayback.make(source: source)
@@ -79,10 +80,11 @@ private func check(_ condition: Bool, _ label: String) throws {
         playback.close(); await source.close()
 
         try await playerChecks(fixture: fixture, track: track, cache: cache)
+        try await progressiveReadAheadChecks(fixture: fixture, track: track, root: base.appendingPathComponent("read-ahead"))
 
         // A new owner must reuse verified disk blocks, without relying on the previous actor's memory.
         let server2 = FixtureServer(fixture.encrypted)
-        let reopened = try await ProgressiveSource.open(track: track, episodeID: "test", cache: cache, fetch: { try await server2.fetch($0) })
+        let reopened = try await ProgressiveSource.open(track: track, episodeID: "test", cache: cache, fetch: { try await server2.fetch($0) }, readAhead: 0)
         let countBefore = await server2.requested().count
         _ = try await reopened.read(at: fixture.offsets[90] + 7, count: 100)
         let countAfter = await server2.requested().count
@@ -147,7 +149,7 @@ private func check(_ condition: Bool, _ label: String) throws {
 
     @MainActor private static func playerChecks(fixture: ProgressiveFixture, track: VideoTrack, cache: ProgressiveCache) async throws {
         let server = FixtureServer(fixture.encrypted, delay: 100_000_000)
-        let source = try await ProgressiveSource.open(track: track, episodeID: "player", cache: cache, fetch: { try await server.fetch($0) })
+        let source = try await ProgressiveSource.open(track: track, episodeID: "player", cache: cache, fetch: { try await server.fetch($0) }, readAhead: 0)
         let playback = await ProgressivePlayback.make(source: source)
         let item = AVPlayerItem(asset: playback.asset)
         item.preferredForwardBufferDuration = 1
