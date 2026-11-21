@@ -1,26 +1,26 @@
 {
   "name": "红果 iOS · 国内加速",
   "message": "项目维护者发布的未签名 IPA；需要自行签名安装。加速服务由第三方提供。",
-  "identifier": "ooiua.hongguo-ios.source-cn",
-  "sourceURL": "https://gh-proxy.com/https://raw.githubusercontent.com/OOIUa/hongguo-ios/main/distribution/source-cn.json",
-  "sourceicon": "https://gh-proxy.com/https://raw.githubusercontent.com/OOIUa/hongguo-ios/v0.1.28/distribution/icon.png",
+  "identifier": "waitingsnow.hongguo-ios.source-cn",
+  "sourceURL": "https://gh-proxy.com/https://raw.githubusercontent.com/waitingsnow/hongguo-ios/main/distribution/source-cn.json",
+  "sourceicon": "https://gh-proxy.com/https://raw.githubusercontent.com/waitingsnow/hongguo-ios/v0.1.29/distribution/icon.png",
   "apps": [
     {
       "name": "红果独立版",
       "type": "1",
       "bundleIdentifier": "com.ooiua.hongguo.ios",
-      "version": "0.1.28",
-      "build": 29,
+      "version": "0.1.29",
+      "build": 31,
       "minimumOSVersion": "17.0",
-      "versionDate": "2026-11-20T05:53:35Z",
-      "versionDescription": "修复开始播放或切集时因播放信息偶发返回空正文而失败的问题；会在同一会话重新读取当前集一次。\n读取播放信息时遇到临时断线，会在剩余时间内重试一次。服务端要求稍后再试时会停止本次请求。\n未签名 IPA，需使用本人的证书签名后安装。",
+      "versionDate": "2026-11-21T09:58:08Z",
+      "versionDescription": "全能签订阅与应用内更新已迁移到 waitingsnow/hongguo-ios。已订阅旧源的用户可从项目首页添加新源。\n首页列表、剧集详情和封面加入本机缓存（封面使用 Nuke），重开应用先显示上次内容，再在后台刷新。\n新增全屏刷剧：首页右上角进入，上下滑动试看推荐剧；不滑动时第 1 集播完自动进入该剧并连播第 2 集。\n播放器新增 720P / 1080P 清晰度切换，设置中可选默认清晰度。\n起播和切集更快：按播放进度预读、复用连接，播放几秒后预先准备下一集；地址失效时自动换新地址，偶发暂停会自动恢复。\n小窗播放可在后台继续连播下一集；回到应用自动恢复全屏。横屏新增锁定屏幕按钮。\n登录账号后默认同步观看进度，其他设备可接着看；修复首页点击搜索栏误进今日推荐的问题。\n未签名 IPA，需使用本人的证书签名后安装。",
       "lock": "0",
-      "downloadURL": "https://gh-proxy.com/https://github.com/OOIUa/hongguo-ios/releases/download/v0.1.28/Hongguo-iOS-0.1.28-unsigned.ipa",
+      "downloadURL": "https://gh-proxy.com/https://github.com/waitingsnow/hongguo-ios/releases/download/v0.1.29/Hongguo-iOS-0.1.29-unsigned.ipa",
       "isLanZouCloud": "0",
-      "iconURL": "https://gh-proxy.com/https://raw.githubusercontent.com/OOIUa/hongguo-ios/v0.1.28/distribution/icon.png",
+      "iconURL": "https://gh-proxy.com/https://raw.githubusercontent.com/waitingsnow/hongguo-ios/v0.1.29/distribution/icon.png",
       "tintColor": "E8463F",
-      "size": "1883746",
-      "sha256": "fb4544815c8be84d93717f1d7dd4e9803c6039a8a49ad02963f575b87a229665"
+      "size": "2345539",
+      "sha256": "351321685a22d917cb5079ce62280ecde0ef9451f285c6c4095195af1b265d04"
     }
   ]
 }
