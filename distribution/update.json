@@ -1,18 +1,18 @@
 {
-  "version": "0.1.30",
-  "build": 32,
+  "version": "0.1.31",
+  "build": 33,
   "minimumOSVersion": "17.0",
   "releaseNotes": [
-    "播放时可查看本集公开评论，打开弹幕开关后可随播放进度轮播评论。",
-    "首页试看遵循默认倍速，长按后纵向滑入提示区可锁定 2×。切集与进入连播时复用预加载和视频画面。",
-    "优化后台切集时播放控件的显示，并从设备构建产物中移除本机工程路径。"
+    "播放器右侧集中显示收藏、弹幕和评论数量，底部保留进度、选集、清晰度和倍速。",
+    "优化本集评论与弹幕加载，手势提示最多展示三次。",
+    "播放器解锁后跟随系统方向旋转，快速切集时省略短暂的加载提示。"
   ],
-  "publishedAt": "2026-11-21T10:52:18Z",
-  "downloadURL": "https://github.com/waitingsnow/hongguo-ios/releases/download/v0.1.30/Hongguo-iOS-0.1.30-unsigned.ipa",
-  "sha256": "760206ac0631e98955963f3fefab0ffda15b8bf21f7970430adcf23983f4c809",
-  "size": 1659206,
+  "publishedAt": "2026-11-21T11:18:39Z",
+  "downloadURL": "https://github.com/waitingsnow/hongguo-ios/releases/download/v0.1.31/Hongguo-iOS-0.1.31-unsigned.ipa",
+  "sha256": "23336442391e566f1edadb8933a9ad0b15be61f628d2a1265b1236319e3aa06c",
+  "size": 1677814,
   "mirrors": {
-    "gh-proxy": "https://gh-proxy.com/https://github.com/waitingsnow/hongguo-ios/releases/download/v0.1.30/Hongguo-iOS-0.1.30-unsigned.ipa",
-    "ghfast": "https://ghfast.top/https://github.com/waitingsnow/hongguo-ios/releases/download/v0.1.30/Hongguo-iOS-0.1.30-unsigned.ipa"
+    "gh-proxy": "https://gh-proxy.com/https://github.com/waitingsnow/hongguo-ios/releases/download/v0.1.31/Hongguo-iOS-0.1.31-unsigned.ipa",
+    "ghfast": "https://ghfast.top/https://github.com/waitingsnow/hongguo-ios/releases/download/v0.1.31/Hongguo-iOS-0.1.31-unsigned.ipa"
   }
 }
