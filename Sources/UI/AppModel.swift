@@ -130,7 +130,8 @@ final class AppModel: ObservableObject {
         theme = AppTheme(rawValue: defaults.string(forKey: "theme") ?? "warm") ?? .warm
         // The old switch 深色模式时自动切换 meant following the system.
         appearanceMode = defaults.string(forKey: "appearanceMode").flatMap(AppearanceMode.init) ?? (defaults.bool(forKey: "followSystemDark") ? .system : nil)
-        autoNext = defaults.object(forKey: "autoNext") as? Bool ?? true
+        defaults.register(defaults: ["autoNext": true])
+        autoNext = defaults.bool(forKey: "autoNext")
         preloadNext = defaults.object(forKey: "preloadNext") as? Bool ?? false
         let saved = defaults.float(forKey: "speed")
         speed = [Float(0.5), 0.75, 1, 1.25, 1.5, 2].contains(saved) ? saved : 1

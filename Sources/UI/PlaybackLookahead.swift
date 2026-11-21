@@ -47,7 +47,7 @@ final class PlaybackLookahead {
         var headReady = false
         var warmedBytes = 0
         var length = 0
-        weak var preparedItem: AVPlayerItem?
+        var preparedEpisode: OpenEpisode?
         var hasOpened = false
         init(open: Task<OpenEpisode, Error>) { self.open = open }
     }
@@ -142,6 +142,7 @@ final class PlaybackLookahead {
     func claim(_ target: PlaybackTarget) -> Task<OpenEpisode, Error> {
         let slot = slots.removeValue(forKey: target.key)
         pause()
+        if slot?.preparedEpisode?.item.status == .failed { return open(target, priority: .userInitiated) }
         return slot?.open ?? open(target, priority: .userInitiated)
     }
 
@@ -162,15 +163,24 @@ final class PlaybackLookahead {
         failedAt.removeAll()
     }
 
-    func stageNext(_ target: PlaybackTarget?, on player: AVQueuePlayer) {
-        let next = target.flatMap { slots[$0.key]?.preparedItem }
+    @discardableResult
+    func stageNext(_ target: PlaybackTarget?, on player: AVQueuePlayer) -> OpenEpisode? {
+        let episode = target.flatMap { slots[$0.key]?.preparedEpisode }
+        let next = episode.flatMap { $0.item.status != .failed ? $0.item : nil }
         let queued = player.items().dropFirst()
-        if let next, queued.first === next { return }
+        if let next, player.currentItem === next || queued.first === next { return episode }
         for item in queued { player.remove(item) }
         if let next, let current = player.currentItem, current !== next, player.canInsert(next, after: current) {
             next.preferredForwardBufferDuration = 2
             player.insert(next, after: current)
+            return episode
         }
+        return nil
+    }
+
+    func consumePrepared(_ episode: OpenEpisode, for target: PlaybackTarget) {
+        guard slots[target.key]?.preparedEpisode === episode else { return }
+        _ = claim(target)
     }
 
     func update(_ targets: [PlaybackTarget], depth: Int, wholeFirst: Bool = false) {
@@ -180,8 +190,9 @@ final class PlaybackLookahead {
         let allowed = targets.prefix(depth)
         guard !allowed.isEmpty else { if worker != nil { pause() }; return }
         let next = allowed.first { slots[$0.key]?.headReady != true && failedAt[$0.key] == nil }
-        let whole = wholeFirst && depth > 1 ? targets.first.flatMap { target in
-            slots[target.key].flatMap { $0.headReady && $0.warmedBytes < $0.length ? target : nil }
+        let whole = wholeFirst && depth > 1 ? targets.first.flatMap { target -> PlaybackTarget? in
+            guard failedAt[target.key] == nil else { return nil }
+            return slots[target.key].flatMap { $0.headReady && $0.warmedBytes < $0.length ? target : nil }
         } : nil
         guard let target = next ?? whole else { if worker != nil { pause() }; return }
         if worker != nil && activeKey == target.key { return }
@@ -208,11 +219,11 @@ final class PlaybackLookahead {
                 guard warmed else { throw MediaError.transport }
                 slot.warmedBytes = bytes
                 slot.headReady = true
-                slot.preparedItem = episode.item
+                slot.preparedEpisode = episode
             } catch {
                 guard let self, self.generation == ticket else { return }
                 self.failedAt[target.key] = Date()
-                self.slots.removeValue(forKey: target.key)
+                if !slot.headReady { self.slots.removeValue(forKey: target.key) }
             }
             guard let self, self.generation == ticket else { return }
             self.worker = nil

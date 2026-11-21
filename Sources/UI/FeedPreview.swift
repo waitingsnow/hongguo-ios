@@ -330,6 +330,7 @@ struct FeedGestureView: View {
         func makeUIView(context: Context) -> UIView {
             let view = UIView()
             let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped))
+            tap.delegate = context.coordinator
             if beginHold != nil {
                 let hold = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.hold(_:)))
                 hold.minimumPressDuration = 0.35
@@ -352,8 +353,15 @@ struct FeedGestureView: View {
 
             @objc func tapped() { parent.tap() }
 
+            func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldRequireFailureOf other: UIGestureRecognizer) -> Bool {
+                guard recognizer is UITapGestureRecognizer, let scroll = other.view as? UIScrollView,
+                      other === scroll.panGestureRecognizer else { return false }
+                return recognizer.view?.isDescendant(of: scroll) == true
+            }
+
             func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
-                guard other is UIPanGestureRecognizer, let scroll = other.view as? UIScrollView else { return false }
+                guard recognizer is UILongPressGestureRecognizer, other is UIPanGestureRecognizer,
+                      let scroll = other.view as? UIScrollView else { return false }
                 return recognizer.view?.isDescendant(of: scroll) == true
             }
 

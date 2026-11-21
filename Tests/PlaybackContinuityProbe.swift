@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import os
 @testable import Hongguo
 
 @main @MainActor
@@ -18,6 +19,66 @@ struct PlaybackContinuityProbe {
         throw Failure(message: message)
     }
 
+    static func seekNearEnd(_ player: AVPlayer) async throws {
+        guard let duration = player.currentItem?.duration.seconds, duration.isFinite, duration > 1 else {
+            throw Failure(message: "no playable item duration")
+        }
+        let finish = CMTime(seconds: duration - 0.65, preferredTimescale: 600)
+        await player.seek(to: finish, toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    static func verifyNativeAdvance(_ session: PlayerSession, player: AVQueuePlayer, expectedRate: Float,
+                                    checkDelayedAdvance: Bool = false,
+                                    opened: () -> Int?) async throws {
+        try await eventually("active series never queued the next episode with native advance enabled") {
+            player.items().count == 2 && player.actionAtItemEnd == .advance
+        }
+        let previous = session.episode
+        let nextIndex = session.index + 1
+        let staged = player.items()[1]
+        let openCount = opened()
+        if checkDelayedAdvance {
+            guard let current = player.currentItem else { throw Failure(message: "no current item before delayed advance") }
+            let ticket = session.playID
+            NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: current)
+            try await Task.sleep(for: .milliseconds(500))
+            try require(session.playID == ticket && player.currentItem === current && player.items().last === staged
+                        && player.actionAtItemEnd == .advance && player.rate == expectedRate && opened() == openCount,
+                        "an early end notification interrupted a healthy queue")
+            print("PASS: a healthy staged item survived 500 ms after an early end notification")
+        }
+        var transitions = 0
+        var savedCompletion = false
+        let episodeChange = session.$playID.dropFirst().sink { _ in
+            transitions += 1
+            let saved = session.app.library.progress(for: session.detail.drama.id)
+            savedCompletion = saved?.episodeID == previous.id && saved?.position == 0
+        }
+        defer { episodeChange.cancel() }
+        try await seekNearEnd(player)
+        try await eventually("seek did not return to the requested rate") {
+            player.timeControlStatus == .playing && player.rate == expectedRate
+        }
+        let pauses = OSAllocatedUnfairLock(initialState: 0)
+        let status = player.observe(\.timeControlStatus, options: [.new]) { @Sendable _, change in
+            if change.newValue == .paused { pauses.withLock { $0 += 1 } }
+        }
+        let rate = player.observe(\.rate, options: [.new]) { @Sendable _, change in
+            if change.newValue == 0 { pauses.withLock { $0 += 1 } }
+        }
+        defer { status.invalidate(); rate.invalidate() }
+        try await eventually("series did not advance on its own") {
+            session.index == nextIndex && player.currentItem === staged && player.currentTime().seconds > 0.35 && session.rendered
+        }
+        try require(pauses.withLock { $0 } == 0, "native transition paused playback")
+        try require(player.rate == expectedRate && session.isPlaying, "native transition lost playback speed")
+        try require(transitions == 1 && opened() == openCount, "native transition duplicated a switch or reopened an item")
+        try require(savedCompletion, "native transition did not settle the previous episode's progress")
+        try require(session.app.library.progress(for: session.detail.drama.id)?.episodeID == session.episode.id,
+                    "native transition did not record the new episode")
+        print("PASS: episode \(previous.index) → \(session.episode.index), \(expectedRate)×, no pause or reopen")
+    }
+
     static func main() async throws {
         let media = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -28,9 +89,14 @@ struct PlaybackContinuityProbe {
         let detail = DramaDetail(drama: drama, episodes: episodes)
         let targets = episodes.indices.map { PlaybackTarget(detail, index: $0, quality: .p720) }
         var opened: [Int: Int] = [:]
+        var failNextOpen: Int?
         let queue = PlaybackLookahead { target in
             opened[target.index, default: 0] += 1
             try await Task.sleep(for: .milliseconds(120))
+            if failNextOpen == target.index {
+                failNextOpen = nil
+                throw Failure(message: "fixture lookahead failure")
+            }
             let track = VideoTrack(url: URL(string: "https://test.qznovelvod.com/fixture.mp4")!, spadeA: "", encrypted: false, definition: "720p")
             let source = try await ProgressiveSource.open(track: track, episodeID: episodes[target.index].id, cache: cache, fetch: { range in
                 let end = min(range.upperBound, media.count)
@@ -77,6 +143,7 @@ struct PlaybackContinuityProbe {
         feed.stop()
         let app = AppModel()
         app.quality = .p720; app.speed = 1.5; app.autoNext = true
+        defer { app.library.removeHistory(id: drama.id) }
         let session = PlayerSession(request: request, app: app)
         session.start()
         try require(session.player === player && player.currentItem === item && player.currentTime().seconds >= position - 0.05, "handoff replaced the live player, item or position")
@@ -114,25 +181,66 @@ struct PlaybackContinuityProbe {
         try require(pauseEvents == 1 && !nextSession.isPlaying, "explicit foreground pause must reveal the controls")
         nextSession.toggle()
         try await eventually("second episode did not resume") { nextSession.isPlaying }
-        nextSession.holdForGesture()
-        try await eventually("gesture did not momentarily pause playback") { !nextSession.isPlaying }
-        nextSession.releaseGesture()
-        try await eventually("cancelled gesture did not resume playback") { nextSession.isPlaying }
-        try require(pauseEvents == 1, "temporary gesture pause must not reveal the controls")
-
-        try await eventually("active series never queued the next episode") { seriesPlayer.items().count == 2 }
-        let staged = seriesPlayer.items()[1]
-        let opensBeforeEnd = opened[2]
-        let nearEnd = CMTime(seconds: seriesPlayer.currentItem!.duration.seconds - 0.2, preferredTimescale: 600)
-        await seriesPlayer.seek(to: nearEnd, toleranceBefore: .zero, toleranceAfter: .zero)
-        try await eventually("series did not advance on its own") {
-            nextSession.index == 2 && seriesPlayer.currentItem === staged && seriesPlayer.currentTime().seconds > 0.05
-        }
-        try require(opened[2] == opensBeforeEnd, "autoplay reopened a staged series item")
-        try require(pauseEvents == 1, "autoplay must not report a user-visible pause while replacing the item")
+        try await verifyNativeAdvance(nextSession, player: seriesPlayer, expectedRate: 1.5, checkDelayedAdvance: true) { opened[2] }
+        nextSession.lockSpeed()
+        try require(nextSession.speedLocked, "could not lock 2× before the next transition")
+        try await verifyNativeAdvance(nextSession, player: seriesPlayer, expectedRate: 2) { opened[3] }
+        try require(nextSession.speedLocked && pauseEvents == 1, "autoplay changed the speed lock or reported a user pause")
+        let lastTicket = nextSession.playID
+        let lastItem = seriesPlayer.currentItem
+        try require(seriesPlayer.actionAtItemEnd == .pause, "last episode did not retain its end action")
+        try await seekNearEnd(seriesPlayer)
+        try await eventually("last episode did not finish") { nextSession.endMessage == "已播完最后一集" }
+        try require(seriesPlayer.rate == 0 && seriesPlayer.currentItem === lastItem && nextSession.playID == lastTicket
+                    && app.library.progress(for: drama.id)?.position == 0, "last episode changed items, kept playing, or left stale progress")
         nextSession.suspend()
         try require(!nextSession.isPlaying && pauseEvents == 1, "background suspension must not reveal the controls")
         nextSession.stop()
-        print("PASS: bounded lookahead, promotion, decoded frames, native queue advance, default speed, live handoff, preloaded autoplay and playback chrome pause events")
+
+        let fallbackRequest = PlaybackRequest(detail: detail, index: 0, position: 0, recordsLocalHistory: false,
+                                              handoff: FeedHandoff(lookahead: queue, live: nil, speedLocked: false))
+        let fallback = PlayerSession(request: fallbackRequest, app: app)
+        let nextOpenCount = opened[1, default: 0]
+        failNextOpen = 1
+        fallback.start()
+        try await eventually("fallback session never attempted lookahead") { fallback.rendered && failNextOpen == nil }
+        guard let fallbackPlayer = fallback.player as? AVQueuePlayer,
+              let first = fallbackPlayer.currentItem else { throw Failure(message: "no fallback player") }
+        try require(fallbackPlayer.items().count == 1 && fallbackPlayer.actionAtItemEnd == .pause,
+                    "failed preloading armed an unavailable next item")
+        try await seekNearEnd(fallbackPlayer)
+        try await eventually("failed lookahead did not fall back to opening the next episode") {
+            fallback.index == 1 && fallbackPlayer.currentItem !== first && fallbackPlayer.currentTime().seconds > 0.15
+        }
+        try require(opened[1] == nextOpenCount + 2, "fallback did not open the next item exactly once after its preload failed")
+        try await eventually("fallback session did not stage its next episode") {
+            fallbackPlayer.items().count == 2 && fallbackPlayer.actionAtItemEnd == .advance
+        }
+        let timerItem = fallbackPlayer.currentItem
+        let timerTicket = fallback.playID
+        fallback.stopAtEpisodeEnd()
+        try require(fallbackPlayer.actionAtItemEnd == .pause, "end-of-episode timer left native advance armed")
+        fallback.setSleepTimer(minutes: nil)
+        try require(fallbackPlayer.actionAtItemEnd == .advance, "clearing the timer did not restore native advance")
+        app.autoNext = false
+        try require(fallbackPlayer.actionAtItemEnd == .pause, "disabling autoplay left native advance armed")
+        try await seekNearEnd(fallbackPlayer)
+        try await eventually("autoplay-disabled episode did not stop") { fallback.endMessage == "本集已播完，上滑观看下一集" }
+        try require(fallback.index == 1 && fallbackPlayer.currentItem === timerItem && fallback.playID == timerTicket
+                    && fallbackPlayer.rate == 0, "disabled autoplay switched to the staged item")
+        app.autoNext = true
+        fallback.go(to: 2)
+        try await eventually("next episode did not start after disabled autoplay") { fallback.rendered && fallback.index == 2 }
+        try await eventually("timer session did not stage its next episode") {
+            fallbackPlayer.items().count == 2 && fallbackPlayer.actionAtItemEnd == .advance
+        }
+        let stoppedItem = fallbackPlayer.currentItem
+        fallback.stopAtEpisodeEnd()
+        try await seekNearEnd(fallbackPlayer)
+        try await eventually("end-of-episode timer did not pause") { fallback.pausedBySleepTimer }
+        try require(fallback.index == 2 && fallbackPlayer.currentItem === stoppedItem && fallbackPlayer.rate == 0,
+                    "end-of-episode timer advanced to a queued episode")
+        fallback.stop()
+        print("PASS: bounded lookahead, decoded frames, live handoff, manual pause, failed-preload fallback, final episode, disabled autoplay and end-of-episode timer")
     }
 }

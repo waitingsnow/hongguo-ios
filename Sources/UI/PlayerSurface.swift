@@ -21,7 +21,6 @@ final class PlayerSurface: NSObject, ObservableObject, AVPictureInPictureControl
     private var playerSubscription: AnyCancellable?
     private var playIDSubscription: AnyCancellable?
     private weak var session: PlayerSession?
-    private weak var outgoingItem: AVPlayerItem?
 
     override init() {
         super.init()
@@ -36,17 +35,14 @@ final class PlayerSurface: NSObject, ObservableObject, AVPictureInPictureControl
         guard self.session !== session else { return }
         self.session = session
         view.onReadinessChange = { [weak self, weak session] item, ready in
-            guard ready, let item, let self, let session, item !== self.outgoingItem else { return }
-            let ticket = session.playID
+            guard ready, let item, let self, let ticket = session?.firstFrame(for: item) else { return }
             guard self.displayedPlayID != ticket else { return }
             self.displayedPlayID = ticket
             self.heldFrame = nil
-            session.firstFrame(ticket: ticket)
         }
         playIDSubscription = session.$playID.dropFirst().sink { [weak self, weak session] _ in
             guard let self, let session else { return }
-            self.holdDisplayedFrame(ticket: session.playID)
-            self.outgoingItem = self.view.playerLayer.player?.currentItem
+            if session.currentPlaybackItem == nil { self.holdDisplayedFrame(ticket: session.playID) }
         }
         playerSubscription = session.$player.sink { [weak self] player in self?.view.setPlayer(player) }
         guard pip == nil, pipSupported, let controller = AVPictureInPictureController(playerLayer: view.playerLayer) else { return }
@@ -74,7 +70,7 @@ final class PlayerSurface: NSObject, ObservableObject, AVPictureInPictureControl
         playerSubscription = nil; playIDSubscription = nil
         view.onReadinessChange = nil
         view.setPlayer(nil)
-        outgoingItem = nil; heldFrame = nil; displayedPlayID = nil
+        heldFrame = nil; displayedPlayID = nil
         onPiPEnd = nil; pipPhase = .idle; session = nil
     }
 
@@ -272,6 +268,8 @@ struct VideoGestureView: UIViewRepresentable {
         let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleTapped(_:))); doubleTap.numberOfTapsRequired = 2; doubleTap.require(toFail: hold)
         let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped(_:))); tap.require(toFail: hold); tap.require(toFail: doubleTap)
         let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.panned(_:))); pan.maximumNumberOfTouches = 1; pan.delegate = context.coordinator
+        doubleTap.require(toFail: pan)
+        tap.require(toFail: pan)
         let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.pinchChanged(_:)))
         let recognizers: [UIGestureRecognizer] = [hold, doubleTap, tap, pan, pinch]
         context.coordinator.singleTap = tap

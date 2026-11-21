@@ -270,7 +270,29 @@ final class HongguoQATests: XCTestCase {
         func point(_ x: CGFloat) -> XCUICoordinate { video.coordinate(withNormalizedOffset: CGVector(dx: x, dy: 0.5)) }
         let progress = app.sliders["播放进度"]
         func percent() -> Double { Double((progress.value as? String ?? "0").filter { $0.isNumber || $0 == "." }) ?? 0 }
+        let shortWipeStart = video.coordinate(withNormalizedOffset: CGVector(dx: 0.35, dy: 0.5))
+        let shortWipeEnd = shortWipeStart.withOffset(CGVector(dx: 0, dy: -32))
+        func shortWipe(hold: TimeInterval) {
+            shortWipeStart.press(forDuration: 0.02, thenDragTo: shortWipeEnd, withVelocity: .fast, thenHoldForDuration: hold)
+        }
+        func elapsedSeconds() throws -> Int {
+            let timestamps = app.staticTexts.matching(NSPredicate(format: "label MATCHES %@", "[0-9]+:[0-9]{2}"))
+            let label = try XCTUnwrap(timestamps.allElementsBoundByIndex.first { $0.frame.maxX <= progress.frame.minX + 2 })
+            let parts = label.label.split(separator: ":").compactMap { Int($0) }
+            return try XCTUnwrap(parts.count == 2 ? parts[0] * 60 + parts[1] : nil)
+        }
+        progress.adjust(toNormalizedSliderPosition: 0)
+        let nearStart = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in percent() < 5 }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [nearStart], timeout: 5), .completed)
+        let beforeWipe = try elapsedSeconds()
+        shortWipe(hold: 4)
+        XCTAssertGreaterThanOrEqual(try elapsedSeconds() - beforeWipe, 3)
+        assertEpisode(1, in: app)
         point(0.5).doubleTap()
+        assertPlayback("已暂停", in: app, timeout: 5)
+        let pausedAt = try elapsedSeconds()
+        shortWipe(hold: 0)
+        XCTAssertEqual(try elapsedSeconds(), pausedAt)
         assertPlayback("已暂停", in: app, timeout: 5)
         // No side skips: a double tap on either side also just plays or pauses.
         let start = percent()

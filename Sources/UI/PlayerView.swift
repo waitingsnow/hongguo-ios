@@ -28,7 +28,8 @@ struct PlayerScreen: View {
     // Page drag: the current picture follows the finger and the neighbouring episode number slides in.
     @State private var pageHeight: CGFloat = 1
     @State private var dragOffset: CGFloat = 0
-    @State private var dragging = false
+    @State private var dragOrigin: UUID?
+    private var dragging: Bool { dragOrigin == session.playID }
     @State private var sliding = false
     @State private var slideTarget: Int?
     /// 清屏: only the picture remains until a tap or an inward pinch brings the controls back.
@@ -201,6 +202,7 @@ struct PlayerScreen: View {
             .onDisappear { unlock(); session.stop(); surface.unbind() }
             .onChange(of: inlineForeground) { _, foreground in
                 if !foreground {
+                    dragCancelled()
                     session.endHold()
                     seekDragCancelled()
                     seekDragAbandoned = true
@@ -230,7 +232,11 @@ struct PlayerScreen: View {
             }
             // An episode that changes mid-drag (autoplay at the end of a 2× hold, for example) ends that drag. The
             // gesture view's own cancellation can arrive during a view update, where its state change is dropped.
-            .onChange(of: session.playID) { _, _ in seekDragCancelled(); seekDragAbandoned = true }
+            .onChange(of: session.playID) { _, _ in
+                if dragOrigin != nil { dragOffset = 0 }
+                seekDragCancelled()
+                seekDragAbandoned = true
+            }
             // In full screen the controls step aside after a few seconds of playback.
             .task(id: shouldAutoHideChrome) {
                 guard shouldAutoHideChrome else { return }
@@ -450,17 +456,22 @@ struct PlayerScreen: View {
 
     private func dragChanged(_ translation: CGFloat) {
         guard !sliding, !locked, !sheetVisible, inlineForeground else { return }
-        if !dragging { dragging = true; session.holdForGesture() }
+        if dragOrigin == nil { dragOrigin = session.playID }
+        guard dragging else { return }
         let atFirst = session.index == 0 && translation > 0
         let atLast = session.index + 1 >= session.detail.episodes.count && translation < 0
         dragOffset = atFirst || atLast ? translation * 0.28 : translation
     }
 
     private func dragEnded(_ translation: CGFloat, _ velocity: CGFloat) {
-        guard dragging else { return }
-        dragging = false
+        guard dragging else { dragCancelled(); return }
+        dragOrigin = nil
         let projected = translation + velocity * 0.18
-        let direction = projected <= -pageHeight * 0.3 ? 1 : (projected >= pageHeight * 0.3 ? -1 : 0)
+        let minimumTravel = min(80, max(44, pageHeight * 0.12))
+        let direction: Int
+        if translation <= -minimumTravel && projected <= -pageHeight * 0.3 { direction = 1 }
+        else if translation >= minimumTravel && projected >= pageHeight * 0.3 { direction = -1 }
+        else { direction = 0 }
         let target = session.index + direction
         if direction != 0, session.detail.episodes.indices.contains(target) {
             if session.pausedBySleepTimer {
@@ -470,32 +481,32 @@ struct PlayerScreen: View {
             return
         }
         withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) { dragOffset = 0 }
-        if scenePhase == .active { session.releaseGesture() }
         if direction == 1 { session.next() } else if direction == -1 { session.previous() }
     }
 
     private func dragCancelled() {
-        guard dragging else { return }
-        dragging = false
+        guard dragOrigin != nil else { return }
+        dragOrigin = nil
         withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) { dragOffset = 0 }
-        if scenePhase == .active { session.releaseGesture() }
     }
 
     /// Autoplay, buttons and the episode sheet slide the same way a swipe does. Touches are off until the slide ends.
     private func slide(to target: Int) {
         guard !sliding, !dragging, target != session.index, session.detail.episodes.indices.contains(target) else { return }
         if landscape || !inlineForeground { session.load(index: target, startAt: 0); return }
-        session.holdForGesture()
         commitSlide(to: target)
     }
 
     private func commitSlide(to target: Int) {
+        let origin = session.playID
         let direction: CGFloat = target > session.index ? 1 : -1
         sliding = true; slideTarget = target
         withAnimation(.easeInOut(duration: 0.32)) { dragOffset = -direction * pageHeight } completion: {
             var transaction = Transaction(); transaction.disablesAnimations = true
             withTransaction(transaction) {
-                session.load(index: target, startAt: 0)
+                if session.playID == origin, !session.pausedBySleepTimer {
+                    session.load(index: target, startAt: 0)
+                }
                 dragOffset = 0; slideTarget = nil; sliding = false
             }
             if backgroundPlayback == .suspended && UIApplication.shared.applicationState == .background { session.suspend() }
