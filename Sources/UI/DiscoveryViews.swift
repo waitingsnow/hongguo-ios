@@ -384,13 +384,23 @@ private struct ImmersivePage: View {
 
     private var playButton: some View {
         let next = continueEpisode
+        let symbol = next == nil ? "play.fill" : "forward.end.fill"
         return Button { playFull() } label: {
             HStack(spacing: 6) {
-                if model.openingDramaID == drama.id || (active && preview.awaitingHandoff) {
-                    ProgressView().controlSize(.small).tint(.white)
-                } else {
-                    Image(systemName: next == nil ? "play.fill" : "forward.end.fill")
+                Group {
+                    if model.openingDramaID == drama.id || (active && preview.awaitingHandoff) {
+                        DelayedPlaybackLoading {
+                            ProgressView().controlSize(.small).tint(.white)
+                        } fallback: {
+                            Image(systemName: symbol)
+                        }
+                    } else {
+                        Image(systemName: symbol)
+                    }
                 }
+                .frame(width: 18, height: 18)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
                 Text(next.map { "继续播放 · 第 \($0.index) 集" } ?? "立即播放").lineLimit(1)
             }
             .font(.subheadline.weight(.semibold))

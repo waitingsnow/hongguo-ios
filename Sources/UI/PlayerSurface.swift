@@ -13,13 +13,11 @@ final class PlayerSurface: NSObject, ObservableObject, AVPictureInPictureControl
     let view = PlayerLayerHost()
     @Published private(set) var displayedPlayID: UUID?
     @Published private(set) var heldFrame: UIImage?
-    @Published private(set) var pipPossible = false
     @Published private(set) var pipPhase: PiPPhase = .idle
     var pipInProgress: Bool { pipPhase != .idle }
     var pipActive: Bool { pipPhase == .active }
     var onPiPEnd: (() -> Void)?
     private var pip: AVPictureInPictureController?
-    private var pipObservation: NSKeyValueObservation?
     private var playerSubscription: AnyCancellable?
     private var playIDSubscription: AnyCancellable?
     private weak var session: PlayerSession?
@@ -57,13 +55,6 @@ final class PlayerSurface: NSObject, ObservableObject, AVPictureInPictureControl
         // the system's 画中画 settings.
         controller.canStartPictureInPictureAutomaticallyFromInline = true
         pip = controller
-        pipObservation = controller.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self] controller, _ in
-            let possible = controller.isPictureInPicturePossible
-            Task { @MainActor in
-                guard let self, self.pip === controller else { return }
-                self.pipPossible = possible
-            }
-        }
     }
 
     func holdDisplayedFrame(ticket: UUID) {
@@ -80,18 +71,13 @@ final class PlayerSurface: NSObject, ObservableObject, AVPictureInPictureControl
     func unbind() {
         pip?.stopPictureInPicture()
         pip?.delegate = nil; pip = nil
-        pipObservation = nil; playerSubscription = nil; playIDSubscription = nil
+        playerSubscription = nil; playIDSubscription = nil
         view.onReadinessChange = nil
         view.setPlayer(nil)
         outgoingItem = nil; heldFrame = nil; displayedPlayID = nil
-        onPiPEnd = nil; pipPhase = .idle; pipPossible = false; session = nil
+        onPiPEnd = nil; pipPhase = .idle; session = nil
     }
 
-    func startPictureInPicture() {
-        guard let pip, pip.isPictureInPicturePossible, !pipInProgress else { return }
-        pipPhase = .starting
-        pip.startPictureInPicture()
-    }
     func stopPictureInPicture() { pip?.stopPictureInPicture() }
 
     nonisolated func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {
@@ -157,27 +143,45 @@ struct PlayerSurfaceView: UIViewRepresentable {
     func updateUIView(_ uiView: PlayerLayerHost, context: Context) { }
 }
 
-/// The app follows the phone's rotation except while the player locks it: 全屏观看 holds landscape, and leaving
-/// full screen holds portrait until the player closes.
 @MainActor
 enum InterfaceOrientationLock {
-    static let free: UIInterfaceOrientationMask = .allButUpsideDown
-    private(set) static var mask: UIInterfaceOrientationMask = free
+    private static weak var lockedScene: UIWindowScene?
+    private static var lockedMask: UIInterfaceOrientationMask = .allButUpsideDown
 
-    static func lock(_ mask: UIInterfaceOrientationMask, rotate: Bool) {
-        self.mask = mask
-        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else { return }
+    static func supportedOrientations(in scene: UIWindowScene?) -> UIInterfaceOrientationMask {
+        guard let scene, scene === lockedScene else { return .allButUpsideDown }
+        return lockedMask
+    }
+
+    static func lockLandscape(in scene: UIWindowScene) -> Bool {
+        let orientation = scene.effectiveGeometry.interfaceOrientation
+        switch orientation {
+        case .landscapeLeft: lockedMask = .landscapeLeft
+        case .landscapeRight: lockedMask = .landscapeRight
+        default: return false
+        }
+        lockedScene = scene
+        invalidate(in: scene)
+        return true
+    }
+
+    static func unlock() {
+        guard let scene = lockedScene else { return }
+        lockedScene = nil
+        invalidate(in: scene)
+    }
+
+    private static func invalidate(in scene: UIWindowScene) {
         for window in scene.windows {
             var controller = window.rootViewController
             while let current = controller { current.setNeedsUpdateOfSupportedInterfaceOrientations(); controller = current.presentedViewController }
         }
-        if rotate { scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in } }
     }
 }
 
 final class HongguoAppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
-        MainActor.assumeIsolated { InterfaceOrientationLock.mask }
+        MainActor.assumeIsolated { InterfaceOrientationLock.supportedOrientations(in: window?.windowScene) }
     }
 }
 

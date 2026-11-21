@@ -16,10 +16,12 @@ struct PlayerScreen: View {
     @State private var speedsVisible = false
     @State private var qualitiesVisible = false
     @State private var commentsVisible = false
+    @AppStorage("playback.gestureHintDisplays") private var hintDisplays = 0
+    @State private var didShowHint = false
+    @State private var showingHint = false
     /// 锁定屏幕 in landscape: the controls and every gesture are off; a tap only shows the lock button for a moment.
     @State private var locked = false
     @State private var lockButtonVisible = false
-    @State private var maskBeforeLock: UIInterfaceOrientationMask?
     @State private var backgroundPlayback = BackgroundPlayback.foreground
     /// 短剧详情 over the player; the episode waits paused underneath and goes on when the sheet closes.
     @State private var detailVisible = false
@@ -41,6 +43,9 @@ struct PlayerScreen: View {
     @State private var seekDragAbandoned = false
     @State private var speedLockZone: SpeedLockZone?
     private var inlineForeground: Bool { scenePhase == .active && !surface.pipInProgress }
+    private var waitingForPlayback: Bool {
+        session.preparing || session.buffering || (session.isPlaying && !session.rendered)
+    }
     /// Holding for 2× hides the same elements, for as long as the hold lasts.
     private var chromeHidden: Bool { !inlineForeground || cleanScreen || session.holding || locked }
     private var awaitsBackgroundSuspension: Bool {
@@ -76,7 +81,7 @@ struct PlayerScreen: View {
                         }
                         .accessibilityElement()
                         .accessibilityLabel("视频画面")
-                        .accessibilityValue(session.speedLocked ? "已锁定 2 倍速" : "")
+                        .accessibilityValue(session.speedLocked ? "已锁定 2 倍速" : session.isPlaying ? "播放中" : session.player == nil ? "准备中" : "已暂停")
                         .accessibilityHint(videoAccessibilityHint)
                         .accessibilityAddTraits(.isButton)
                         .accessibilityAction { if locked { lockButtonVisible = true } else { session.toggle() } }
@@ -90,7 +95,7 @@ struct PlayerScreen: View {
                             }
                         }
                         .accessibilityHidden(!inlineForeground)
-                    Color.clear.frame(height: cleanScreen || locked ? 0 : (geometry.size.height < 420 ? 112 : 174)).allowsHitTesting(false)
+                    Color.clear.frame(height: cleanScreen || locked ? 0 : (geometry.size.height < 420 ? 76 : 92)).allowsHitTesting(false)
                 }.ignoresSafeArea(edges: cleanScreen || locked ? .all : []).zIndex(1)
                 if inlineForeground && landscape && (locked ? lockButtonVisible : !chromeHidden) {
                     lockButton.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading).padding(.leading, 18)
@@ -124,17 +129,27 @@ struct PlayerScreen: View {
                         }.buttonStyle(.plain).accessibilityLabel("退出小窗").accessibilityIdentifier("player.pip")
                     }
                     else if !inlineForeground || dragging || sliding { EmptyView() }
-                    else if session.preparing { preparationPanel.allowsHitTesting(false) }
                     else if let error = session.error { errorPanel(error) }
-                    else if chromeHidden { EmptyView() }
-                    else if session.buffering { ProgressView().tint(.white).scaleEffect(1.4).allowsHitTesting(false) }
-                    else if !session.isPlaying && session.player != nil {
+                    else if waitingForPlayback {
+                        DelayedPlaybackLoading {
+                            if session.preparing { preparationPanel }
+                            else { ProgressView("正在缓冲…").tint(.white) }
+                        }.id(session.playID).allowsHitTesting(false).accessibilityIdentifier("player.loading")
+                    }
+                    else if !chromeHidden && !session.isPlaying && session.rendered && session.player != nil {
                         Button(action: session.toggle) { Image(systemName: "play.fill").font(.system(size: 38)).frame(width: 82, height: 82).background(.black.opacity(0.3), in: Circle()) }.buttonStyle(.plain).accessibilityLabel("继续播放")
                     }
                     Spacer(minLength: 10)
                     if let end = session.endMessage { chrome { Text(end).font(.caption).foregroundStyle(.white.opacity(0.8)).padding(.bottom, 12) } }
                     chrome { bottomBar(compact: geometry.size.height < 420) }
                 }.padding(.horizontal, 20).padding(.top, 6).padding(.bottom, landscape ? 0 : 12).zIndex(2).allowsHitTesting(!sliding || surface.pipActive)
+                if !chromeHidden && !dragging && !sliding {
+                    sideActions
+                        .padding(.trailing, 10)
+                        .padding(.bottom, geometry.size.height < 420 ? 76 : 115)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                        .zIndex(2.5)
+                }
             }.foregroundStyle(.white)
             .overlay(alignment: .topTrailing) {
                 if inlineForeground && !locked {
@@ -169,7 +184,7 @@ struct PlayerScreen: View {
                 surface.onPiPEnd = { suspendBackgroundPlayback() }
                 session.onSlide = { target in slide(to: target) }; session.start()
             }
-            .onDisappear { session.stop(); surface.unbind(); InterfaceOrientationLock.lock(InterfaceOrientationLock.free, rotate: false) }
+            .onDisappear { unlock(); session.stop(); surface.unbind() }
             .onChange(of: inlineForeground) { _, foreground in
                 if !foreground {
                     session.endHold()
@@ -188,9 +203,6 @@ struct PlayerScreen: View {
                 guard awaitsBackgroundSuspension else { return }
                 try? await Task.sleep(for: .milliseconds(700))
                 if !Task.isCancelled { suspendBackgroundPlayback() }
-            }
-            .onChange(of: landscape) { _, wide in
-                if !wide && inlineForeground { unlock() }
             }
             // An episode that changes mid-drag (autoplay at the end of a 2× hold, for example) ends that drag. The
             // gesture view's own cancellation can arrive during a view update, where its state change is dropped.
@@ -212,13 +224,21 @@ struct PlayerScreen: View {
             }
             .onReceive(session.$endMessage.removeDuplicates().dropFirst()) { message in if message != nil { revealChrome() } }
             .onReceive(session.didPausePlayback) { revealChrome() }
+            .task(id: inlineForeground && !chromeHidden && session.rendered && !sheetVisible) {
+                guard inlineForeground, !chromeHidden, session.rendered, !sheetVisible,
+                      !didShowHint, hintDisplays < 3 else { return }
+                didShowHint = true
+                hintDisplays += 1
+                showingHint = true
+                defer { showingHint = false }
+                try? await Task.sleep(for: .seconds(4))
+            }
     }
 
     private func restoreFromBackground() {
         guard scenePhase == .active, backgroundPlayback != .foreground, surface.pipPhase != .starting else { return }
         backgroundPlayback = .foreground
         if surface.pipActive { surface.stopPictureInPicture() }
-        if !landscape { unlock() }
     }
 
     private func suspendBackgroundPlayback() {
@@ -241,9 +261,8 @@ struct PlayerScreen: View {
     /// Locking also holds the current landscape, so turning the phone does not leave full screen either.
     private func toggleLock() {
         if locked { unlock(); return }
+        guard let scene = surface.view.window?.windowScene, InterfaceOrientationLock.lockLandscape(in: scene) else { return }
         session.endHold(); cleanScreen = false
-        maskBeforeLock = InterfaceOrientationLock.mask
-        InterfaceOrientationLock.lock(.landscape, rotate: false)
         locked = true; lockButtonVisible = true
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
@@ -251,8 +270,7 @@ struct PlayerScreen: View {
     private func unlock() {
         guard locked else { return }
         locked = false; lockButtonVisible = false
-        if let mask = maskBeforeLock { InterfaceOrientationLock.lock(mask, rotate: false) }
-        maskBeforeLock = nil
+        InterfaceOrientationLock.unlock()
     }
 
     private var lockButton: some View {
@@ -323,14 +341,12 @@ struct PlayerScreen: View {
         landscape && !chromeHidden && session.isPlaying && !session.scrubbing && !sheetVisible
     }
 
-    /// 全屏观看 holds landscape; leaving it holds portrait until the player closes, even with the phone held sideways.
-    private func enterFullScreen() {
+    private func enterFullScreen() { requestOrientation(.landscape) }
+    private func exitFullScreen() { requestOrientation(.portrait) }
+
+    private func requestOrientation(_ orientation: UIInterfaceOrientationMask) {
         revealChrome()
-        InterfaceOrientationLock.lock(.landscape, rotate: true)
-    }
-    private func exitFullScreen() {
-        revealChrome()
-        InterfaceOrientationLock.lock(.portrait, rotate: true)
+        surface.view.window?.windowScene?.requestGeometryUpdate(.iOS(interfaceOrientations: orientation))
     }
 
     /// Controls fade out with the screen and stop taking touches and VoiceOver focus.
@@ -443,12 +459,19 @@ struct PlayerScreen: View {
                     Text("第 \(visibleEpisode.index) 集 / 共 \(session.detail.episodes.count) 集").font(.caption).foregroundStyle(.white.opacity(0.7))
                 }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading).contentShape(Rectangle())
             }.accessibilityLabel("\(session.detail.drama.title)，第 \(visibleEpisode.index) 集").accessibilityHint("打开短剧详情").accessibilityIdentifier("player.dramaTitle")
-            DiscussionControls { commentsVisible = true }
-            if surface.pipPossible {
-                Button(action: surface.startPictureInPicture) { Image(systemName: "pip.enter").font(.title3).frame(width: 40, height: 44) }.accessibilityLabel("小窗播放").accessibilityIdentifier("player.pip")
-            }
-            Button { library.toggleFavorite(session.detail.drama) } label: { Image(systemName: library.isFavorite(session.detail.drama) ? "star.fill" : "star").font(.title3).foregroundStyle(library.isFavorite(session.detail.drama) ? .yellow : .white).frame(width: 44, height: 44) }.accessibilityLabel(library.isFavorite(session.detail.drama) ? "取消本机收藏" : "添加本机收藏")
         }.buttonStyle(.plain)
+    }
+
+    private var sideActions: some View {
+        VStack(spacing: 4) {
+            let favorite = library.isFavorite(session.detail.drama)
+            Button { library.toggleFavorite(session.detail.drama) } label: {
+                Image(systemName: favorite ? "star.fill" : "star")
+                    .font(.system(size: 24, weight: .semibold)).foregroundStyle(favorite ? .yellow : .white)
+                    .frame(width: 44, height: 44).contentShape(Rectangle())
+            }.accessibilityLabel(favorite ? "取消本机收藏" : "添加本机收藏").accessibilityIdentifier("player.favorite")
+            DiscussionControls(vertical: true) { commentsVisible = true }
+        }.buttonStyle(.plain).shadow(color: .black.opacity(0.8), radius: 2, y: 1)
     }
 
     private var preparationPanel: some View {
@@ -460,21 +483,21 @@ struct PlayerScreen: View {
     }
 
     private func bottomBar(compact: Bool) -> some View {
-        VStack(alignment: .leading, spacing: compact ? 6 : 13) {
-            if !compact { HStack { Text("第 \(visibleEpisode.index) 集").font(.title3.bold()); Spacer(); Text("长按 2× · 纵滑锁定 · 横滑调进度").font(.caption2).foregroundStyle(.white.opacity(0.65)).lineLimit(1).minimumScaleFactor(0.8) } }
+        VStack(alignment: .leading, spacing: compact ? 0 : 3) {
+            if showingHint {
+                Text("长按 2× · 纵滑锁定 · 横滑调进度").font(.caption2)
+                    .foregroundStyle(.white.opacity(0.75)).accessibilityIdentifier("player.gestureHint")
+            }
             HStack(spacing: 10) {
                 Text(timeLabel(session.scrubbing ? session.previewPosition : session.position)).font(.caption.monospacedDigit()).frame(minWidth: 36)
                 Slider(value: Binding(get: { session.scrubbing ? session.previewPosition : session.position }, set: { session.previewPosition = $0 }), in: 0...max(session.duration, 1), onEditingChanged: session.setSeeking).tint(Color(hex: 0xF08058)).disabled(session.duration <= 0).accessibilityLabel("播放进度")
                 Text(timeLabel(session.duration)).font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.6)).frame(minWidth: 36)
             }
             HStack(spacing: 8) {
-                Button(action: session.previous) { Image(systemName: "backward.end.fill").frame(width: 38, height: 44).contentShape(Rectangle()) }.disabled(session.index == 0).accessibilityLabel("上一集")
-                Button(action: session.toggle) { Image(systemName: session.isPlaying ? "pause.fill" : "play.fill").frame(width: 38, height: 44).contentShape(Rectangle()) }.disabled(session.player == nil).accessibilityLabel(session.isPlaying ? "暂停" : "播放")
-                Button(action: session.next) { Image(systemName: "forward.end.fill").frame(width: 38, height: 44).contentShape(Rectangle()) }.disabled(session.index + 1 >= session.detail.episodes.count).accessibilityLabel("下一集")
+                Button { episodesVisible = true } label: { Label("选集", systemImage: "rectangle.stack").font(.subheadline.weight(.semibold)).frame(minHeight: 44).contentShape(Rectangle()) }.accessibilityIdentifier("player.episodes")
                 Spacer(minLength: 0)
                 Button { qualitiesVisible = true } label: { Text(session.quality.label).font(.subheadline.weight(.semibold)).frame(minWidth: 52, minHeight: 44).contentShape(Rectangle()) }.accessibilityLabel("清晰度").accessibilityValue(session.quality.label).accessibilityIdentifier("player.quality")
                 Button { speedsVisible = true } label: { Text(String(format: "%g×", session.playbackSpeed)).font(.subheadline.weight(.semibold)).frame(minWidth: 52, minHeight: 44).contentShape(Rectangle()) }.accessibilityLabel("播放倍速").accessibilityValue(session.speedLocked ? "已锁定 2 倍速" : speedLabel).accessibilityIdentifier("player.speed")
-                Button { episodesVisible = true } label: { Label("选集", systemImage: "square.grid.2x2").font(.subheadline.weight(.semibold)).frame(minHeight: 44).contentShape(Rectangle()) }.accessibilityIdentifier("player.episodes")
                 if landscape {
                     Button(action: exitFullScreen) { Image(systemName: "arrow.down.right.and.arrow.up.left").frame(width: 40, height: 44).contentShape(Rectangle()) }.accessibilityLabel("退出全屏").accessibilityIdentifier("player.exitFullScreen")
                 }
@@ -518,6 +541,28 @@ extension PlayerScreen {
             }.navigationTitle("清晰度").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { qualitiesVisible = false } } }
         }.presentationDetents([.height(300)]).presentationDragIndicator(.visible).preferredColorScheme(.dark)
+    }
+}
+
+struct DelayedPlaybackLoading<Content: View, Fallback: View>: View {
+    @ViewBuilder let content: () -> Content
+    @ViewBuilder let fallback: () -> Fallback
+    @State private var visible = false
+
+    var body: some View {
+        ZStack {
+            Color.clear.frame(width: 0, height: 0).allowsHitTesting(false).accessibilityHidden(true)
+            if visible { content() } else { fallback() }
+        }.task {
+            try? await Task.sleep(for: .milliseconds(450))
+            if !Task.isCancelled { visible = true }
+        }
+    }
+}
+
+extension DelayedPlaybackLoading where Fallback == EmptyView {
+    init(@ViewBuilder content: @escaping () -> Content) {
+        self.init(content: content, fallback: EmptyView.init)
     }
 }
 

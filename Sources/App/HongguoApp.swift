@@ -2,7 +2,6 @@ import SwiftUI
 
 @main
 struct HongguoApp: App {
-    /// Supplies the orientation lock used by 全屏观看.
     @UIApplicationDelegateAdaptor(HongguoAppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
     @StateObject private var library = LibraryStore.shared
@@ -52,7 +51,15 @@ struct RootView: View {
         .environment(\.colorScheme, model.isDark ? .dark : .light)
     }
     @ViewBuilder private var openingOverlay: some View {
-        if model.openingDramaID != nil { ZStack { Color.black.opacity(0.12).ignoresSafeArea(); ProgressView("正在获取选集…").padding(23).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 19)) } }
+        if scenePhase == .active, let dramaID = model.openingDramaID {
+            DelayedPlaybackLoading {
+                ZStack {
+                    Color.black.opacity(0.12).ignoresSafeArea()
+                    ProgressView("正在获取选集…")
+                        .padding(23).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 19))
+                }
+            }.id(dramaID)
+        }
     }
     private var openErrorVisible: Binding<Bool> { Binding(get: { model.openError != nil }, set: { if !$0 { model.openError = nil } }) }
     private var updatePromptDeferred: Bool { welcomeVisible || model.playback != nil }

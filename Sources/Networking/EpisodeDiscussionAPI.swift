@@ -6,6 +6,12 @@ struct EpisodeComment: Identifiable, Equatable, Sendable {
     let author: String
 }
 
+struct EpisodeCommentPreview: Equatable, Sendable {
+    let items: [EpisodeComment]
+    let totalCount: Int?
+    var previewCount: Int { items.count }
+}
+
 enum EpisodeDiscussionAPI {
     enum ReadError: LocalizedError, Equatable {
         case invalidIdentifier
@@ -25,7 +31,57 @@ enum EpisodeDiscussionAPI {
         }
     }
 
+    actor PreviewCache {
+        private struct Entry {
+            let preview: EpisodeCommentPreview
+            let expiresAt: ContinuousClock.Instant
+        }
+
+        private let lifetime: Duration
+        private let capacity: Int
+        private var entries: [URL: Entry] = [:]
+        private var pending: [URL: Task<EpisodeCommentPreview, Error>] = [:]
+
+        init(lifetime: Duration = .seconds(30), capacity: Int = 32) {
+            self.lifetime = lifetime
+            self.capacity = capacity
+        }
+
+        func preview(for url: URL, load: @escaping @Sendable () async throws -> EpisodeCommentPreview) async throws -> EpisodeCommentPreview {
+            try Task.checkCancellation()
+            if let entry = entries[url], entry.expiresAt > ContinuousClock.now { return entry.preview }
+            entries[url] = nil
+
+            let task: Task<EpisodeCommentPreview, Error>
+            if let ongoing = pending[url] {
+                task = ongoing
+            } else {
+                task = Task {
+                    defer { pending[url] = nil }
+                    let preview = try await load()
+                    store(preview, for: url)
+                    return preview
+                }
+                pending[url] = task
+            }
+            let preview = try await task.value
+            try Task.checkCancellation()
+            return preview
+        }
+
+        private func store(_ preview: EpisodeCommentPreview, for url: URL) {
+            guard capacity > 0, preview.previewCount <= 32 else { return }
+            let textBytes = preview.items.reduce(0) { $0 + $1.text.utf8.count + $1.author.utf8.count }
+            guard textBytes <= 16 * 1024 else { return }
+            if entries.count >= capacity, let oldest = entries.min(by: { $0.value.expiresAt < $1.value.expiresAt })?.key {
+                entries[oldest] = nil
+            }
+            entries[url] = Entry(preview: preview, expiresAt: ContinuousClock.now.advanced(by: lifetime))
+        }
+    }
+
     private static let maximumPageBytes = 8 * 1024 * 1024
+    private static let cache = PreviewCache()
     private static let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpShouldSetCookies = false
@@ -43,16 +99,23 @@ enum EpisodeDiscussionAPI {
     }
 
     static func comments(seriesID: String, episodeID: String) async throws -> [EpisodeComment] {
+        try await preview(seriesID: seriesID, episodeID: episodeID).items
+    }
+
+    static func preview(seriesID: String, episodeID: String) async throws -> EpisodeCommentPreview {
         guard let url = shareURL(seriesID: seriesID, episodeID: episodeID) else {
             throw ReadError.invalidIdentifier
         }
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
-        request.httpShouldHandleCookies = false
-        request.setValue("text/html", forHTTPHeaderField: "Accept")
-        let (bytes, response) = try await session.bytes(for: request)
+        return try await cache.preview(for: url) {
+            try await fetchPreview(url, seriesID: seriesID, episodeID: episodeID)
+        }
+    }
+
+    private static func fetchPreview(_ url: URL, seriesID: String, episodeID: String) async throws -> EpisodeCommentPreview {
+        let (bytes, response) = try await session.bytes(for: publicPageRequest(url))
         defer { bytes.task.cancel() }
         guard let http = response as? HTTPURLResponse, http.url == url else { throw ReadError.unexpectedPage }
-        try validateStatus(http.statusCode)
+        try validateStatus(http, episodeID: episodeID)
         guard http.expectedContentLength <= maximumPageBytes else { throw ReadError.responseTooLarge }
         var body = Data()
         if http.expectedContentLength > 0 { body.reserveCapacity(Int(http.expectedContentLength)) }
@@ -64,31 +127,45 @@ enum EpisodeDiscussionAPI {
         return try parse(String(decoding: body, as: UTF8.self), seriesID: seriesID, episodeID: episodeID)
     }
 
-    static func validateStatus(_ status: Int) throws {
-        switch status {
+    static func publicPageRequest(_ url: URL) -> URLRequest {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        request.httpShouldHandleCookies = false
+        request.setValue("text/html", forHTTPHeaderField: "Accept")
+        request.setValue(WebsiteCatalog.userAgent, forHTTPHeaderField: "User-Agent")
+        return request
+    }
+
+    static func validateStatus(_ response: HTTPURLResponse, episodeID: String) throws {
+        switch response.statusCode {
         case 200: return
-        case 300..<400, 401, 403, 404, 410: throw ReadError.unavailable
-        default: throw ReadError.httpStatus(status)
+        case 404, 410: throw ReadError.unavailable
+        case 300..<400:
+            if let location = response.value(forHTTPHeaderField: "Location"),
+               let redirect = URL(string: location, relativeTo: response.url)?.absoluteURL,
+               redirect.scheme == "https", redirect.host == response.url?.host, redirect.port == response.url?.port,
+               let components = URLComponents(url: redirect, resolvingAgainstBaseURL: false),
+               components.queryItems?.first(where: { $0.name == "pc_locked_episode" })?.value == episodeID {
+                throw ReadError.unavailable
+            }
+            throw ReadError.httpStatus(response.statusCode)
+        default: throw ReadError.httpStatus(response.statusCode)
         }
     }
 
-    static func parse(_ html: String, seriesID: String, episodeID: String) throws -> [EpisodeComment] {
-        let page = WebsiteCatalog.inlineRouterValue(html) { loaders in
-            loaders.values.compactMap { $0 as? [String: Any] }.first {
-                $0["seriesDetail"] != nil && $0["vid"] != nil
-            }
-        }
+    static func parse(_ html: String, seriesID: String, episodeID: String) throws -> EpisodeCommentPreview {
+        let page = WebsiteCatalog.inlineRouterValue(html) { $0["player_(series_id)/(vid)/page"] as? [String: Any] }
         guard let page,
               ProtocolJSON.identifier(ProtocolJSON.dictionary(page["seriesDetail"])["series_id"]) == seriesID,
               ProtocolJSON.identifier(page["vid"]) == episodeID else { throw ReadError.unexpectedPage }
         guard ProtocolJSON.bool(page["isSuccess"], default: true) else { throw ReadError.unavailable }
         let social = ProtocolJSON.dictionary(page["episodeSocialInfo"])
-        guard let reviews = ProtocolJSON.dictionary(social["reviews"])["reviews"] as? [Any] else {
+        let preview = ProtocolJSON.dictionary(social["reviews"])
+        guard let reviews = preview["reviews"] as? [Any] else {
             throw ReadError.unavailable
         }
 
         var seen = Set<String>()
-        return try reviews.compactMap { value in
+        let items: [EpisodeComment] = try reviews.compactMap { value in
             guard let review = value as? [String: Any], let content = review["content"] as? String else { return nil }
             let text = content.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return nil }
@@ -99,5 +176,7 @@ enum EpisodeDiscussionAPI {
             guard seen.insert(id).inserted else { return nil }
             return EpisodeComment(id: id, text: text, author: author)
         }
+        let total = Int(ProtocolJSON.text(preview["total_count"]))
+        return EpisodeCommentPreview(items: items, totalCount: total.flatMap { $0 >= 0 ? $0 : nil })
     }
 }
