@@ -122,9 +122,25 @@ final class HongguoQATests: XCTestCase {
     }
 
     func testNavigationSwipeReturnsOneLevel() {
+        checkNavigationSwipes(nativePopDeclines: false)
+    }
+
+    func testNavigationSwipeFallsBackWhenNativeDeclines() {
+        checkNavigationSwipes(nativePopDeclines: true)
+    }
+
+    private func checkNavigationSwipes(nativePopDeclines: Bool) {
         continueAfterFailure = false
+        let device = XCUIDevice.shared
+        let previousOrientation = device.orientation
+        device.orientation = .portrait
         let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        defer {
+            app.terminate()
+            device.orientation = previousOrientation
+        }
         app.launchArguments = ["-theme", "warm", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO"]
+        if nativePopDeclines { app.launchArguments.append("--qa-native-pop-declines") }
         app.launch()
 
         let myTab = app.tabBars.buttons["我的"]
@@ -136,11 +152,22 @@ final class HongguoQATests: XCTestCase {
         XCTAssertTrue(theme.wait(for: \.isHittable, toEqual: true, timeout: 5))
         theme.tap()
         let themeBar = app.navigationBars["主题样式"]
-        XCTAssertTrue(themeBar.waitForExistence(timeout: 5))
+        let themeBack = themeBar.buttons.firstMatch
+        XCTAssertTrue(themeBack.wait(for: \.isHittable, toEqual: true, timeout: 5))
         let settingsBar = app.navigationBars["设置"]
+        let settingsBack = settingsBar.buttons.firstMatch
 
-        swipeRight(in: app, from: 0.25)
-        XCTAssertTrue(settingsBar.waitForExistence(timeout: 5))
+        let introduction = app.staticTexts["选择喜欢的界面风格，点选后立即生效。收藏、历史与播放设置不受影响。"]
+        XCTAssertTrue(introduction.waitForExistence(timeout: 5))
+        let contentY = (introduction.frame.midY - app.frame.minY) / app.frame.height
+        let center = app.coordinate(withNormalizedOffset: CGVector(dx: 0.50, dy: contentY))
+        let shortDrag = center.withOffset(CGVector(dx: 44, dy: 0))
+        center.press(forDuration: 0.05, thenDragTo: shortDrag, withVelocity: .slow, thenHoldForDuration: 0.5)
+        XCTAssertTrue(themeBack.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        XCTAssertFalse(settingsBack.isHittable)
+
+        swipeRight(in: app, from: 0.50, to: 0.95, at: contentY)
+        XCTAssertTrue(settingsBack.wait(for: \.isHittable, toEqual: true, timeout: 5))
         XCTAssertFalse(themeBar.exists)
         XCTAssertFalse(settings.isHittable)
 
@@ -184,7 +211,7 @@ final class HongguoQATests: XCTestCase {
         openEpisodeFromDetail(2, in: app)
         assertPlayback("播放中", in: app)
 
-        swipeRight(in: app, from: 0.25)
+        swipeRight(in: app, from: 0.50, to: 0.95)
         XCTAssertTrue(detailBar.buttons.firstMatch.wait(for: \.isHittable, toEqual: true, timeout: 5))
         swipeRight(in: app, from: 0)
         assertEpisode(1, in: app)
@@ -993,9 +1020,9 @@ final class HongguoQATests: XCTestCase {
         XCTAssertTrue(playButtons.firstMatch.waitForExistence(timeout: 30))
     }
 
-    private func swipeRight(in element: XCUIElement, from start: CGFloat) {
-        let origin = element.coordinate(withNormalizedOffset: CGVector(dx: start, dy: 0.5))
-        let destination = element.coordinate(withNormalizedOffset: CGVector(dx: 0.75, dy: 0.5))
+    private func swipeRight(in element: XCUIElement, from start: CGFloat, to end: CGFloat = 0.75, at y: CGFloat = 0.5) {
+        let origin = element.coordinate(withNormalizedOffset: CGVector(dx: start, dy: y))
+        let destination = element.coordinate(withNormalizedOffset: CGVector(dx: end, dy: y))
         origin.press(forDuration: start == 0 ? 0 : 0.05, thenDragTo: destination, withVelocity: .fast, thenHoldForDuration: 0)
     }
 

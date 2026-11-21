@@ -664,7 +664,11 @@ final class PlayerSession: ObservableObject {
     private func setStagedEpisode(_ episode: OpenEpisode?) {
         guard stagedEpisode !== episode else { return }
         stagedEpisode = episode
-        trace(episode == nil ? "unstaged" : "staged")
+        if let episode {
+            trace("staged itemDuration=\(episode.item.duration.seconds)")
+        } else {
+            trace("unstaged")
+        }
         stagedItemObservation = episode?.item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor in
                 guard let self, self.stagedEpisode?.item === item, item.status == .failed else { return }

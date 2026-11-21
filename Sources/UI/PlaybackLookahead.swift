@@ -29,12 +29,11 @@ struct PlaybackTarget {
 final class OpenEpisode {
     let detail: DramaDetail
     let stream: ProgressivePlayback
-    let item: AVPlayerItem
+    private(set) lazy var item = AVPlayerItem(asset: stream.asset, automaticallyLoadedAssetKeys: ["duration", "tracks"])
 
     init(detail: DramaDetail, stream: ProgressivePlayback) {
         self.detail = detail
         self.stream = stream
-        item = AVPlayerItem(asset: stream.asset, automaticallyLoadedAssetKeys: ["duration", "tracks"])
     }
 
     deinit { stream.close() }

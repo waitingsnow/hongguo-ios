@@ -125,6 +125,10 @@ struct InteractiveBackSwipe: UIViewControllerRepresentable {
     }
 
     final class Controller: UIViewController, UIGestureRecognizerDelegate {
+        #if DEBUG
+        private static let testNativePopDeclines = ProcessInfo.processInfo.arguments.contains("--qa-native-pop-declines")
+        #endif
+
         var enabled = false
         var pop: (() -> Void)?
         private weak var owner: UIViewController?
@@ -172,7 +176,8 @@ struct InteractiveBackSwipe: UIViewControllerRepresentable {
             install(navigationController.interactivePopGestureRecognizer)
             if #available(iOS 26.0, *) {
                 install(navigationController.interactiveContentPopGestureRecognizer)
-            } else if backPan.view == nil {
+            }
+            if backPan.view !== navigationController.view {
                 navigationController.view.addGestureRecognizer(backPan)
             }
         }
@@ -202,8 +207,13 @@ struct InteractiveBackSwipe: UIViewControllerRepresentable {
                   navigationController.viewControllers.count > 1, navigationController.transitionCoordinator == nil,
                   navigationController.presentedViewController == nil else { return false }
             if gestureRecognizer === backPan {
-                return HorizontalSwipeDirection(movement: backPan.velocity(in: backPan.view)) == .right
+                let translation = backPan.translation(in: backPan.view)
+                let movement = translation == .zero ? backPan.velocity(in: backPan.view) : translation
+                return HorizontalSwipeDirection(movement: movement) == .right
             }
+            #if DEBUG
+            if Self.testNativePopDeclines { return false }
+            #endif
             return true
         }
 
@@ -220,15 +230,20 @@ struct InteractiveBackSwipe: UIViewControllerRepresentable {
             return true
         }
 
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRequireFailureOf other: UIGestureRecognizer) -> Bool {
+            gestureRecognizer === backPan && other.isEnabled && gestures.contains { $0.recognizer === other }
+        }
+
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
-            if other === backPan { return gestureRecognizer === navigationController?.interactivePopGestureRecognizer }
+            guard other !== backPan, !gestures.contains(where: { $0.recognizer === other }) else { return false }
             guard let ownerView = owner?.viewIfLoaded, let otherView = other.view else { return false }
             return other is UIPanGestureRecognizer && otherView.isDescendant(of: ownerView)
         }
 
         @objc private func handleBackPan(_ pan: UIPanGestureRecognizer) {
             guard pan.state == .ended, enabled, let view = pan.view, let owner, let navigationController,
-                  owner === navigationController.topViewController, navigationController.transitionCoordinator == nil,
+                  owner === navigationController.topViewController, navigationController.viewControllers.count > 1,
+                  navigationController.transitionCoordinator == nil,
                   navigationController.presentedViewController == nil else { return }
             let minimumDistance = max(56, min(100, view.bounds.width * 0.25))
             guard HorizontalSwipeDirection(movement: pan.translation(in: view), minimumDistance: minimumDistance) == .right else { return }
