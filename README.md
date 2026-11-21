@@ -8,35 +8,13 @@
 
 基于 SwiftUI 与 AVFoundation 构建的原生 iOS 短剧客户端。<br>请求签名、媒体解密、缓存与播放均在本机完成，无需部署服务器或配置 API key。
 
-[![Release](https://img.shields.io/github/v/release/waitingsnow/hongguo-ios?label=Release&color=F15A2B)](https://github.com/waitingsnow/hongguo-ios/releases/latest) [![iOS](https://img.shields.io/badge/iOS-17.0%2B-000000?logo=apple&logoColor=white)](#下载与安装) [![UI](https://img.shields.io/badge/UI-SwiftUI-F05138?logo=swift&logoColor=white)](#功能一览) [![License](https://img.shields.io/badge/License-GPL--3.0--only-blue)](LICENSE)
+[![iOS](https://img.shields.io/badge/iOS-17.0%2B-000000?logo=apple&logoColor=white)](#源码构建) [![UI](https://img.shields.io/badge/UI-SwiftUI-F05138?logo=swift&logoColor=white)](#功能一览) [![License](https://img.shields.io/badge/License-GPL--3.0--only-blue)](LICENSE)
 
-[**添加全能签源**](#全能签在线源) · [下载 IPA](https://github.com/waitingsnow/hongguo-ios/releases/latest) · [功能一览](#功能一览) · [源码构建](#源码构建) · [反馈问题](https://github.com/waitingsnow/hongguo-ios/issues)
+[功能一览](#功能一览) · [源码构建](#源码构建) · [反馈问题](https://github.com/waitingsnow/hongguo-ios/issues)
 
 </div>
 
-## 下载与安装
-
-发布的是 **无签名 IPA**（iPhone arm64，iOS 17.0 及以上），需要用你自己的签名工具签名后安装。
-
-### 全能签在线源
-
-推荐方式：在全能签的「软件源」中添加下面任一地址，之后有新版本会在源里直接显示。三条线路对应同一个 IPA，选当前网络能访问的即可。
-
-| 线路 | 软件源地址 |
-| --- | --- |
-| 官方 GitHub | `https://raw.githubusercontent.com/waitingsnow/hongguo-ios/main/distribution/source.json` |
-| 加速一 gh-proxy | `https://gh-proxy.com/https://raw.githubusercontent.com/waitingsnow/hongguo-ios/main/distribution/source-cn.json` |
-| 加速二 ghfast | `https://ghfast.top/https://raw.githubusercontent.com/waitingsnow/hongguo-ios/main/distribution/source-cn-backup.json` |
-
-加速线路由第三方提供，可用性取决于当地网络；连不上时换一条，或切回官方直连。源格式参考[全能签官方源](https://qnq.nuosike.cn/)。
-
-### 手动下载
-
-在 [GitHub Releases](https://github.com/waitingsnow/hongguo-ios/releases/latest) 下载 `Hongguo-iOS-<版本>-unsigned.ipa`，同页附有 SHA-256 校验文件和对应源码。
-
-> **已安装旧版？** 覆盖安装即可保留收藏、历史与续播位置。签名时保持相同的 Bundle ID 和兼容的签名配置，否则系统会当成新应用，本机数据和账号登录无法恢复。
-
-应用内「我的 → 设置 → 检查更新与全能签源」也能检查新版本：可切换官方与加速线路，下载后核对版本、大小和 SHA-256，再导出给你的签名工具。应用无法自行安装无签名包。
+仓库提供源码。安装时请在本机完成构建与签名。覆盖安装旧版时，使用相同的 Bundle ID 和兼容的签名配置，以保留本机数据。
 
 ## 功能一览
 
@@ -118,9 +96,7 @@ bash scripts/test-progressive-live.sh --live
 
 测试不需要本人账号，也不会打印设备身份、Cookie、媒体密钥或完整媒体 URL。各版本的验证记录与尚未验证的部分见 [VALIDATION.md](VALIDATION.md)。
 
-## 发布
-
-推送 `v<版本>` 标签后，GitHub Actions 会构建并校验无签名 IPA，上传 Release，再同步三条全能签源与应用内更新清单。完整流程、本机发布与故障恢复见 [RELEASING.md](RELEASING.md)。
+本机签名和真机安装流程见 [RELEASING.md](RELEASING.md)。
 
 ## 开源与来源
 
