@@ -258,15 +258,15 @@ final class PlayerSession: ObservableObject {
     }
 
     private func makePlayer(_ player: AVPlayer = AVQueuePlayer()) -> AVPlayer {
-        player.actionAtItemEnd = .pause
+        setEndAction(.pause, on: player)
         // AVPlayer waits for enough data and then resumes by itself. Without this a slow range stalled playback and
         // left it paused until the user tapped.
         player.automaticallyWaitsToMinimizeStalling = true
         playerObservations.append(player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, change in
-            let status = change.newValue
+            let status = change.newValue ?? player.timeControlStatus
             Task { @MainActor in
                 guard let self, self.player === player else { return }
-                self.trace("transport=\(status?.rawValue ?? -1)")
+                self.trace("transport=\(status.rawValue)")
                 self.adoptQueuedEpisodeIfNeeded()
                 guard !self.pauseIfSleepTimerExpired() else { return }
                 if self.pausedBySleepTimer {
@@ -558,14 +558,17 @@ final class PlayerSession: ObservableObject {
 
     @discardableResult
     private func adoptQueuedEpisodeIfNeeded() -> Bool {
-        guard let player, let next = stagedEpisode, player.currentItem === next.item,
+        guard let player = player as? AVQueuePlayer, let next = stagedEpisode, player.currentItem === next.item,
               detail.episodes.indices.contains(index + 1), !stopped, !preparing, !finished else { return false }
         let target = PlaybackTarget(detail, index: index + 1, quality: quality)
-        trace("native-advance nextSize=\(next.item.presentationSize) nextDuration=\(next.item.duration.seconds)")
         pendingItemEnd = nil
-        setStagedEpisode(nil)
-        updateEndAction(autoNext: app.autoNext)
         lookahead.consumePrepared(next, for: target)
+        let successor = detail.episodes.indices.contains(target.index + 1)
+            ? PlaybackTarget(detail, index: target.index + 1, quality: quality) : nil
+        let staged = lookahead.stageNext(successor, on: player)
+        setStagedEpisode(staged)
+        updateEndAction(autoNext: app.autoNext)
+        trace("native-advance nextSize=\(next.item.presentationSize) nextDuration=\(next.item.duration.seconds) successorPrepared=\(successor.flatMap { lookahead.preparedEpisode(for: $0) } != nil) successorStaged=\(staged != nil) successorStatus=\(staged.map { String($0.item.status.rawValue) } ?? "none")")
         recordCompletion()
         removeItemObservers()
         frameTask?.cancel(); frameTask = nil
@@ -652,7 +655,8 @@ final class PlayerSession: ObservableObject {
         if let queue = player as? AVQueuePlayer, !finished, player.timeControlStatus != .paused,
            player.currentItem === currentPlaybackItem {
             let next = lookahead.stageNext(targets.first, on: queue)
-            if !adoptQueuedEpisodeIfNeeded() { setStagedEpisode(next) }
+            guard !adoptQueuedEpisodeIfNeeded() else { return }
+            setStagedEpisode(next)
             updateEndAction(autoNext: app.autoNext)
         }
     }
@@ -674,9 +678,16 @@ final class PlayerSession: ObservableObject {
         guard let player else { return }
         let shouldAdvance = autoNext && stagedEpisode != nil && stagedEpisode?.item.status != .failed
             && !stopsAtEpisodeEnd && !pausedBySleepTimer
+            && (sleepDeadline.map { sleepClock.now < $0 } ?? true)
             && !stopped && !finished && error == nil
-        let action: AVPlayer.ActionAtItemEnd = shouldAdvance ? .advance : .pause
-        if player.actionAtItemEnd != action { player.actionAtItemEnd = action }
+        setEndAction(shouldAdvance ? .advance : .pause, on: player)
+    }
+
+    private func setEndAction(_ action: AVPlayer.ActionAtItemEnd, on player: AVPlayer) {
+        let previous = player.actionAtItemEnd
+        guard previous != action else { return }
+        player.actionAtItemEnd = action
+        trace("end-action=\(action == .advance ? "advance" : "pause") previous=\(previous.rawValue)")
     }
 
     private func saveProgress(flush: Bool = false) {

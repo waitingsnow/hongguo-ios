@@ -28,6 +28,7 @@ struct PlaybackContinuityProbe {
     }
 
     static func verifyNativeAdvance(_ session: PlayerSession, player: AVQueuePlayer, expectedRate: Float,
+                                    successor: AVPlayerItem?,
                                     checkDelayedAdvance: Bool = false,
                                     opened: () -> Int?) async throws {
         try await eventually("active series never queued the next episode with native advance enabled") {
@@ -49,10 +50,17 @@ struct PlaybackContinuityProbe {
         }
         var transitions = 0
         var savedCompletion = false
+        var adoptedWithExpectedQueue = false
         let episodeChange = session.$playID.dropFirst().sink { _ in
             transitions += 1
             let saved = session.app.library.progress(for: session.detail.drama.id)
             savedCompletion = saved?.episodeID == previous.id && saved?.position == 0
+            let items = player.items()
+            if let successor {
+                adoptedWithExpectedQueue = items.count == 2 && items[1] === successor && player.actionAtItemEnd == .advance
+            } else {
+                adoptedWithExpectedQueue = items.count == 1 && player.actionAtItemEnd == .pause
+            }
         }
         defer { episodeChange.cancel() }
         try await seekNearEnd(player)
@@ -60,8 +68,8 @@ struct PlaybackContinuityProbe {
             player.timeControlStatus == .playing && player.rate == expectedRate
         }
         let pauses = OSAllocatedUnfairLock(initialState: 0)
-        let status = player.observe(\.timeControlStatus, options: [.new]) { @Sendable _, change in
-            if change.newValue == .paused { pauses.withLock { $0 += 1 } }
+        let status = player.observe(\.timeControlStatus, options: [.new]) { @Sendable player, change in
+            if (change.newValue ?? player.timeControlStatus) == .paused { pauses.withLock { $0 += 1 } }
         }
         let rate = player.observe(\.rate, options: [.new]) { @Sendable _, change in
             if change.newValue == 0 { pauses.withLock { $0 += 1 } }
@@ -73,6 +81,7 @@ struct PlaybackContinuityProbe {
         try require(pauses.withLock { $0 } == 0, "native transition paused playback")
         try require(player.rate == expectedRate && session.isPlaying, "native transition lost playback speed")
         try require(transitions == 1 && opened() == openCount, "native transition duplicated a switch or reopened an item")
+        try require(adoptedWithExpectedQueue, "native handoff did not immediately publish the expected successor and end action")
         try require(savedCompletion, "native transition did not settle the previous episode's progress")
         try require(session.app.library.progress(for: session.detail.drama.id)?.episodeID == session.episode.id,
                     "native transition did not record the new episode")
@@ -181,10 +190,27 @@ struct PlaybackContinuityProbe {
         try require(pauseEvents == 1 && !nextSession.isPlaying, "explicit foreground pause must reveal the controls")
         nextSession.toggle()
         try await eventually("second episode did not resume") { nextSession.isPlaying }
-        try await verifyNativeAdvance(nextSession, player: seriesPlayer, expectedRate: 1.5, checkDelayedAdvance: true) { opened[2] }
+        try await eventually("both successors were not preheated before the native handoff") {
+            queue.update(Array(targets[2...3]), depth: 2)
+            return queue.preparedEpisode(for: targets[3]) != nil
+                && seriesPlayer.items().count == 2 && seriesPlayer.actionAtItemEnd == .advance
+        }
+        guard let successor = queue.preparedEpisode(for: targets[3]) else { throw Failure(message: "missing preheated successor") }
         nextSession.lockSpeed()
-        try require(nextSession.speedLocked, "could not lock 2× before the next transition")
-        try await verifyNativeAdvance(nextSession, player: seriesPlayer, expectedRate: 2) { opened[3] }
+        try require(nextSession.speedLocked, "could not lock 2× before the native transitions")
+        let endActions = OSAllocatedUnfairLock(initialState: [AVPlayer.ActionAtItemEnd]())
+        let endActionObservation = seriesPlayer.observe(\.actionAtItemEnd, options: [.new]) { @Sendable player, change in
+            let action = change.newValue ?? player.actionAtItemEnd
+            endActions.withLock { $0.append(action) }
+        }
+        defer { endActionObservation.invalidate() }
+        try await verifyNativeAdvance(nextSession, player: seriesPlayer, expectedRate: 2, successor: successor.item,
+                                      checkDelayedAdvance: true) { opened[2] }
+        try require(endActions.withLock { $0.isEmpty }, "end action changed on the way to the second native advance")
+        try await verifyNativeAdvance(nextSession, player: seriesPlayer, expectedRate: 2, successor: nil) { opened[3] }
+        try require(endActions.withLock { $0 } == [.pause], "end action must change exactly once, on entry to the last episode")
+        endActionObservation.invalidate()
+        print("PASS: two native 2× advances with continuous .advance until the final episode")
         try require(nextSession.speedLocked && pauseEvents == 1, "autoplay changed the speed lock or reported a user pause")
         let lastTicket = nextSession.playID
         let lastItem = seriesPlayer.currentItem

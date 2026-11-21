@@ -163,10 +163,15 @@ final class PlaybackLookahead {
         failedAt.removeAll()
     }
 
+    func preparedEpisode(for target: PlaybackTarget) -> OpenEpisode? {
+        guard let episode = slots[target.key]?.preparedEpisode, episode.item.status != .failed else { return nil }
+        return episode
+    }
+
     @discardableResult
     func stageNext(_ target: PlaybackTarget?, on player: AVQueuePlayer) -> OpenEpisode? {
-        let episode = target.flatMap { slots[$0.key]?.preparedEpisode }
-        let next = episode.flatMap { $0.item.status != .failed ? $0.item : nil }
+        let episode = target.flatMap { preparedEpisode(for: $0) }
+        let next = episode?.item
         let queued = player.items().dropFirst()
         if let next, player.currentItem === next || queued.first === next { return episode }
         for item in queued { player.remove(item) }
