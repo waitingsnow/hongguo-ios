@@ -7,6 +7,8 @@ import importlib.util
 import json
 import plistlib
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -19,13 +21,15 @@ spec.loader.exec_module(feeds)
 release_spec = importlib.util.spec_from_file_location("release_common", Path(__file__).with_name("release-common.py"))
 release = importlib.util.module_from_spec(release_spec)
 release_spec.loader.exec_module(release)
+verify_path = Path(__file__).with_name("verify-ipa.py")
 
 
 class FeedTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="hongguo-feed-tests-")
         self.root = Path(self.temporary.name)
-        self.config = {"version": "0.1.1", "build": 2, "repository": "waitingsnow/hongguo-ios", "minimumOSVersion": "17.0", "releaseNotes": ["合成发布测试"]}
+        self.config = {"version": "0.1.1", "build": 2, "repository": "waitingsnow/hongguo-ios", "minimumOSVersion": "17.0",
+                       "minimumBuildSDK": "27.1", "releaseNotes": ["合成发布测试"]}
         self.config_path = self.root / "Release.json"
         self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
         self.output = self.root / "distribution"
@@ -36,9 +40,11 @@ class FeedTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def package(self, changes=None, *, signature=False, profile=False, signature_directory=False, platform=2, deployment=17 << 16, corrupt_path=False):
+    def package(self, changes=None, *, signature=False, profile=False, signature_directory=False, platform=2, deployment=17 << 16,
+                corrupt_path=False, extra=(), binary_data=b""):
         info = {"CFBundleIdentifier": feeds.BUNDLE_ID, "CFBundleShortVersionString": "0.1.1", "CFBundleVersion": "2",
-                "MinimumOSVersion": "17.0", "CFBundleSupportedPlatforms": ["iPhoneOS"], "CFBundleExecutable": "Hongguo"}
+                "MinimumOSVersion": "17.0", "CFBundleSupportedPlatforms": ["iPhoneOS"], "CFBundleExecutable": "Hongguo",
+                "DTPlatformVersion": "27.2"}
         info.update(changes or {})
         command = struct.pack("<6I", 0x32, 24, platform, deployment, 0, 0)
         if signature:
@@ -47,8 +53,8 @@ class FeedTests(unittest.TestCase):
         with zipfile.ZipFile(self.ipa, "w") as archive:
             prefix = "Payload/Hongguo.app/"
             archive.writestr(prefix + "Info.plist", plistlib.dumps(info))
-            archive.writestr(prefix + "Hongguo", binary)
-            for resource in ("PureSign.js", "BufferRuntime.js", "Assets.car"):
+            archive.writestr(prefix + "Hongguo", binary + binary_data)
+            for resource in ("PureSign.js", "BufferRuntime.js", "PlayerSignV5.js", "Assets.car"):
                 archive.writestr(prefix + resource, b"synthetic test resource")
             if profile:
                 archive.writestr(prefix + "embedded.mobileprovision", b"synthetic")
@@ -56,6 +62,8 @@ class FeedTests(unittest.TestCase):
                 archive.writestr(prefix + "_CodeSignature/CodeResources", b"synthetic")
             if corrupt_path:
                 archive.writestr("../../escape", b"synthetic")
+            for name, contents in extra:
+                archive.writestr(name, contents)
 
     def generate(self, **options):
         return feeds.generate(self.config_path, self.ipa, self.output, tag="v0.1.1", published_at="2026-10-28T12:00:00Z", use_codesign=False, **options)
@@ -96,6 +104,72 @@ class FeedTests(unittest.TestCase):
                 self.package(**options)
                 with self.assertRaises(feeds.ValidationError):
                     self.generate()
+
+    def test_private_ipa_resources_are_rejected_before_extraction(self):
+        for name in ("alternate.MobileProvision", "Developer.PROVISIONPROFILE", "Certificate.CER", "keys/key.P12",
+                     "AppleAuth.P8", "certificate.pem", "codesign.xcent", "debug.entitlements",
+                     "nested/_codesignature/CodeResources", ".env.local", "Configuration/Local.xcconfig"):
+            with self.subTest(name=name):
+                self.package(extra=[("Payload/Hongguo.app/" + name, b"fixture only")])
+                with self.assertRaisesRegex(feeds.ValidationError, "Private paths or signing material"):
+                    self.generate()
+
+    def test_new_build_rejects_private_home_paths_without_echoing_them(self):
+        for path, kind in [(b"/Users/fixture-person/Development/File.swift", "macOS home"),
+                           (b"/System/Volumes/Data/Users/fixture-person", "macOS home"),
+                           (b"/private/var/root/Sources", "macOS root home"),
+                           (b"/home/fixture-person/work.c", "Linux home"),
+                           (b"/root/source", "Linux root home"),
+                           (rb"C:\Users\fixture-person\source", "Windows home")]:
+            with self.subTest(kind=kind):
+                self.package(binary_data=b"\0" * (65536 - 60) + path + b"\0")
+                result = subprocess.run([sys.executable, "-O", verify_path, self.ipa, "--config", self.config_path],
+                                        capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"Private absolute home path detected ({kind})".encode(), result.stderr)
+                self.assertNotIn(path, result.stderr + result.stdout)
+                self.generate()
+                self.generate(check=True)
+
+    def test_new_build_resource_scan_accepts_public_paths_and_rejects_renamed_material(self):
+        def verify():
+            return subprocess.run([sys.executable, verify_path, self.ipa, "--config", self.config_path],
+                                  capture_output=True, text=True)
+
+        self.package(binary_data=b"\0/Users/Shared/work\0docs/Users/example\0")
+        self.assertEqual(verify().returncode, 0)
+        for contents, message in [(b"-----BEGIN PRIVATE KEY-----\nZml4dHVyZQ==\n", "PEM signing material"),
+                                  (bytes.fromhex("cffaedfe"), "Unexpected embedded Mach-O")]:
+            self.package(extra=[("Payload/Hongguo.app/resources.bin", contents)])
+            result = verify()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(message, result.stderr)
+
+    def test_new_build_rejects_uid_gid_extra_fields_in_both_zip_headers(self):
+        entry = zipfile.ZipInfo("Payload/Hongguo.app/metadata.txt")
+        entry.extra = struct.pack("<HH", 0x7875, 7) + b"\x01\x02\xe8\x03\x02\xe8\x03"
+        self.package(extra=[(entry, b"fixture")])
+        original = self.ipa.read_bytes()
+        for local_only, location in [(False, "central-directory"), (True, "local-header")]:
+            with self.subTest(location=location):
+                if local_only:
+                    with zipfile.ZipFile(self.ipa) as archive:
+                        central = archive.start_dir
+                        for item in archive.infolist()[:-1]:
+                            central += 46 + len(item.filename) + len(item.extra) + len(item.comment)
+                    data = bytearray(original)
+                    start_extra = central + 46 + len(entry.filename)
+                    del data[start_extra:start_extra + len(entry.extra)]
+                    struct.pack_into("<H", data, central + 30, 0)
+                    end_record = len(data) - 22
+                    struct.pack_into("<I", data, end_record + 12, end_record - archive.start_dir)
+                    self.ipa.write_bytes(data)
+                result = subprocess.run([sys.executable, verify_path, self.ipa, "--config", self.config_path],
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"ZIP {location} extra fields", result.stderr)
+                self.generate()
+                self.generate(check=True)
 
     def test_bad_archive_traversal_and_binary_target_are_rejected(self):
         for options in [{"corrupt_path": True}, {"platform": 7}, {"deployment": 16 << 16}]:

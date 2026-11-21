@@ -20,7 +20,7 @@
 
 ## 本机发布
 
-GitHub 排不到 macOS runner 时，可在本机完成同样的步骤。先准备并检查发布材料：
+GitHub 排不到 macOS runner 时，可在本机完成同样的步骤。在已提交、工作区干净的版本上创建对应标签后，准备并检查发布材料。源码包和 IPA 都从该标签的文件构建：
 
 ```sh
 bash scripts/release.sh v0.1.16

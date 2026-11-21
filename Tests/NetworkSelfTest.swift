@@ -296,6 +296,7 @@ import JavaScriptCore
         precondition(WebsiteCatalog.parseSuggestions(["suggest_list": (1...12).map { ["name": "剧\($0)"] }]).count == 8)
         precondition(WebsiteCatalog.parseSuggestions(["suggest_list": [["name":"甲"],["display_words":["乙"]],["name":"甲"],["name":" "]]]) == ["甲","乙"])
         print("PASS: website boards and suggestions.")
+        try await checkEpisodeDiscussion()
         // Signed playback: the full GetVideoModelRequest query, the registered identity in the query and the official
         // player's version and headers; object/string model, rejection of unusable replies.
         let identity = RegisteredIdentity(deviceID: "9999999999999999999", installID: "9999999999999999998", cdid: "offline", appDeviceCookie: "install_id=1; ttreq=2")
@@ -529,5 +530,45 @@ import JavaScriptCore
         print("PASS: video_tab playback model request and parsing.")
         try await playbackRecoveryChecks(resources: resources)
         print("PASS: 4 original Node signing vectors; exact 20/30-digit IDs; numeric-token parsing; binary/gzip body digest; URL spaces; cancelled query rejects before HTTP.")
+    }
+
+    static func checkEpisodeDiscussion() async throws {
+        let series = "7700000000000000001", episode = "7700000000000000002"
+        let otherEpisode = "7700000000000000003"
+        func page(_ reviewField: String, vid: String = episode) -> String {
+            #"<script>_ROUTER_DATA = {"loaderData":{"player_layout":null,"player_(series_id)/(vid)/page":{"isSuccess":true,"seriesDetail":{"series_id":\#(series)},"vid":\#(vid),"seriesSocialInfo":{"reviews":{"reviews":[{"content":"整剧剧评"}]}},"episodeSocialInfo":{\#(reviewField)}}}};</script>"#
+        }
+        let fixture = #""reviews":{"total_count":600,"reviews":[{"content":"  带有 } 和 { 的评论  ","user_name":"甲","create_time":1700000000,"digg_count":1},{"content":"带有 } 和 { 的评论","user_name":"甲","create_time":1700000000,"digg_count":2},{"content":"匿名评论","create_time":1700000001},{"content":" "},{"content":123},null]}"#
+        let comments = try EpisodeDiscussionAPI.parse(page(fixture), seriesID: series, episodeID: episode)
+        precondition(comments.map(\.text) == ["带有 } 和 { 的评论", "匿名评论"] && comments.map(\.author) == ["甲", ""])
+        let withMoreLikes = try EpisodeDiscussionAPI.parse(page(fixture.replacingOccurrences(of: "digg_count\":1", with: "digg_count\":7")), seriesID: series, episodeID: episode)
+        precondition(comments == withMoreLikes)
+        let acrossEpisodes = try EpisodeDiscussionAPI.parse(page(fixture, vid: otherEpisode), seriesID: series, episodeID: otherEpisode)
+        precondition(comments.map(\.id) != acrossEpisodes.map(\.id))
+        let empty = try EpisodeDiscussionAPI.parse(page(#""reviews":{"total_count":0,"reviews":[]}"#), seriesID: series, episodeID: episode)
+        precondition(empty.isEmpty)
+        do {
+            _ = try EpisodeDiscussionAPI.parse(page(""), seriesID: series, episodeID: episode)
+            fatalError("Missing episode preview must not be presented as a valid empty list or as series reviews")
+        } catch EpisodeDiscussionAPI.ReadError.unavailable { }
+        do {
+            _ = try EpisodeDiscussionAPI.parse(page(fixture, vid: otherEpisode), seriesID: series, episodeID: episode)
+            fatalError("A different episode's comments must not be returned")
+        } catch EpisodeDiscussionAPI.ReadError.unexpectedPage { }
+        do {
+            try EpisodeDiscussionAPI.validateStatus(302)
+            fatalError("A locked episode redirect must not be accepted")
+        } catch EpisodeDiscussionAPI.ReadError.unavailable { }
+        do {
+            try EpisodeDiscussionAPI.validateStatus(429)
+            fatalError("Rate limiting must not be presented as an empty preview")
+        } catch EpisodeDiscussionAPI.ReadError.httpStatus(429) { }
+        do {
+            _ = try await EpisodeDiscussionAPI.comments(seriesID: "../\(series)", episodeID: episode)
+            fatalError("Invalid identifiers must fail before networking")
+        } catch EpisodeDiscussionAPI.ReadError.invalidIdentifier { }
+        precondition(EpisodeDiscussionAPI.shareURL(seriesID: series, episodeID: episode)?.absoluteString ==
+            "https://hongguoduanju.com/player/\(series)/\(episode)")
+        print("PASS: anonymous episode comment preview, precise IDs, stable deduplication, empty/mismatched/locked pages.")
     }
 }

@@ -28,6 +28,9 @@ actor ProgressiveSource {
         return min(readAhead, ProgressiveCache.blockSize * (1 + 2 * max(0, readAheadFrom - streakStart)))
     }
     private var runs: [UUID: Task<[Data], Error>] = [:]
+    private var warmRun: (id: UUID, blocks: ClosedRange<Int>)?
+    private var warmWaiters: [UUID: [UUID: CheckedContinuation<Bool, Never>]] = [:]
+    private var warmReaders: Set<UUID> = []
     private var mediaStart = 0
     private var sampleBytes = 0
     private var cacheKey: String?
@@ -119,24 +122,47 @@ actor ProgressiveSource {
     /// The new owner's progress reports (a prepared episode is opened before its player exists).
     func observe(_ handler: @escaping Progress) { progress = handler; report() }
 
-    /// Downloads the first `bytes` of the picture data, so a prepared episode shows its first frame without waiting.
-    /// Failures are left for playback to retry.
-    func warm(bytes: Int) async {
-        guard !closed, length > 0, bytes > 0 else { return }
+    /// Verifies `[from, bytes)` relative to the start of picture data, clipped to EOF, with at most one warm range in flight.
+    /// False means the request did not complete. Verified blocks remain reusable on a later attempt.
+    @discardableResult
+    func warm(bytes toOffset: Int, from startOffset: Int = 0) async -> Bool {
+        guard !closed, !Task.isCancelled, mediaStart < length, toOffset > 0,
+              startOffset >= 0, startOffset <= toOffset else { return false }
+        let mediaLength = length - mediaStart
+        let start = min(startOffset, mediaLength)
+        let end = min(toOffset, mediaLength)
+        if start == end { return true }
         let size = ProgressiveCache.blockSize
-        let first = mediaStart / size, last = min((length - 1) / size, (mediaStart + bytes - 1) / size)
-        guard first <= last else { return }
-        var index = first
-        var loads: [Task<Data, Error>] = []
+        let last = (mediaStart + end - 1) / size
+        var index = (mediaStart + start) / size
         while index <= last {
-            if known(index) { if let task = pending[index]?.task { loads.append(task) }; index += 1; continue }
-            var end = index
-            while end + 1 <= last, end + 1 - index < Self.runBlocks, !known(end + 1) { end += 1 }
-            startRun(index...end)
-            loads += (index...end).compactMap { pending[$0]?.task }
-            index = end + 1
+            guard !closed, !Task.isCancelled else { return false }
+            if memory[index] != nil { index += 1; continue }
+            if available.contains(index), let key = cacheKey {
+                let expected = min(size, length - index * size)
+                let cached = await cache.read(key: key, block: index, expected: expected)
+                guard !closed, !Task.isCancelled else { return false }
+                if cached != nil || memory[index] != nil { index += 1; continue }
+                available.remove(index)
+            }
+            if let loading = pending[index]?.id {
+                guard await waitForWarmLoad(loading) else { return false }
+                continue
+            }
+            if let warmRun {
+                let draining = runs[warmRun.id]?.isCancelled == true
+                guard await waitForWarmLoad(warmRun.id) || draining else { return false }
+                continue
+            }
+            var lastBlock = index
+            while lastBlock + 1 <= last, lastBlock + 1 - index < Self.runBlocks, !known(lastBlock + 1) { lastBlock += 1 }
+            let blocks = index...lastBlock
+            guard let identifier = startRun(blocks) else { return false }
+            warmRun = (identifier, blocks)
+            guard await waitForWarmLoad(identifier) else { return false }
+            index = lastBlock + 1
         }
-        for load in loads { _ = try? await load.value }
+        return !closed && !Task.isCancelled
     }
 
     func read(at offset: Int, count: Int) async throws -> Data {
@@ -205,13 +231,14 @@ actor ProgressiveSource {
         if let data = memory[index] { return data }
         let start = index * ProgressiveCache.blockSize, end = min(start + ProgressiveCache.blockSize, length)
         guard start >= 0, start < end else { throw MediaError.invalidMedia }
-        if let key = cacheKey, let data = await cache.read(key: key, block: index, expected: end - start) {
+        if let key = cacheKey, warmRun == nil || pending[index]?.id != warmRun?.id,
+           let data = await cache.read(key: key, block: index, expected: end - start) {
             guard !closed else { throw CancellationError() }
             remember(data, block: index); available.insert(index); report(); return data
         }
         if let existing = pending[index] {
             // A read-ahead run that failed falls back to this block's own request below.
-            if let data = try? await existing.task.value {
+            if let data = try? await loadBlock(existing) {
                 try Task.checkCancellation()
                 guard !closed else { throw CancellationError() }
                 return data
@@ -232,15 +259,17 @@ actor ProgressiveSource {
                     try Task.checkCancellation()
                     guard reply.total == expectedLength, reply.data.count == end - start else { throw MediaError.invalidMedia }
                     try await self.completed(reply.data, block: index, identifier: identifier)
+                    self.resolveWarmWaiters(identifier, completed: true)
                     return reply.data
                 } catch {
                     if self.pending[index]?.id == identifier { self.pending.removeValue(forKey: index) }
+                    self.resolveWarmWaiters(identifier, completed: false)
                     throw error
                 }
             }
             loading = Pending(id: identifier, task: task); pending[index] = loading
         }
-        let data = try await loading.task.value
+        let data = try await loadBlock(loading)
         try Task.checkCancellation()
         guard !closed else { throw CancellationError() }
         return data
@@ -262,6 +291,55 @@ actor ProgressiveSource {
 
     private func known(_ index: Int) -> Bool { memory[index] != nil || pending[index] != nil || available.contains(index) }
 
+    private func waitForWarmLoad(_ load: UUID) async -> Bool {
+        let waiter = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if closed || Task.isCancelled {
+                    continuation.resume(returning: false)
+                    cancelUnusedWarmRun(load)
+                } else {
+                    warmWaiters[load, default: [:]][waiter] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWarmWaiter(waiter, load: load) }
+        }
+    }
+
+    private func cancelWarmWaiter(_ waiter: UUID, load: UUID) {
+        warmWaiters[load]?.removeValue(forKey: waiter)?.resume(returning: false)
+        cancelUnusedWarmRun(load)
+    }
+
+    private func resolveWarmWaiters(_ load: UUID, completed: Bool) {
+        guard let waiters = warmWaiters.removeValue(forKey: load) else { return }
+        for waiter in waiters.values { waiter.resume(returning: completed) }
+    }
+
+    private func loadBlock(_ loading: Pending) async throws -> Data {
+        guard loading.id == warmRun?.id else { return try await loading.task.value }
+        let reader = UUID()
+        warmReaders.insert(reader)
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await loading.task.value
+        } onCancel: {
+            Task { await self.cancelWarmReader(reader, load: loading.id) }
+        }
+    }
+
+    private func cancelWarmReader(_ reader: UUID, load: UUID) {
+        warmReaders.remove(reader)
+        cancelUnusedWarmRun(load)
+    }
+
+    private func cancelUnusedWarmRun(_ load: UUID) {
+        guard let warmRun, warmRun.id == load, warmReaders.isEmpty, warmWaiters[load]?.isEmpty != false else { return }
+        runs[load]?.cancel()
+        for index in warmRun.blocks where pending[index]?.id == load { pending.removeValue(forKey: index) }
+    }
+
     private func extendReadAhead() {
         guard readAhead > 0, readAheadFrom >= 0, !paused, !closed, length > 0 else { return }
         let size = ProgressiveCache.blockSize
@@ -279,12 +357,14 @@ actor ProgressiveSource {
     }
 
     /// One HTTP range for several neighbouring blocks; each block can be awaited on its own.
-    private func startRun(_ blocks: ClosedRange<Int>) {
+    @discardableResult
+    private func startRun(_ blocks: ClosedRange<Int>) -> UUID? {
         let size = ProgressiveCache.blockSize
         let start = blocks.lowerBound * size, end = min((blocks.upperBound + 1) * size, length)
-        guard start < end else { return }
+        guard start < end else { return nil }
         let provider = fetch, expectedLength = length, identifier = UUID()
         let run = Task { () throws -> [Data] in
+            try Task.checkCancellation()
             let reply = try await provider(start..<end)
             try Task.checkCancellation()
             guard reply.total == expectedLength, reply.data.count == end - start else { throw MediaError.invalidMedia }
@@ -298,11 +378,13 @@ actor ProgressiveSource {
             let result = await run.result
             await self?.finishRun(blocks, identifier: identifier, result: result)
         }
+        return identifier
     }
 
     private func finishRun(_ blocks: ClosedRange<Int>, identifier: UUID, result: Result<[Data], Error>) async {
         runs.removeValue(forKey: identifier)
         guard !closed else { return }
+        if warmRun?.id == identifier { warmRun = nil; warmReaders.removeAll() }
         var stored: [(Int, Data)] = []
         for (position, index) in blocks.enumerated() where pending[index]?.id == identifier {
             pending.removeValue(forKey: index)
@@ -312,6 +394,7 @@ actor ProgressiveSource {
             }
         }
         if !stored.isEmpty { report() }
+        resolveWarmWaiters(identifier, completed: stored.count == blocks.count)
         if let key = cacheKey { for (index, data) in stored { try? await cache.store(data, key: key, block: index) } }
         if case .success = result { extendReadAhead() }
     }
@@ -346,8 +429,10 @@ actor ProgressiveSource {
         guard !closed else { return }
         closed = true
         let values = waiters.values; waiters.removeAll(); for waiter in values { waiter.resume(throwing: CancellationError()) }
+        for load in Array(warmWaiters.keys) { resolveWarmWaiters(load, completed: false) }
         for value in pending.values { value.task.cancel() }; pending.removeAll()
         for run in runs.values { run.cancel() }; runs.removeAll()
+        warmRun = nil; warmReaders.removeAll()
         memory.removeAll(); sampleMemory.removeAll()
         if let key = cacheKey { cacheKey = nil; await cache.release(key) }
     }

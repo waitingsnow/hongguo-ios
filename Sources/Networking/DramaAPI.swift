@@ -2,7 +2,7 @@
 // Adapted from OOIUa/hongguo-android Client/WebSource/AppSource and their attributed upstreams.
 import Foundation
 
-private final class ProtocolSessionDelegate: NSObject, URLSessionTaskDelegate {
+final class ProtocolSessionDelegate: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
 }

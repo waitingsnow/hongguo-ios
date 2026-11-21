@@ -67,6 +67,7 @@ struct PlaybackRequest: Identifiable {
     let index: Int
     let position: Double
     let recordsLocalHistory: Bool
+    var handoff: FeedHandoff? = nil
 }
 
 @MainActor
@@ -84,6 +85,11 @@ final class AppModel: ObservableObject {
     @Published var tab = 0
     @Published var systemDark = UITraitCollection.current.userInterfaceStyle == .dark
     @Published var playback: PlaybackRequest?
+    func presentFeedPlayback(_ request: PlaybackRequest) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { playback = request }
+    }
     @Published var openingDramaID: String?
     @Published var openError: String?
     private var openTask: Task<Void, Never>?

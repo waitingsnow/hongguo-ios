@@ -78,6 +78,8 @@ for config in ('Debug', 'Release'):
         # Swift packages build Debug for the running architecture only; the app must match to find their modules.
         'ONLY_ACTIVE_ARCH': 'YES' if config == 'Debug' else 'NO',
     }
+    if config == 'Release':
+        settings.update(DEPLOYMENT_POSTPROCESSING='YES', STRIP_INSTALLED_PRODUCT='YES', STRIP_STYLE='non-global')
     objects[tc] = '{isa = XCBuildConfiguration; buildSettings = {' + ''.join(f'{k} = {quote(v)};' for k,v in settings.items()) + '}; name = ' + config + '; }'
 
 pc_list, tc_list = uid('projectConfigs'), uid('targetConfigs')

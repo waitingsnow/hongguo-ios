@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct HomeView: View {
     @EnvironmentObject private var model: AppModel
@@ -161,6 +162,8 @@ private struct ImmersiveFeed: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var library: LibraryStore
     @State private var current: String?
+    @State private var detailDrama: Drama?
+    @State private var commentsVisible = false
     @StateObject private var preview = FeedPreview()
     @State private var visible = false
     @Environment(\.scenePhase) private var scenePhase
@@ -177,12 +180,20 @@ private struct ImmersiveFeed: View {
                         LazyVStack(spacing: 0) {
                             ForEach(Array(loader.dramas.enumerated()), id: \.element.id) { index, drama in
                                 ImmersivePage(drama: drama, index: index, insets: insets,
-                                              roomy: outer.size.height + insets.top + insets.bottom >= 640, preview: preview)
+                                              roomy: outer.size.height + insets.top + insets.bottom >= 640, preview: preview,
+                                              openDetails: { detailDrama = drama }, openComments: { commentsVisible = true },
+                                              retryPreview: { if preview.dramaID == drama.id { syncPreview() } })
                                     .frame(width: outer.size.width + insets.leading + insets.trailing,
                                            height: outer.size.height + insets.top + insets.bottom)
                                     .id(drama.id)
                             }
-                        }.scrollTargetLayout()
+                        }
+                        .scrollTargetLayout()
+                        .background {
+                            FeedDetailSwipe(canBegin: { !preview.holding }) {
+                                if loader.dramas.indices.contains(index) { detailDrama = loader.dramas[index] }
+                            }
+                        }
                     }
                     .scrollTargetBehavior(.paging)
                     .scrollIndicators(.hidden)
@@ -196,10 +207,20 @@ private struct ImmersiveFeed: View {
                 topBar.padding(.top, insets.top).padding(.leading, insets.leading).padding(.trailing, insets.trailing)
             }.ignoresSafeArea()
         }
+        .navigationDestination(item: $detailDrama) { DetailView(drama: $0) }
+        .episodeDiscussion(preview.detail.flatMap { detail in
+            detail.episodes.first.map { DiscussionEpisode(seriesID: detail.drama.id, episodeID: $0.id, number: $0.index) }
+        }, player: preview.player, playing: preview.rendered && !preview.paused && !preview.ended,
+           foreground: visible && scenePhase == .active && model.playback == nil && detailDrama == nil,
+           presented: $commentsVisible)
+        .onChange(of: commentsVisible) { _, shown in if !shown && preview.ended { continueAfterPreview() } }
         .onChange(of: current) { _, id in loader.anchorID = id; prefetch(); syncPreview() }
         // Not swiping on: when episode 1 ends, the drama continues with episode 2 in the full player.
         .onChange(of: preview.ended) { _, ended in if ended { continueAfterPreview() } }
         .onChange(of: loader.dramas.first?.id) { _, _ in current = loader.dramas.first?.id; syncPreview() }
+        .onChange(of: loader.dramas.count) { _, _ in syncPreview() }
+        .onChange(of: model.speed) { _, _ in syncPreview() }
+        .onChange(of: model.quality) { _, _ in syncPreview() }
         // Only the visible, foreground feed plays: pushing a page, switching tab, opening the full player or
         // backgrounding releases the preview, and coming back starts the current page again.
         .onAppear { visible = true; model.feedOnScreen = true; syncPreview() }
@@ -209,15 +230,17 @@ private struct ImmersiveFeed: View {
     }
 
     private func syncPreview() {
-        guard visible, scenePhase == .active, model.playback == nil, loader.dramas.indices.contains(index) else { preview.stop(); return }
-        preview.play(loader.dramas[index], quality: model.quality)
-        if loader.dramas.indices.contains(index + 1) { preview.prepare(loader.dramas[index + 1], quality: model.quality) }
+        guard visible, detailDrama == nil, scenePhase == .active, model.playback == nil, loader.dramas.indices.contains(index) else { preview.stop(); return }
+        let index = self.index
+        preview.play(loader.dramas[index], quality: model.quality, speed: model.speed,
+                     following: Array(loader.dramas.dropFirst(index + 1).prefix(2)))
     }
 
     private func continueAfterPreview() {
-        guard visible, model.playback == nil, model.autoNext, let detail = preview.detail, preview.dramaID == detail.drama.id else { return }
+        guard visible, !commentsVisible, detailDrama == nil, model.playback == nil, model.autoNext,
+              let detail = preview.detail, preview.dramaID == detail.drama.id else { return }
         if detail.episodes.count > 1 {
-            model.playback = PlaybackRequest(detail: detail, index: 1, position: 0, recordsLocalHistory: true)
+            if let request = preview.handoff(index: 1) { model.presentFeedPlayback(request) }
         } else if loader.dramas.indices.contains(index + 1) {
             withAnimation(.easeInOut(duration: 0.3)) { current = loader.dramas[index + 1].id }
         }
@@ -289,95 +312,189 @@ private struct ImmersivePage: View {
     let insets: EdgeInsets
     let roomy: Bool
     @ObservedObject var preview: FeedPreview
+    let openDetails: () -> Void
+    let openComments: () -> Void
+    let retryPreview: () -> Void
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var library: LibraryStore
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            // The cover only paints the page; a fill-scaled image must not widen the layout of the overlays.
             Color.black.overlay {
-                RemoteImage(address: drama.coverURL, priority: .high) {
-                    LinearGradient(colors: [Color(hex: 0x3A2A26), Color(hex: 0x141416)], startPoint: .top, endPoint: .bottom)
-                }.opacity(active && preview.rendered ? 0 : 1)
-            }.clipped()
-            if active, let player = preview.player {
-                PlayerLayerView(player: player) { preview.markRendered() }.opacity(preview.rendered ? 1 : 0)
+                if !active || !preview.rendered, let frame = preview.firstFrame(for: drama, quality: model.quality) {
+                    Image(uiImage: frame).resizable().scaledToFit()
+                }
+            }.clipped().task(id: PlaybackTarget(drama, quality: model.quality).key) {
+                await preview.restoreFirstFrame(for: drama, quality: model.quality)
             }
-            if active && preview.player != nil {
-                FeedGestureView(tap: preview.toggle, holdBegan: preview.beginHold, holdEnded: preview.endHold)
-            } else if active && preview.failed {
-                FeedGestureView(tap: { preview.play(drama, quality: model.quality) }, holdBegan: {}, holdEnded: {})
+            if active, let player = preview.player {
+                PlayerLayerView(player: player) { host in preview.markRendered(player, host: host) }.opacity(preview.rendered ? 1 : 0)
+            }
+            if active && preview.failed {
+                FeedGestureView(tap: retryPreview).overlay {
+                    Label("重试播放", systemImage: "arrow.clockwise").foregroundStyle(.white)
+                        .allowsHitTesting(false).accessibilityHidden(true)
+                }
+            } else if active, let player = preview.player {
+                FeedGestureView(preview: preview, player: player, statusTopInset: insets.top + 64,
+                                statusTrailingInset: insets.trailing + 20, restoredSpeed: String(format: "%g×", model.speed))
+                    .id(ObjectIdentifier(player))
             }
             if active && preview.paused && !preview.ended {
                 Image(systemName: "play.fill").font(.system(size: 54)).foregroundStyle(.white.opacity(0.8))
                     .frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)
             }
-            if active && preview.holding {
-                Label("2× 临时加速中", systemImage: "forward.fill").font(.caption.bold()).foregroundStyle(.white)
-                    .padding(.horizontal, 13).padding(.vertical, 8).background(.black.opacity(0.5), in: Capsule())
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top).padding(.top, insets.top + 64)
-                    .allowsHitTesting(false).transition(.opacity)
-            }
-            VStack(spacing: 0) {
-                LinearGradient(colors: [.black.opacity(0.6), .clear], startPoint: .top, endPoint: .bottom).frame(height: 180)
-                Spacer(minLength: 0)
-                LinearGradient(colors: [.clear, .black.opacity(0.88)], startPoint: .top, endPoint: .bottom).frame(height: 380)
+            GeometryReader { page in
+                VStack(spacing: 0) {
+                    LinearGradient(colors: [.black.opacity(0.6), .clear], startPoint: .top, endPoint: .bottom)
+                        .frame(height: min(180, page.size.height * 0.32))
+                    Spacer(minLength: 0)
+                    LinearGradient(colors: [.clear, .black.opacity(0.88)], startPoint: .top, endPoint: .bottom)
+                        .frame(height: min(380, page.size.height * 0.68))
+                }
             }.allowsHitTesting(false)
             VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .bottom, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 8) {
+                Button(action: openDetails) {
+                    HStack(spacing: 7) {
                         Text(drama.title).font(.system(size: 20, weight: .bold)).foregroundStyle(.white).lineLimit(2)
-                        Text([active && preview.player != nil ? "第 1 集" : nil, drama.episodeCount > 0 ? "全 \(drama.episodeCount) 集" : nil].compactMap { $0 }.joined(separator: " · "))
-                            .font(.footnote).foregroundStyle(.white.opacity(0.8))
-                        if roomy && !drama.summary.isEmpty { Text(drama.summary).font(.footnote).foregroundStyle(.white.opacity(0.82)).lineLimit(2) }
-                    }.frame(maxWidth: .infinity, alignment: .leading)
-                    VStack(spacing: roomy ? 14 : 4) {
-                        let favorite = library.isFavorite(drama)
-                        Button { library.toggleFavorite(drama) } label: { rail(favorite ? "star.fill" : "star", favorite ? "已追" : "追剧", tint: favorite ? Color(hex: 0xFFC56B) : .white) }
-                            .accessibilityIdentifier("immersive_favorite_\(index)")
-                        NavigationLink { DetailView(drama: drama) } label: { rail("square.grid.2x2", "选集") }.accessibilityIdentifier("immersive_episodes_\(index)")
-                        if roomy { NavigationLink { DetailView(drama: drama) } label: { rail("info.circle", "详情") }.accessibilityIdentifier("immersive_detail_\(index)") }
-                    }.buttonStyle(.plain)
+                        Image(systemName: "chevron.right").font(.caption2.weight(.semibold)).foregroundStyle(.white.opacity(0.72))
+                            .accessibilityHidden(true)
+                    }.multilineTextAlignment(.leading).frame(minHeight: 44).contentShape(Rectangle())
                 }
-                // After episode 1 ends, the same button turns into 继续播放 for episode 2.
-                let continues = continueEpisode != nil
-                Button { playFull() } label: {
-                    ZStack {
-                        HStack(spacing: 6) {
-                            if model.openingDramaID == drama.id { ProgressView().tint(.white) } else { Image(systemName: continues ? "forward.end.fill" : "play.fill") }
-                            Text(continues ? "继续播放" : "立即播放").font(.system(size: 15, weight: .semibold))
-                            if let next = continueEpisode { Text(verbatim: "· 第 \(next.index) 集").font(.system(size: 14)).foregroundStyle(.white.opacity(0.85)) }
-                            else if drama.episodeCount > 0 { Text(verbatim: "· 全 \(drama.episodeCount) 集").font(.system(size: 14)).foregroundStyle(.white.opacity(0.75)) }
-                        }.id(continues)
-                            .transition(.asymmetric(insertion: .move(edge: .bottom).combined(with: .opacity), removal: .move(edge: .top).combined(with: .opacity)))
-                    }.foregroundStyle(.white).frame(maxWidth: .infinity, minHeight: 48)
-                        .background(continues ? Color(hex: 0xC94426) : Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 12))
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .scaleEffect(continues ? 1.02 : 1)
-                }.buttonStyle(.plain).padding(.trailing, 6).accessibilityIdentifier("immersive_play_\(index)")
-                    .animation(.spring(response: 0.45, dampingFraction: 0.78), value: continues)
-                if roomy { Text("上滑看下一部").font(.caption2).foregroundStyle(.white.opacity(0.55)).frame(maxWidth: .infinity) }
-            }.padding(.leading, 16 + insets.leading).padding(.trailing, 10 + insets.trailing).padding(.bottom, 16 + insets.bottom)
-        }.animation(.easeOut(duration: 0.2), value: preview.holding)
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("immersive_title_\(index)")
+                .accessibilityHint("打开剧集详情")
+                let episodeInfo = [active && preview.player != nil ? "第 1 集" : nil, drama.episodeCount > 0 ? "全 \(drama.episodeCount) 集" : nil].compactMap { $0 }
+                if !episodeInfo.isEmpty {
+                    Text(episodeInfo.joined(separator: " · ")).font(.footnote).foregroundStyle(.white.opacity(0.8))
+                }
+                if roomy && !drama.summary.isEmpty { Text(drama.summary).font(.footnote).foregroundStyle(.white.opacity(0.82)).lineLimit(2) }
+                HStack(spacing: 8) {
+                    playButton
+                    favoriteButton
+                    Spacer(minLength: 2)
+                    if active, preview.detail != nil { DiscussionControls(showComments: openComments) }
+                }
+            }.padding(.leading, 16 + insets.leading).padding(.trailing, 16 + insets.trailing).padding(.bottom, 12 + insets.bottom)
+        }
     }
 
     private var active: Bool { preview.dramaID == drama.id }
     private var continueEpisode: Episode? { active && preview.ended ? preview.detail?.episodes.dropFirst().first : nil }
 
-    /// 立即播放 continues the preview in the full player from where it is; after episode 1 ends, 继续播放 opens episode 2.
-    private func playFull() {
-        if continueEpisode != nil, let detail = preview.detail {
-            model.playback = PlaybackRequest(detail: detail, index: 1, position: 0, recordsLocalHistory: true)
-        } else if active, let detail = preview.detail, !preview.ended {
-            model.playback = PlaybackRequest(detail: detail, index: 0, position: preview.position, recordsLocalHistory: true)
-        } else { model.play(drama) }
+    private var playButton: some View {
+        let next = continueEpisode
+        return Button { playFull() } label: {
+            HStack(spacing: 6) {
+                if model.openingDramaID == drama.id || (active && preview.awaitingHandoff) {
+                    ProgressView().controlSize(.small).tint(.white)
+                } else {
+                    Image(systemName: next == nil ? "play.fill" : "forward.end.fill")
+                }
+                Text(next.map { "继续播放 · 第 \($0.index) 集" } ?? "立即播放").lineLimit(1)
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12)
+            .frame(height: 32)
+            .background(next == nil ? Color.white.opacity(0.16) : Color(hex: 0xC94426), in: Capsule())
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }.buttonStyle(.plain).accessibilityIdentifier("immersive_play_\(index)")
     }
 
-    private func rail(_ symbol: String, _ label: String, tint: Color = .white) -> some View {
-        VStack(spacing: 3) {
-            Image(systemName: symbol).font(.system(size: 26)).foregroundStyle(tint).frame(height: 32)
-            Text(label).font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
-        }.frame(minWidth: 52, minHeight: 52).contentShape(Rectangle())
+    private var favoriteButton: some View {
+        let favorite = library.isFavorite(drama)
+        return Button { library.toggleFavorite(drama) } label: {
+            Label(favorite ? "已追" : "追剧", systemImage: favorite ? "star.fill" : "star")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(favorite ? Color(hex: 0xFFC56B) : .white)
+                .lineLimit(1)
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
+        }.buttonStyle(.plain).accessibilityIdentifier("immersive_favorite_\(index)")
+    }
+
+    /// 立即播放 continues the preview in the full player from where it is; after episode 1 ends, 继续播放 opens episode 2.
+    private func playFull() {
+        let continuing = continueEpisode != nil
+        if active, !preview.failed, continuing || !preview.ended {
+            preview.requestHandoff(index: continuing ? 1 : 0, present: model.presentFeedPlayback)
+        } else if continuing, let detail = preview.detail {
+            model.play(detail, index: 1)
+        } else {
+            model.play(drama)
+        }
+    }
+}
+
+private struct FeedDetailSwipe: UIViewRepresentable {
+    let canBegin: () -> Bool
+    let openDetails: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> AttachmentView {
+        AttachmentView(pan: context.coordinator.pan)
+    }
+
+    func updateUIView(_ uiView: AttachmentView, context: Context) {
+        context.coordinator.canBegin = canBegin
+        context.coordinator.openDetails = openDetails
+    }
+
+    static func dismantleUIView(_ uiView: AttachmentView, coordinator: Coordinator) {
+        uiView.pan.view?.removeGestureRecognizer(uiView.pan)
+    }
+
+    final class AttachmentView: UIView {
+        let pan: UIPanGestureRecognizer
+
+        init(pan: UIPanGestureRecognizer) {
+            self.pan = pan
+            super.init(frame: .zero)
+            isUserInteractionEnabled = false
+        }
+
+        required init?(coder: NSCoder) { nil }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            var ancestor = window == nil ? nil : superview
+            while let view = ancestor, !(view is UIScrollView) { ancestor = view.superview }
+            if pan.view !== ancestor {
+                pan.view?.removeGestureRecognizer(pan)
+                ancestor?.addGestureRecognizer(pan)
+            }
+        }
+    }
+
+    @MainActor final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var canBegin: (() -> Bool)?
+        var openDetails: (() -> Void)?
+        lazy var pan: UIPanGestureRecognizer = {
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(didPan(_:)))
+            pan.maximumNumberOfTouches = 1
+            pan.delegate = self
+            return pan
+        }()
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard canBegin?() == true, let scrollView = gestureRecognizer.view as? UIScrollView,
+                  !scrollView.isDecelerating else { return false }
+            let velocity = pan.velocity(in: scrollView)
+            return velocity.x < -abs(velocity.y) * 1.35
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+            (gestureRecognizer.view as? UIScrollView)?.panGestureRecognizer === other
+        }
+
+        @objc private func didPan(_ pan: UIPanGestureRecognizer) {
+            guard pan.state == .ended else { return }
+            let movement = pan.translation(in: pan.view)
+            if movement.x <= -56 && -movement.x > abs(movement.y) * 1.35 { openDetails?() }
+        }
     }
 }
 

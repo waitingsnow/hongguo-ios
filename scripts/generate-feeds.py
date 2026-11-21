@@ -4,32 +4,17 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import os
-import plistlib
 import re
-import stat
-import struct
-import subprocess
-import sys
-import tempfile
-import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
+
+from ipa_checks import BUNDLE_ID, file_sha256, validate_ipa
+from package_rules import ValidationError, require
 
 ROOT = Path(__file__).resolve().parent.parent
-BUNDLE_ID = "com.ooiua.hongguo.ios"
 MIRRORS = {"gh-proxy": "https://gh-proxy.com/", "ghfast": "https://ghfast.top/"}
 GENERATED = ("update.json", "source.json", "source-cn.json", "source-cn-backup.json")
-
-
-class ValidationError(ValueError):
-    pass
-
-
-def require(condition: bool, message: str) -> None:
-    if not condition:
-        raise ValidationError(message)
 
 
 def read_config(path: Path, tag: str | None = None) -> dict:
@@ -47,80 +32,6 @@ def read_config(path: Path, tag: str | None = None) -> dict:
     if tag is not None:
         require(tag == "v" + config["version"], "Tag does not match Configuration/Release.json")
     return config
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def inspect_macho(binary: bytes, expected_minimum: str) -> None:
-    require(len(binary) >= 32, "Missing/truncated Mach-O header")
-    magic, cpu, _, file_type, commands, command_bytes, _, _ = struct.unpack_from("<8I", binary)
-    require(magic == 0xFEEDFACF and cpu == 0x0100000C and file_type == 2, "Expected a thin arm64 device executable")
-    require(commands <= 4096 and command_bytes <= len(binary) - 32, "Invalid Mach-O load-command table")
-    position, device_platform = 32, False
-    expected = tuple(int(item) for item in expected_minimum.split("."))
-    expected = (expected + (0, 0))[:3]
-    for _ in range(commands):
-        require(position + 8 <= 32 + command_bytes, "Truncated Mach-O command")
-        command, size = struct.unpack_from("<II", binary, position)
-        require(size >= 8 and size % 4 == 0 and size <= 32 + command_bytes - position, "Invalid Mach-O command length")
-        require(command != 0x1D, "Signed IPA rejected: LC_CODE_SIGNATURE is present")
-        if command == 0x32:  # LC_BUILD_VERSION
-            require(size >= 24, "Truncated LC_BUILD_VERSION")
-            platform, minimum = struct.unpack_from("<II", binary, position + 8)
-            require(platform == 2, "Simulator/non-iOS executable rejected")
-            actual = ((minimum >> 16) & 0xFFFF, (minimum >> 8) & 0xFF, minimum & 0xFF)
-            require(actual == expected, "Mach-O deployment target disagrees with Release.json")
-            device_platform = True
-        position += size
-    require(position == 32 + command_bytes and device_platform, "Missing/invalid device build-version command")
-
-
-def validate_ipa(path: Path, config: dict, *, use_codesign: bool = True) -> dict:
-    require(path.is_file(), "IPA file does not exist")
-    require(path.name == f"Hongguo-iOS-{config['version']}-unsigned.ipa", "IPA filename disagrees with release version")
-    require(path.stat().st_size > 0, "IPA is empty")
-    try:
-        with zipfile.ZipFile(path) as archive:
-            entries = archive.infolist()
-            names = [entry.filename for entry in entries]
-            require(len(names) == len(set(names)), "Duplicate archive paths rejected")
-            require(len(names) <= 20000 and sum(entry.file_size for entry in entries) <= 1024 * 1024 * 1024, "IPA archive exceeds validation limits")
-            for entry in entries:
-                item = PurePosixPath(entry.filename)
-                require(not item.is_absolute() and ".." not in item.parts and "\\" not in entry.filename, "Unsafe archive path")
-                require(not stat.S_ISLNK(entry.external_attr >> 16), "Archive symlinks rejected")
-                require("_CodeSignature" not in item.parts and item.name != "embedded.mobileprovision", "Signed/provisioned bundle rejected")
-            require(archive.testzip() is None, "IPA archive CRC verification failed")
-            info_names = [name for name in names if re.fullmatch(r"Payload/[^/]+\.app/Info\.plist", name)]
-            require(info_names == ["Payload/Hongguo.app/Info.plist"], "Expected exactly Payload/Hongguo.app")
-            prefix = "Payload/Hongguo.app/"
-            info = plistlib.loads(archive.read(prefix + "Info.plist"))
-            require(info.get("CFBundleIdentifier") == BUNDLE_ID, "Unexpected bundle identifier")
-            require(info.get("CFBundleShortVersionString") == config["version"], "IPA version disagrees with Release.json")
-            require(info.get("CFBundleVersion") == str(config["build"]), "IPA build disagrees with Release.json")
-            require(info.get("MinimumOSVersion") == config["minimumOSVersion"], "IPA minimum OS disagrees with Release.json")
-            require(info.get("CFBundleSupportedPlatforms") == ["iPhoneOS"], "Expected iPhoneOS package")
-            executable = info.get("CFBundleExecutable")
-            require(isinstance(executable, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", executable) is not None, "Invalid bundle executable")
-            for resource in ("PureSign.js", "BufferRuntime.js", "Assets.car"):
-                require(prefix + resource in names, f"Required packaged resource missing: {resource}")
-            inspect_macho(archive.read(prefix + executable), config["minimumOSVersion"])
-            if use_codesign and sys.platform == "darwin":
-                with tempfile.TemporaryDirectory(prefix="hongguo-feed-verify-") as folder:
-                    archive.extractall(folder)
-                    command = subprocess.run(["/usr/bin/codesign", "-dv", str(Path(folder) / prefix)], capture_output=True, text=True, check=False)
-                    require(command.returncode != 0 and "not signed at all" in command.stderr,
-                            "codesign did not confirm an unsigned app")
-    except (zipfile.BadZipFile, KeyError, plistlib.InvalidFileException, struct.error, OSError) as error:
-        raise ValidationError("Invalid IPA: " + type(error).__name__) from error
-    return {"version": config["version"], "build": config["build"], "minimumOSVersion": config["minimumOSVersion"],
-            "bundleIdentifier": BUNDLE_ID, "sha256": file_sha256(path), "size": path.stat().st_size, "unsigned": True}
 
 
 def timestamp(value: str | None = None) -> str:

@@ -26,10 +26,10 @@ mkdir -p "$TASK_PACKAGE/Payload"
 /usr/bin/ditto "$TASK_APP" "$TASK_PACKAGE/Payload/Hongguo.app"
 TASK_VERSION="$(/usr/bin/python3 -c 'import json; print(json.load(open("Configuration/Release.json"))["version"])')"
 TASK_IPA="$TASK_ROOT/dist/Hongguo-iOS-$TASK_VERSION-unsigned.ipa"
-TASK_ZIP_TMP="$TASK_PACKAGE/package.zip"
-(cd "$TASK_PACKAGE" && COPYFILE_DISABLE=1 /usr/bin/zip -qry "$TASK_ZIP_TMP" Payload)
+TASK_ZIP_TMP="$TASK_PACKAGE/$(basename "$TASK_IPA")"
+(cd "$TASK_PACKAGE" && COPYFILE_DISABLE=1 /usr/bin/zip -X -qry "$TASK_ZIP_TMP" Payload)
+/usr/bin/python3 scripts/verify-ipa.py "$TASK_ZIP_TMP"
 mv "$TASK_ZIP_TMP" "$TASK_IPA"
 (cd "$TASK_ROOT/dist" && /usr/bin/shasum -a 256 "$(basename "$TASK_IPA")" > "$(basename "$TASK_IPA").sha256")
-/usr/bin/python3 scripts/verify-ipa.py "$TASK_IPA"
 printf 'Unsigned iPhone IPA: %s\n' "$TASK_IPA"
 printf 'Build log: %s/build/release-build.log\n' "$TASK_ROOT"

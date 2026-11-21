@@ -4,11 +4,32 @@ import Foundation
 private actor CountingServer {
     let data: Data
     var requests: [Range<Int>] = []
+    private var delay: UInt64 = 15_000_000
+    private var malformedNext = false
+    private var active = 0
+    private(set) var peak = 0
+    private(set) var cancellations: [Range<Int>] = []
     init(_ data: Data) { self.data = data }
     func fetch(_ range: Range<Int>) async throws -> MediaRangeReply {
         requests.append(range)
-        try await Task.sleep(nanoseconds: 15_000_000)
-        return MediaRangeReply(data: data.subdata(in: range.lowerBound..<min(range.upperBound, data.count)), total: data.count)
+        active += 1
+        peak = max(peak, active)
+        defer { active -= 1 }
+        let malformed = malformedNext
+        malformedNext = false
+        do {
+            try await Task.sleep(nanoseconds: delay)
+        } catch is CancellationError {
+            cancellations.append(range)
+            throw CancellationError()
+        }
+        let upper = min(range.upperBound, data.count) - (malformed ? 1 : 0)
+        return MediaRangeReply(data: data.subdata(in: range.lowerBound..<upper), total: data.count)
+    }
+    func configure(delay: UInt64 = 15_000_000, malformedNext: Bool = false) {
+        self.delay = delay
+        self.malformedNext = malformedNext
+        peak = active
     }
     func requested() -> [Range<Int>] { requests }
 }
@@ -50,15 +71,7 @@ func progressiveReadAheadChecks(fixture: ProgressiveFixture, track: VideoTrack, 
     await source.close()
     print("PASS read-ahead downloads neighbouring blocks in combined ranges and serves later reads from them")
 
-    let warmServer = CountingServer(fixture.encrypted)
-    let warmed = try await ProgressiveSource.open(track: track, episodeID: "warm", cache: ProgressiveCache(root: root.appendingPathComponent("warm")),
-                                                  fetch: { try await warmServer.fetch($0) }, readAhead: 0)
-    await warmed.warm(bytes: 2 * size)
-    let afterWarm = await warmServer.requested().count
-    _ = try await warmed.read(at: first, count: 4_096)
-    try expect(await warmServer.requested().count == afterWarm, "Warmed first frame still went to the network")
-    await warmed.close()
-    print("PASS warming prepares the start of the picture data before a player exists")
+    try await progressiveWarmChecks(fixture: fixture, track: track, root: root)
 
     let expired = URL(string: "https://v1.qznovelvod.com/expired.mp4")!, fresh = URL(string: "https://v1.qznovelvod.com/fresh.mp4")!
     let edge = URL(string: "https://edge.vegslb.com/fresh.mp4")!
@@ -83,4 +96,119 @@ func progressiveReadAheadChecks(fixture: ProgressiveFixture, track: VideoTrack, 
     let other = MediaLocator(track: base, renew: { VideoTrack(url: fresh, spadeA: "other", encrypted: true, definition: "720p") }, transport: transport)
     do { _ = try await other.fetch(0..<100); try expect(false, "A renewed address with another key was used") } catch MediaError.transport { }
     print("PASS expired addresses are renewed once for concurrent ranges, refused for another key, and redirects are reused")
+}
+
+private func progressiveWarmChecks(fixture: ProgressiveFixture, track: VideoTrack, root: URL) async throws {
+    let size = ProgressiveCache.blockSize
+    try expect(fixture.encrypted.count > 8 * size, "Fixture is too small for warm range checks")
+
+    func open(_ name: String, server: CountingServer, readAhead: Int = 0) async throws -> ProgressiveSource {
+        try await ProgressiveSource.open(track: track, episodeID: name, cache: ProgressiveCache(root: root.appendingPathComponent(name)),
+                                         fetch: { try await server.fetch($0) }, readAhead: readAhead)
+    }
+
+    let server = CountingServer(fixture.encrypted)
+    let source = try await open("warm", server: server)
+    let opening = await server.requested().count
+    await server.configure()
+    async let wide = source.warm(bytes: 8 * size)
+    async let narrow = source.warm(bytes: 2 * size)
+    let (wideReady, narrowReady) = await (wide, narrow)
+    try expect(wideReady && narrowReady, "Concurrent warm calls did not finish their prefixes")
+    let ranges = Array(await server.requested().dropFirst(opening))
+    try expect(await server.peak == 1, "Several speculative ranges ran simultaneously")
+    try expect(ranges.count > 1 && ranges.allSatisfy { $0.count <= 4 * size } && ranges.contains { $0.count > size },
+               "Warm ranges were not split into bounded multi-block runs")
+    try expect(zip(ranges, ranges.dropFirst()).allSatisfy { $0.upperBound == $1.lowerBound }, "Concurrent warm calls duplicated or skipped a range")
+    let afterWarm = await server.requested().count
+    let first = fixture.offsets[0]
+    let warmed = try await source.read(at: first, count: 4_096)
+    try expect(warmed == fixture.clear.subdata(in: first..<(first + 4_096)), "Verified warm bytes did not match playback")
+    try expect(await server.requested().count == afterWarm, "Warmed first frame still went to the network")
+    await source.close()
+    try expect(await source.warm(bytes: size) == false, "A closed source reported warm completion")
+    print("PASS concurrent warm requests share bounded, merged ranges and verify the requested prefix")
+
+    let offsetServer = CountingServer(fixture.encrypted)
+    let offsetSource = try await open("warm-offset", server: offsetServer)
+    let offsetOpening = await offsetServer.requested().count
+    let mdat = nodes(fixture.encrypted, 0, fixture.encrypted.count).first { $0.type == "mdat" }!
+    let mediaStart = mdat.start + (u32(fixture.encrypted, mdat.start) == 1 ? 16 : 8)
+    let start = 3 * size + 23 - mediaStart
+    let split = 4 * size + 71 - mediaStart
+    let end = 6 * size - mediaStart
+    try expect(await offsetSource.warm(bytes: split, from: start), "Unaligned warm interval failed")
+    try expect(await offsetSource.warm(bytes: end, from: split), "Warm did not continue from the unaligned boundary")
+    let offsetRanges = Array(await offsetServer.requested().dropFirst(offsetOpening))
+    try expect(offsetRanges == [(3 * size)..<(5 * size), (5 * size)..<(6 * size)],
+               "Unexpected warm ranges at unaligned boundaries: \(offsetRanges)")
+    await offsetSource.close()
+    print("PASS incremental warm skips earlier blocks and reuses unaligned boundary blocks")
+
+    let failureServer = CountingServer(fixture.encrypted)
+    let retry = try await open("warm-retry", server: failureServer)
+    let beforeFailure = await retry.metrics()
+    let requestsBeforeFailure = await failureServer.requested().count
+    await failureServer.configure(malformedNext: true)
+    try expect(await retry.warm(bytes: 2 * size) == false, "A short response was reported ready")
+    try expect(await retry.metrics().availableBytes == beforeFailure.availableBytes, "A failed warm made blocks available")
+    try expect(await retry.warm(bytes: 2 * size), "A failed warm range could not be retried")
+    let retried = Array(await failureServer.requested().dropFirst(requestsBeforeFailure))
+    try expect(retried.count == 2 && retried[0] == retried[1], "Retry did not fetch the failed range again")
+    await retry.close()
+    print("PASS malformed warm response returns false and playback can retry it")
+
+    let soloServer = CountingServer(fixture.encrypted)
+    let solo = try await open("warm-cancel", server: soloServer)
+    let soloOpening = await soloServer.requested().count
+    await soloServer.configure(delay: 2_000_000_000)
+    let speculative = Task { await solo.warm(bytes: 8 * size) }
+    try await waitForRequests(soloOpening + 1, on: soloServer)
+    let cancelledAt = Date()
+    speculative.cancel()
+    try expect(await speculative.value == false, "Cancelled warm call reported completion")
+    for _ in 0..<200 {
+        if await !soloServer.cancellations.isEmpty { break }
+        try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    let cancelled = await soloServer.cancellations
+    try expect(cancelled.count == 1 && Date().timeIntervalSince(cancelledAt) < 1, "An unshared warm range did not cancel promptly")
+    try expect(await soloServer.requested().count == soloOpening + 1, "Cancellation launched another warm range")
+    await soloServer.configure()
+    try expect(await solo.warm(bytes: 2 * size), "An unshared cancellation prevented a subsequent warm")
+    await solo.close()
+    print("PASS cancelling an unshared warm stops its range and starts no further ranges")
+
+    let sharedServer = CountingServer(fixture.encrypted)
+    let shared = try await open("warm-shared", server: sharedServer, readAhead: size)
+    let sharedOpening = await sharedServer.requested().count
+    await sharedServer.configure(delay: 1_500_000_000)
+    let warming = Task { await shared.warm(bytes: 8 * size) }
+    try await waitForRequests(sharedOpening + 1, on: sharedServer)
+    let sharedRange = await sharedServer.requested()[sharedOpening]
+    let offset = sharedRange.upperBound - 128
+    let reading = Task { try await shared.read(at: offset, count: 64) }
+    // The front read starts its normal lookahead just outside the shared range.
+    try await waitForRequests(sharedOpening + 2, on: sharedServer)
+    let detachedAt = Date()
+    warming.cancel()
+    try expect(await warming.value == false, "A cancelled shared warm reported completion")
+    try expect(Date().timeIntervalSince(detachedAt) < 1, "Cancelled warm waited for the foreground range to finish")
+    let data = try await reading.value
+    try expect(data == fixture.clear.subdata(in: offset..<(offset + 64)), "Foreground read could not finish the shared range")
+    let reread = try await shared.read(at: offset, count: 64)
+    try expect(reread == data, "Completed shared range was not reusable")
+    let sharedRequests = Array(await sharedServer.requested().dropFirst(sharedOpening))
+    try expect(await sharedServer.cancellations.isEmpty, "A foreground consumer's shared range was cancelled")
+    try expect(sharedRequests.filter { $0.contains(offset) } == [sharedRange], "Foreground read requested the same bytes again")
+    await shared.close()
+    print("PASS foreground reads retain and reuse the same warm range after its caller cancels")
+}
+
+private func waitForRequests(_ count: Int, on server: CountingServer) async throws {
+    for _ in 0..<200 {
+        if await server.requested().count >= count { return }
+        try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    try expect(false, "Timed out waiting for \(count) requests")
 }

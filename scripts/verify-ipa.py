@@ -1,51 +1,84 @@
 #!/usr/bin/env python3
-"""Verify the packaged device binary, resources, signing state and deployment target."""
-import hashlib
+"""Verify a newly built unsigned device IPA and reject private build paths."""
+import argparse
 import json
-import plistlib
+import re
 import struct
-import subprocess
-import sys
-import tempfile
-import zipfile
 from pathlib import Path
 
-def version_tuple(text):
-    return tuple(int(part) for part in str(text).split('.'))
+from ipa_checks import APP_PREFIX, validate_ipa
+from package_rules import ValidationError, require
 
-root = Path(__file__).resolve().parent.parent
-release = json.loads((root / 'Configuration/Release.json').read_text())
-ipa = Path(sys.argv[1]) if len(sys.argv) > 1 else root / f'dist/Hongguo-iOS-{release["version"]}-unsigned.ipa'
-with zipfile.ZipFile(ipa) as archive:
-    assert archive.testzip() is None, 'IPA archive is corrupt'
-    prefix = 'Payload/Hongguo.app/'
-    names = archive.namelist()
-    for name in names:
-        assert not name.startswith('/') and '..' not in Path(name).parts, 'Invalid archive path'
-    info = plistlib.loads(archive.read(prefix + 'Info.plist'))
-    assert info['CFBundleIdentifier'] == 'com.ooiua.hongguo.ios'
-    assert info['CFBundleSupportedPlatforms'] == ['iPhoneOS']
-    assert info['MinimumOSVersion'] == release['minimumOSVersion']
-    assert info['CFBundleShortVersionString'] == release['version'], 'IPA version differs from Release.json'
-    assert info['CFBundleVersion'] == str(release['build']), 'IPA build differs from Release.json'
-    # Older SDKs get classic letterboxing on the iPhone Duo inner display.
-    sdk = info.get('DTPlatformVersion', '0')
-    assert version_tuple(sdk) >= version_tuple(release['minimumBuildSDK']), f'Built with iOS SDK {sdk}; iPhone Duo needs {release["minimumBuildSDK"]} or later'
-    assert all(prefix + name in names for name in ['PureSign.js', 'BufferRuntime.js', 'PlayerSignV5.js'])
-    assert prefix + 'Assets.car' in names
-    assert not any(name.endswith('embedded.mobileprovision') for name in names)
-    binary = archive.read(prefix + info['CFBundleExecutable'])
-    magic, cpu = struct.unpack_from('<II', binary)
-    assert magic == 0xFEEDFACF and cpu == 0x0100000C, 'Expected a device arm64 Mach-O binary'
-    with tempfile.TemporaryDirectory(prefix='hongguo-ipa-verify-') as tmp:
-        archive.extractall(tmp)
-        result = subprocess.run(['/usr/bin/codesign', '-dv', str(Path(tmp) / 'Payload/Hongguo.app')], capture_output=True, text=True)
-        assert result.returncode != 0 and 'not signed at all' in result.stderr, 'Expected an unsigned app bundle'
-report = {
-    'ipa': ipa.name, 'bytes': ipa.stat().st_size, 'version': info['CFBundleShortVersionString'],
-    'build': info['CFBundleVersion'], 'bundle_identifier': info['CFBundleIdentifier'],
-    'minimum_ios': info['MinimumOSVersion'], 'sdk': sdk, 'platform': 'iPhoneOS', 'architecture': 'arm64',
-    'unsigned': True, 'signing_resources_present': True,
-    'sha256': hashlib.sha256(ipa.read_bytes()).hexdigest()
+ROOT = Path(__file__).resolve().parent.parent
+ABSOLUTE = rb"(?<![A-Za-z0-9_./\\-])"
+POSIX_END = rb"(?=[/\s\x00\"']|$)"
+HOME_PATHS = {
+    "macOS home": re.compile(ABSOLUTE + rb"(?:/System/Volumes/Data)?/Users/(?!Shared"
+                             + POSIX_END + rb")[^/\s\x00\"']{1,255}" + POSIX_END),
+    "macOS root home": re.compile(ABSOLUTE + rb"(?:/private)?/var/root" + POSIX_END),
+    "Linux home": re.compile(ABSOLUTE + rb"/home/[^/\s\x00\"']{1,255}" + POSIX_END),
+    "Linux root home": re.compile(ABSOLUTE + rb"/root" + POSIX_END),
+    "Windows home": re.compile(ABSOLUTE + rb"[A-Z]:[\\/]Users[\\/][^\\/\x00\r\n\"']{1,255}(?=[\\/\x00\r\n\"']|$)",
+                               re.IGNORECASE),
 }
-print(json.dumps(report, ensure_ascii=False, indent=2))
+PEM = re.compile(rb"(?:^|\n)-----BEGIN (?:[A-Z0-9 ]*PRIVATE KEY|CERTIFICATE(?: REQUEST)?|PKCS12)-----\r?\n[A-Za-z0-9+/]")
+MACHO_MAGICS = {bytes.fromhex(magic) for magic in (
+    "feedface", "cefaedfe", "feedfacf", "cffaedfe", "cafebabe", "bebafeca", "cafebabf", "bfbafeca",
+)}
+
+
+def version_tuple(text):
+    return tuple(int(part) for part in str(text).split("."))
+
+
+def check_new_build(archive, executable, info, config):
+    sdk = info.get("DTPlatformVersion", "0")
+    require(version_tuple(sdk) >= version_tuple(config["minimumBuildSDK"]),
+            f"iPhone Duo needs iOS SDK {config['minimumBuildSDK']} or later")
+    require(APP_PREFIX + "PlayerSignV5.js" in archive.namelist(), "Required packaged resource missing: PlayerSignV5.js")
+    for entry in archive.infolist():
+        require(not entry.extra, "ZIP central-directory extra fields detected in IPA")
+        archive.fp.seek(entry.header_offset)
+        header = archive.fp.read(30)
+        require(len(header) == 30 and header.startswith(b"PK\x03\x04"), "Invalid ZIP local header in IPA")
+        require(struct.unpack_from("<H", header, 28)[0] == 0, "ZIP local-header extra fields detected in IPA")
+        if entry.is_dir():
+            continue
+        with archive.open(entry) as stream:
+            chunk = stream.read(65536)
+            require(entry.filename == executable or chunk[:4] not in MACHO_MAGICS,
+                    "Unexpected embedded Mach-O in unsigned IPA")
+            tail = b""
+            while chunk:
+                window = tail + chunk
+                chunk = stream.read(65536)
+                for kind, pattern in HOME_PATHS.items():
+                    match = pattern.search(window)
+                    require(match is None or (chunk and match.end() == len(window)),
+                            f"Private absolute home path detected ({kind})")
+                require(PEM.search(window) is None, "PEM signing material detected in IPA")
+                tail = window[-512:]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("ipa", type=Path, nargs="?")
+    parser.add_argument("--config", type=Path, default=ROOT / "Configuration/Release.json")
+    args = parser.parse_args()
+    try:
+        config = json.loads(args.config.read_text(encoding="utf-8"))
+        ipa = args.ipa or ROOT / f"dist/Hongguo-iOS-{config['version']}-unsigned.ipa"
+        report = validate_ipa(ipa, config, check_new_build=check_new_build)
+    except ValidationError as error:
+        parser.exit(1, f"IPA verification failed: {error}\n")
+    except (KeyError, ValueError, OSError, RuntimeError) as error:
+        parser.exit(1, f"IPA verification failed: {type(error).__name__}\n")
+    print(json.dumps({"ipa": ipa.name, "bytes": report["size"], "version": report["version"],
+                      "build": str(report["build"]), "bundle_identifier": report["bundleIdentifier"],
+                      "minimum_ios": report["minimumOSVersion"], "sdk": report["sdk"], "platform": "iPhoneOS",
+                      "architecture": "arm64", "unsigned": True, "playback_resources_present": True,
+                      "sha256": report["sha256"]}, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

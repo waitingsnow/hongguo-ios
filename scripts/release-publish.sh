@@ -8,7 +8,7 @@ if [[ -z "$release_tag" ]]; then
   echo "Usage: scripts/release-publish.sh vX.Y.Z" >&2
   exit 2
 fi
-python3 scripts/generate-feeds.py --tag "$release_tag" --check
+bash scripts/release.sh "$release_tag" --skip-build
 release_repo="$(python3 -c 'import json;print(json.load(open("Configuration/Release.json"))["repository"])')"
 release_version="$(python3 -c 'import json;print(json.load(open("Configuration/Release.json"))["version"])')"
 release_ipa="dist/Hongguo-iOS-${release_version}-unsigned.ipa"

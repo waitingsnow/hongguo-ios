@@ -238,6 +238,185 @@ final class HongguoQATests: XCTestCase {
         XCTAssertTrue(app.buttons["暂停"].waitForExistence(timeout: 5), "closing the detail page resumes playback")
     }
 
+    func testImmersiveHomeControlsPagingAndFirstEpisode() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["HONGGUO_QA_MODE"] == "--live",
+                          "Set TEST_RUNNER_HONGGUO_QA_MODE=--live to run anonymous catalogue and playback checks.")
+        continueAfterFailure = true
+        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        app.launchArguments = ["-theme", "immersive", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO",
+                               "-speed", "1.5", "-autoNext", "YES"]
+        app.launch()
+
+        let feed = app.scrollViews["immersive_feed"]
+        let firstTitle = app.buttons["immersive_title_0"]
+        let secondTitle = app.buttons["immersive_title_1"]
+        let detailBar = app.navigationBars["剧集详情"]
+        func visible(_ element: XCUIElement, timeout: TimeInterval = 10) -> Bool {
+            element.wait(for: \.isHittable, toEqual: true, timeout: timeout)
+        }
+        func checkDetailAndReturn(title: String) {
+            let opened = detailBar.waitForExistence(timeout: 8)
+            XCTAssertTrue(opened, "Expected the detail page for \(title)")
+            guard opened else { return }
+            XCTAssertTrue(app.staticTexts[title].firstMatch.waitForExistence(timeout: 8),
+                          "The opened detail must show \(title)")
+            detailBar.buttons.firstMatch.tap()
+        }
+        func lockAndUnlock(_ surface: XCUIElement, buttonID: String) {
+            let start = surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.60))
+            let target = surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.24))
+            start.press(forDuration: 0.65, thenDragTo: target, withVelocity: .slow, thenHoldForDuration: 0.15)
+            let unlock = app.buttons[buttonID]
+            XCTAssertTrue(visible(unlock, timeout: 4), "The vertical hold must stay locked after release")
+            if unlock.isHittable { unlock.tap() }
+            XCTAssertFalse(unlock.exists)
+        }
+
+        let loaded = visible(firstTitle, timeout: 60)
+        XCTAssertTrue(loaded, "The anonymous home feed must show a first drama")
+        guard loaded else { return }
+        let firstName = firstTitle.label
+
+        XCTContext.runActivity(named: "Compact playback and follow controls") { _ in
+            let play = app.buttons["immersive_play_0"]
+            let favorite = app.buttons["immersive_favorite_0"]
+            XCTAssertTrue(visible(play))
+            XCTAssertTrue(visible(favorite))
+            XCTAssertEqual(play.label, "立即播放")
+            XCTAssertTrue(["追剧", "已追"].contains(favorite.label))
+            XCTAssertLessThan(play.frame.width, app.frame.width / 2)
+            XCTAssertLessThan(favorite.frame.width, app.frame.width / 4)
+            XCTAssertEqual(play.frame.midY, favorite.frame.midY, accuracy: 3)
+            XCTAssertLessThanOrEqual(play.frame.maxX, favorite.frame.minX)
+            XCTAssertFalse(app.staticTexts["上滑看下一部"].exists)
+            XCTAssertFalse(app.buttons["选集"].exists)
+            XCTAssertFalse(app.buttons["详情"].exists)
+            capture("immersive-compact-actions")
+        }
+
+        XCTContext.runActivity(named: "Swipe up, tap the second title, and swipe down") { _ in
+            feed.swipeUp()
+            let next = visible(secondTitle)
+            XCTAssertTrue(next, "An upward swipe must page to the second drama")
+            guard next else { return }
+            XCTAssertFalse(detailBar.exists)
+            let secondName = secondTitle.label
+            XCTAssertNotEqual(secondName, firstName)
+            secondTitle.tap()
+            checkDetailAndReturn(title: secondName)
+            let restored = visible(secondTitle)
+            XCTAssertTrue(restored, "Returning from details must keep the second page")
+            guard restored else { return }
+            feed.swipeDown()
+            XCTAssertTrue(visible(firstTitle), "A downward swipe must return to the first drama")
+            XCTAssertFalse(detailBar.exists)
+        }
+
+        guard visible(firstTitle) else { XCTFail("The first page is needed for the left swipe"); return }
+        XCTContext.runActivity(named: "Swipe left to the first drama's detail") { _ in
+            feed.swipeLeft()
+            checkDetailAndReturn(title: firstName)
+            XCTAssertTrue(visible(firstTitle), "Returning from details must keep the first page")
+        }
+
+        XCTContext.runActivity(named: "Play episode 1 from the 1.5× preview") { _ in
+            let preview = app.buttons["预览视频"]
+            XCTAssertTrue(visible(preview, timeout: 45), "Home should open a preview before entering playback")
+            lockAndUnlock(preview, buttonID: "feed.speedUnlock")
+            XCTAssertTrue(visible(firstTitle), "A vertical drag after holding must keep the same page")
+            let play = app.buttons["immersive_play_0"]
+            guard visible(play) else { XCTFail("The first drama is no longer available to play"); return }
+            play.tap()
+            let playerTitle = app.buttons["player.dramaTitle"]
+            let opened = visible(playerTitle, timeout: 45)
+            XCTAssertTrue(opened, "The play control must open the full player")
+            guard opened else { return }
+            XCTAssertEqual(playerTitle.label, "\(firstName)，第 1 集")
+            XCTAssertEqual(app.buttons["player.speed"].value as? String, "1.5×")
+            XCTAssertTrue(app.buttons["暂停"].waitForExistence(timeout: 60))
+            lockAndUnlock(app.buttons["视频画面"], buttonID: "player.speedUnlock")
+            XCTAssertEqual(app.buttons["player.speed"].value as? String, "1.5×")
+            let progress = app.sliders["播放进度"]
+            func progressPercent() -> Double? {
+                guard let value = progress.value as? String else { return nil }
+                return Double(value.filter { $0.isNumber || $0 == "." })
+            }
+            guard let initialValue = progressPercent() else { XCTFail("Playback progress is unavailable"); return }
+            let advances = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                progress.isEnabled && progressPercent().map { $0 > initialValue } == true
+            }, object: nil)
+            XCTAssertEqual(XCTWaiter.wait(for: [advances], timeout: 15), .completed, "Episode 1 must advance")
+            XCTAssertEqual(playerTitle.label, "\(firstName)，第 1 集")
+            capture("immersive-first-episode-1.5x")
+        }
+    }
+
+    func testEpisodeCommentsAndDanmakuPreference() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["HONGGUO_QA_MODE"] == "--live")
+        continueAfterFailure = false
+        let previousOrientation = XCUIDevice.shared.orientation
+        defer { XCUIDevice.shared.orientation = previousOrientation }
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        app.launchArguments = ["-theme", "immersive", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO", "-autoNext", "NO"]
+        app.launch()
+        let toggle = app.buttons["discussion.toggle"].firstMatch
+        let openComments = app.buttons["discussion.comments"].firstMatch
+        let commentBar = app.navigationBars["第 1 集评论"]
+        func expectValue(_ value: String, of control: XCUIElement, line: UInt = #line) {
+            let changed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", value), object: control)
+            XCTAssertEqual(XCTWaiter.wait(for: [changed], timeout: 5), .completed, "Expected \(value)", line: line)
+        }
+
+        XCTAssertTrue(toggle.wait(for: \.isHittable, toEqual: true, timeout: 60))
+        if toggle.value as? String != "开启" { toggle.tap() }
+        expectValue("开启", of: toggle)
+        let play = app.buttons["immersive_play_0"]
+        XCTAssertTrue(play.wait(for: \.isHittable, toEqual: true, timeout: 10))
+        play.tap()
+        XCTAssertTrue(app.buttons["player.dramaTitle"].waitForExistence(timeout: 20))
+        XCTAssertTrue(app.buttons["暂停"].waitForExistence(timeout: 45))
+        expectValue("开启", of: toggle)
+        XCTAssertTrue(openComments.wait(for: \.isHittable, toEqual: true, timeout: 10))
+        openComments.tap()
+        XCTAssertTrue(commentBar.waitForExistence(timeout: 8))
+        let comments = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "官方播放页公开评论")).firstMatch
+        let empty = app.staticTexts["本集暂无公开评论"]
+        let loaded = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in comments.exists || empty.exists }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [loaded], timeout: 30), .completed)
+        capture("episode-comments")
+        let sheetSwitch = app.switches["轮播本集评论弹幕"].switches.firstMatch
+        XCTAssertTrue(sheetSwitch.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        expectValue("1", of: sheetSwitch)
+        sheetSwitch.tap()
+        expectValue("0", of: sheetSwitch)
+        commentBar.buttons["完成"].tap()
+        expectValue("关闭", of: toggle)
+        app.terminate(); app.launch()
+        XCTAssertTrue(toggle.wait(for: \.isHittable, toEqual: true, timeout: 45))
+        expectValue("关闭", of: toggle)
+
+        XCTContext.runActivity(named: "Landscape home discussion controls") { _ in
+            XCUIDevice.shared.orientation = .landscapeLeft
+            let landscape = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                app.frame.width > app.frame.height
+            }, object: nil)
+            XCTAssertEqual(XCTWaiter.wait(for: [landscape], timeout: 10), .completed)
+            XCTAssertTrue(toggle.wait(for: \.isHittable, toEqual: true, timeout: 10))
+            toggle.tap()
+            expectValue("开启", of: toggle)
+            capture("landscape-home-discussion-controls")
+            XCTAssertTrue(openComments.wait(for: \.isHittable, toEqual: true, timeout: 10))
+            openComments.tap()
+            XCTAssertTrue(commentBar.waitForExistence(timeout: 8))
+            capture("landscape-home-comments")
+            commentBar.buttons["完成"].tap()
+            XCTAssertTrue(toggle.wait(for: \.isHittable, toEqual: true, timeout: 10))
+            toggle.tap()
+            expectValue("关闭", of: toggle)
+        }
+    }
+
     private func capture(_ name: String) {
         let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         attachment.name = name; attachment.lifetime = .keepAlways; add(attachment)

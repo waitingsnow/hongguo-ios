@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Combine
+import UIKit
 
 /// One drama's playback. A single `AVPlayer` lives for the whole session and episodes swap its item, so the picture
 /// layer and 小窗播放 (picture in picture) stay attached while autoplay moves on, in the background as well.
@@ -23,7 +24,9 @@ final class PlayerSession: ObservableObject {
     @Published private(set) var duration: Double = 0
     @Published private(set) var rendered = false
     @Published private(set) var holding = false
+    @Published private(set) var speedLocked = false
     @Published private(set) var endMessage: String?
+    let didPausePlayback = PassthroughSubject<Void, Never>()
     /// The picture's display size; zero until the first video format is known.
     @Published private(set) var videoSize: CGSize = .zero
     /// The 清晰度 this episode is playing in.
@@ -32,12 +35,14 @@ final class PlayerSession: ObservableObject {
     @Published var scrubbing = false
     @Published var previewPosition: Double = 0
     private var requestTask: Task<Void, Never>?
-    private var currentStream: ProgressivePlayback?
+    private var frameTask: Task<Void, Never>?
+    @Published private(set) var transitionFrame: UIImage?
+    private var currentEpisode: OpenEpisode?
+    private var currentStream: ProgressivePlayback? { currentEpisode?.stream }
     /// The previous episode's stream stays open until the next item replaces it, so the layer never shows an empty player.
-    private var retiringStream: ProgressivePlayback?
-    private var upcoming: PreparedEpisode?
-    private var upcomingTask: Task<Void, Never>?
-    private var upcomingTicket: UUID?
+    private var retiringEpisode: OpenEpisode?
+    private let lookahead: PlaybackLookahead
+    private var handoff: FeedHandoff?
     private var periodic: Any?
     private var playerObservations: [NSKeyValueObservation] = []
     private var itemObservations: [NSKeyValueObservation] = []
@@ -61,11 +66,29 @@ final class PlayerSession: ObservableObject {
     init(request: PlaybackRequest, app: AppModel) {
         detail = request.detail; index = request.index; initialPosition = request.position
         recordsLocalHistory = request.recordsLocalHistory; self.app = app
+        handoff = request.handoff
+        lookahead = request.handoff?.lookahead ?? PlaybackLookahead()
         quality = app.quality
         accountToken = AccountService.shared.playbackToken
+        speedLocked = request.handoff?.speedLocked ?? false
+        transitionFrame = request.handoff?.displayedFrame ?? PlaybackLookahead.frame(PlaybackTarget(detail, index: index, quality: quality))
+        request.handoff?.displayedFrame = nil
     }
 
-    func start() { stopped = false; load(index: index, startAt: initialPosition) }
+    func start() {
+        stopped = false
+        if let live = handoff?.live {
+            handoff?.live = nil
+            handoff = nil
+            _ = makePlayer(live.player)
+            install(episode: live.episode, startAt: initialPosition, ticket: playID)
+        } else {
+            let outgoingFrame = handoff == nil ? nil : transitionFrame
+            handoff = nil
+            load(index: index, startAt: initialPosition)
+            if transitionFrame == nil { transitionFrame = outgoingFrame }
+        }
+    }
 
     func load(index target: Int, startAt: Double? = nil, recovering: Bool = false) {
         guard detail.episodes.indices.contains(target), !stopped else { return }
@@ -73,35 +96,37 @@ final class PlayerSession: ObservableObject {
         requestTask?.cancel()
         let nextEpisode = detail.episodes[target]
         let chosen = app.quality
-        let prepared = takeUpcoming(episodeID: nextEpisode.id, quality: chosen)
-        cancelUpcoming()
+        let destination = PlaybackTarget(detail, index: target, quality: chosen)
+        let opening = lookahead.claim(destination)
+        transitionFrame = PlaybackLookahead.frame(destination)
         detachItem()
         if !recovering { recoveries = 0 }
         index = target; playID = UUID(); resumeAfterGesture = false; quality = chosen
         let ticket = playID
+        frameTask?.cancel()
+        if transitionFrame == nil {
+            frameTask = Task { [weak self] in
+                guard await PlaybackLookahead.restoreFrame(destination), let self, self.playID == ticket, !self.rendered else { return }
+                self.transitionFrame = PlaybackLookahead.frame(destination)
+            }
+        }
         let saved = startAt ?? (recordsLocalHistory ? app.library.progress(for: detail.drama.id).flatMap { $0.episodeID == nextEpisode.id ? $0.position : nil } : nil) ?? 0
         position = saved; duration = 0; previewPosition = saved
-        preparing = true; stage = prepared == nil ? "正在获取播放地址" : "正在准备首帧"; progress = 0; error = nil
+        preparing = true; stage = "正在准备播放"; progress = 0; error = nil
         rendered = false; endMessage = nil; holding = false; videoSize = .zero; scrubbing = false; finished = false
         requestTask = Task { [weak self] in
             var attempt = 0
             while true {
                 do {
-                    let stream: ProgressivePlayback
-                    if let prepared, attempt == 0 { stream = prepared.stream }
-                    else {
-                        stream = try await EpisodeStream.open(episodeID: nextEpisode.id, quality: chosen) { [weak self] name, fraction in
-                            Task { @MainActor in guard let self, self.playID == ticket, !self.stopped else { return }; self.stage = name; self.progress = fraction.isFinite ? min(max(fraction, 0), 1) : 0 }
-                        }
-                    }
-                    guard let self, self.playID == ticket, !self.stopped, !Task.isCancelled else { stream.close(); return }
-                    self.install(stream: stream, startAt: saved, ticket: ticket)
+                    guard let self, !Task.isCancelled else { opening.cancel(); return }
+                    let task = attempt == 0 ? opening : self.lookahead.claim(destination)
+                    let episode = try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
+                    guard self.playID == ticket, !self.stopped, !Task.isCancelled else { return }
+                    self.install(episode: episode, startAt: saved, ticket: ticket)
                     return
                 } catch is CancellationError {
-                    if let prepared, attempt == 0 { prepared.stream.close() }
                     return
                 } catch {
-                    if let prepared, attempt == 0 { prepared.stream.close() }
                     guard let self, self.playID == ticket, !self.stopped else { return }
                     // One quiet second attempt: a dropped connection or an expired address usually works right away.
                     if attempt == 0 {
@@ -117,8 +142,8 @@ final class PlayerSession: ObservableObject {
         }
     }
 
-    private func makePlayer() -> AVPlayer {
-        let player = AVPlayer()
+    private func makePlayer(_ player: AVPlayer = AVQueuePlayer()) -> AVPlayer {
+        player.actionAtItemEnd = .pause
         // AVPlayer waits for enough data and then resumes by itself. Without this a slow range stalled playback and
         // left it paused until the user tapped.
         player.automaticallyWaitsToMinimizeStalling = true
@@ -128,6 +153,7 @@ final class PlayerSession: ObservableObject {
                 self.isPlaying = player.timeControlStatus == .playing
                 self.buffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
                 if !self.isPlaying { self.endHold() }
+                if !self.preparing, self.rendered { self.prepareUpcomingIfReady() }
             }
         })
         periodic = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] time in
@@ -142,12 +168,12 @@ final class PlayerSession: ObservableObject {
         return player
     }
 
-    private func install(stream: ProgressivePlayback, startAt: Double, ticket: UUID) {
+    private func install(episode: OpenEpisode, startAt: Double, ticket: UUID) {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         try? AVAudioSession.sharedInstance().setActive(true)
         let player = self.player ?? makePlayer()
-        let item = AVPlayerItem(asset: stream.asset)
-        currentStream = stream; stream.resume()
+        let item = episode.item
+        currentEpisode = episode; episode.stream.resume()
         preparing = false; buffering = true; startPosition = max(0, startAt)
         itemObservations.append(item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor in
@@ -163,14 +189,23 @@ final class PlayerSession: ObservableObject {
         })
         itemNotifications.append(NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in Task { @MainActor in guard let self, self.playID == ticket else { return }; self.ended() } })
         itemNotifications.append(NotificationCenter.default.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main) { [weak self] _ in Task { @MainActor in guard let self, self.playID == ticket else { return }; self.failed("视频播放中断，请重试或选择其他集。") } })
-        player.replaceCurrentItem(with: item)
-        retiringStream?.close(); retiringStream = nil
-        let rate = app.speed
-        if startAt > 0.5 {
-            player.seek(to: CMTime(seconds: startAt, preferredTimescale: 600), toleranceBefore: CMTime(seconds: 0.5, preferredTimescale: 600), toleranceAfter: .zero) { [weak self] _ in
-                Task { @MainActor in guard let self, self.playID == ticket, !self.stopped else { return }; self.player?.playImmediately(atRate: rate) }
+        let continuing = player.currentItem === item
+        if !continuing {
+            if let queue = player as? AVQueuePlayer, queue.items().dropFirst().first === item {
+                queue.advanceToNextItem()
+            } else {
+                if let queue = player as? AVQueuePlayer { lookahead.stageNext(nil, on: queue) }
+                player.replaceCurrentItem(with: item)
             }
-        } else { player.playImmediately(atRate: rate) }
+        }
+        item.preferredForwardBufferDuration = 0
+        retiringEpisode = nil
+        player.defaultRate = playbackSpeed
+        if startAt > 0.5 && !continuing {
+            player.seek(to: CMTime(seconds: startAt, preferredTimescale: 600), toleranceBefore: CMTime(seconds: 0.5, preferredTimescale: 600), toleranceAfter: .zero) { [weak self] _ in
+                Task { @MainActor in guard let self, self.playID == ticket, !self.stopped else { return }; self.player?.playImmediately(atRate: self.playbackSpeed) }
+            }
+        } else { player.playImmediately(atRate: playbackSpeed) }
     }
 
     private func tick(_ time: CMTime) {
@@ -201,15 +236,21 @@ final class PlayerSession: ObservableObject {
         if began {
             resumeAfterInterruption = isPlaying
             pause()
+            if resumeAfterInterruption { didPausePlayback.send() }
         } else if shouldResume, resumeAfterInterruption, !stopped, !finished, error == nil {
             resumeAfterInterruption = false
-            currentStream?.resume(); player?.playImmediately(atRate: app.speed)
+            currentStream?.resume(); player?.playImmediately(atRate: playbackSpeed)
         }
     }
 
     func firstFrame(ticket: UUID) {
         guard ticket == playID, !rendered, let player, player.currentItem != nil, !preparing, !stopped else { return }
         rendered = true; buffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        if let episode = currentEpisode {
+            let target = PlaybackTarget(detail, index: index, quality: quality)
+            frameTask?.cancel()
+            frameTask = Task(priority: .utility) { await PlaybackLookahead.capture(episode, target: target) }
+        }
         if recordsLocalHistory {
             let value = player.currentTime().seconds
             app.library.record(drama: detail.drama, episode: episode, position: value.isFinite ? max(0, value) : position)
@@ -217,8 +258,17 @@ final class PlayerSession: ObservableObject {
         }
     }
 
-    func toggle() { if finished { load(index: index, startAt: 0) } else if isPlaying || (player?.rate ?? 0) > 0 { pause() } else { endHold(); endMessage = nil; currentStream?.resume(); player?.playImmediately(atRate: app.speed) } }
-    func pause() { endHold(); player?.pause(); currentStream?.pause(); isPlaying = false; saveProgress(flush: true) }
+    func toggle() {
+        if finished {
+            load(index: index, startAt: 0)
+        } else if isPlaying || (player?.rate ?? 0) > 0 {
+            pause()
+            didPausePlayback.send()
+        } else {
+            endHold(); endMessage = nil; currentStream?.resume(); player?.playImmediately(atRate: playbackSpeed)
+        }
+    }
+    func pause() { endHold(); player?.pause(); currentStream?.pause(); lookahead.pause(); isPlaying = false; saveProgress(flush: true) }
     /// A drag across the full width moves through the whole episode, or through this much of a longer one.
     nonisolated static let dragSeekSpan: Double = 180
     /// Where a sideways drag of `fraction` of the width (negative to the left) lands from `start`, held a second short of the end.
@@ -236,15 +286,43 @@ final class PlayerSession: ObservableObject {
         guard scrubbing else { return }
         if commit, abs(previewPosition - start) > 0.2 { setSeeking(false) } else { scrubbing = false }
     }
-    func setSpeed(_ speed: Float) { app.speed = speed; holding = false; if isPlaying { player?.rate = speed } }
+    var playbackSpeed: Float { holding || speedLocked ? 2 : app.speed }
+    var canLockSpeed: Bool { isPlaying && rendered && !scrubbing && !speedLocked }
+
+    func setSpeed(_ speed: Float) {
+        app.speed = speed
+        holding = false
+        speedLocked = false
+        applyPlaybackSpeed()
+    }
+
+    func lockSpeed() {
+        guard canLockSpeed else { return }
+        speedLocked = true
+        holding = false
+        applyPlaybackSpeed()
+    }
+
+    func unlockSpeed() {
+        guard speedLocked else { return }
+        speedLocked = false
+        applyPlaybackSpeed()
+    }
     /// Switches 清晰度 for this and later episodes, continuing from the same position.
     func setQuality(_ value: VideoQuality) {
         app.quality = value
         guard value != quality, !stopped else { return }
         load(index: index, startAt: position)
     }
-    func beginHold() { guard isPlaying, rendered, !scrubbing, !holding else { return }; holding = true; player?.rate = 2; Haptics.holdSpeedBegan() }
-    func endHold() { guard holding else { return }; holding = false; if (player?.rate ?? 0) > 0 { player?.rate = app.speed } }
+    func beginHold() { guard canLockSpeed, !holding else { return }; holding = true; applyPlaybackSpeed(); Haptics.holdSpeedBegan() }
+    func endHold() { guard holding else { return }; holding = false; applyPlaybackSpeed() }
+
+    private func applyPlaybackSpeed() {
+        guard let player else { return }
+        let rate = playbackSpeed
+        player.defaultRate = rate
+        if player.timeControlStatus != .paused, player.rate != rate { player.rate = rate }
+    }
     func setSeeking(_ editing: Bool) {
         endHold()
         if editing { previewPosition = position; scrubbing = true }
@@ -272,21 +350,21 @@ final class PlayerSession: ObservableObject {
     func releaseGesture() {
         let resume = resumeAfterGesture; resumeAfterGesture = false
         guard resume, !stopped, !finished, error == nil, let player else { return }
-        endMessage = nil; player.playImmediately(atRate: app.speed)
+        endMessage = nil; player.playImmediately(atRate: playbackSpeed)
     }
     func retry() { recoveries = 0; load(index: index, startAt: position) }
     func suspend() {
-        resumeAfterGesture = false; pause(); saveProgress(flush: true); cancelUpcoming()
+        resumeAfterGesture = false; pause(); saveProgress(flush: true); lookahead.clear()
         if preparing { requestTask?.cancel(); playID = UUID(); preparing = false; error = "播放准备已暂停，回到前台后可重试。" }
     }
     /// 下一集整集预加载 changed: what is already prepared stays, a new preparation follows the new setting.
-    func preferencesChanged() { }
+    func preferencesChanged() { prepareUpcomingIfReady() }
 
     private func ended() {
         if rendered { AccountService.shared.observePlayback(drama: detail.drama, episode: episode, position: duration, duration: duration, token: accountToken, force: true) }
         endHold(); isPlaying = false; position = 0; finished = true
         if recordsLocalHistory { app.library.updatePosition(dramaID: detail.drama.id, episodeID: episode.id, position: 0); app.library.flush() }
-        if index + 1 < detail.episodes.count { if app.autoNext { next() } else { endMessage = "本集已播完，上滑观看下一集" } }
+        if index + 1 < detail.episodes.count { if app.autoNext { load(index: index + 1, startAt: 0) } else { endMessage = "本集已播完，上滑观看下一集" } }
         else { endMessage = "已播完最后一集"; Task { await advanceSeason() } }
     }
 
@@ -305,32 +383,13 @@ final class PlayerSession: ObservableObject {
     /// A few seconds into an episode, the next one is opened and its start downloaded (the whole episode when
     /// 下一集整集预加载 is on), so autoplay, a swipe or the next button start it without waiting.
     private func prepareUpcomingIfReady() {
-        guard rendered, !stopped, upcoming == nil, upcomingTask == nil, index + 1 < detail.episodes.count,
-              position > 4 || (duration > 0 && position > duration * 0.5) else { return }
-        let next = detail.episodes[index + 1], chosen = app.quality, whole = app.preloadNext
-        let ticket = UUID(); upcomingTicket = ticket
-        upcomingTask = Task { [weak self] in
-            do {
-                let stream = try await EpisodeStream.open(episodeID: next.id, quality: chosen)
-                guard let self, self.upcomingTicket == ticket, !Task.isCancelled else { stream.close(); return }
-                self.upcoming = PreparedEpisode(episodeID: next.id, quality: chosen, stream: stream)
-                await EpisodeStream.warm(stream, whole: whole)
-            } catch { }
-            guard let self, self.upcomingTicket == ticket else { return }
-            self.upcomingTask = nil
+        guard rendered, !stopped, !scrubbing, let player else { lookahead.pause(); return }
+        let targets = detail.episodes.indices.dropFirst(index + 1).prefix(2).map { PlaybackTarget(detail, index: $0, quality: quality) }
+        let depth = PlaybackLookahead.depth(player: player, speed: player.rate)
+        lookahead.update(targets, depth: depth, wholeFirst: app.preloadNext)
+        if let queue = player as? AVQueuePlayer, !finished, player.timeControlStatus != .paused {
+            lookahead.stageNext(depth > 0 ? targets.first : nil, on: queue)
         }
-    }
-
-    private func takeUpcoming(episodeID: String, quality: VideoQuality) -> PreparedEpisode? {
-        guard let prepared = upcoming, prepared.episodeID == episodeID, prepared.quality == quality else { return nil }
-        upcoming = nil
-        return prepared
-    }
-
-    /// Stops a preparation in progress; a prepared stream not taken by `load` is closed.
-    private func cancelUpcoming() {
-        upcomingTicket = nil; upcomingTask?.cancel(); upcomingTask = nil
-        upcoming?.stream.close(); upcoming = nil
     }
 
     private func saveProgress(flush: Bool = false) {
@@ -350,22 +409,22 @@ final class PlayerSession: ObservableObject {
         endHold(); player?.pause()
         itemObservations.removeAll(); itemNotifications.forEach { NotificationCenter.default.removeObserver($0) }; itemNotifications.removeAll()
         isPlaying = false; buffering = false
-        if let currentStream {
-            retiringStream?.close()
-            retiringStream = currentStream
-            self.currentStream = nil
+        if let currentEpisode {
+            retiringEpisode = currentEpisode
+            self.currentEpisode = nil
         }
     }
 
     func stop() {
         guard !stopped else { return }
         saveProgress(flush: true); stopped = true; onSlide = nil; resumeAfterGesture = false
-        requestTask?.cancel(); requestTask = nil; cancelUpcoming(); playID = UUID()
+        requestTask?.cancel(); requestTask = nil; lookahead.clear(); playID = UUID()
+        frameTask?.cancel(); frameTask = nil
         detachItem()
         if let periodic, let player { player.removeTimeObserver(periodic) }; periodic = nil
         playerObservations.removeAll(); sessionNotifications.forEach { NotificationCenter.default.removeObserver($0) }; sessionNotifications.removeAll()
         player?.replaceCurrentItem(with: nil); player = nil
-        retiringStream?.close(); retiringStream = nil
+        retiringEpisode = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 }
