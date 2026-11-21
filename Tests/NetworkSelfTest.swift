@@ -562,13 +562,15 @@ import JavaScriptCore
             let withoutTotal = try EpisodeDiscussionAPI.parse(page(#""reviews":{\#(field)"reviews":[{"content":"预览"}]}"#), seriesID: series, episodeID: episode)
             precondition(withoutTotal.previewCount == 1 && withoutTotal.totalCount == nil && withoutTotal.displayCount == 1)
         }
-        for unpublished in [#""reviews":{"total_count":"18"}"#, #""reviews":{"reviews":null}"#] {
-            do {
-                _ = try EpisodeDiscussionAPI.parse(page(unpublished), seriesID: series, episodeID: episode)
-                fatalError("Missing episode preview must not be presented as a valid empty list or as series reviews")
-            } catch EpisodeDiscussionAPI.ReadError.unavailable { }
+        for countOnly in [#""reviews":{"total_count":"18"}"#, #""reviews":{"total_count":18,"reviews":null}"#] {
+            let partial = try EpisodeDiscussionAPI.parse(page(countOnly), seriesID: series, episodeID: episode)
+            precondition(!partial.hasDisplayableComments && partial.previewCount == 0 && partial.displayCount == 18)
         }
-        for malformed in [#""reviews":{"reviews":{}}"#, #""reviews":{"reviews":[{"content":123},null]}"#] {
+        for noPreview in [#""reviews":null"#, #""reviews":{"reviews":null}"#] {
+            let missing = try EpisodeDiscussionAPI.parse(page(noPreview), seriesID: series, episodeID: episode)
+            precondition(!missing.hasDisplayableComments && missing.displayCount == nil)
+        }
+        for malformed in [#""reviews":[]"#, #""reviews":{"reviews":{}}"#, #""reviews":{"reviews":[{"content":123},null]}"#] {
             do {
                 _ = try EpisodeDiscussionAPI.parse(page(malformed), seriesID: series, episodeID: episode)
                 fatalError("Malformed previews must not be presented as empty or unpublished")
@@ -578,22 +580,29 @@ import JavaScriptCore
             _ = try EpisodeDiscussionAPI.parse(page(fixture, vid: otherEpisode), seriesID: series, episodeID: episode)
             fatalError("A different episode's comments must not be returned")
         } catch EpisodeDiscussionAPI.ReadError.unexpectedPage { }
+        do {
+            _ = try EpisodeDiscussionAPI.parse(page(fixture), seriesID: otherEpisode, episodeID: episode)
+            fatalError("A different series's comments must not be returned")
+        } catch EpisodeDiscussionAPI.ReadError.unexpectedPage { }
+        do {
+            let unsuccessful = page(fixture).replacingOccurrences(of: "\"isSuccess\":true", with: "\"isSuccess\":false")
+            _ = try EpisodeDiscussionAPI.parse(unsuccessful, seriesID: series, episodeID: episode)
+            fatalError("An unsuccessful loader must not provide comments")
+        } catch EpisodeDiscussionAPI.ReadError.unsuccessfulPage { }
         let url = EpisodeDiscussionAPI.shareURL(seriesID: series, episodeID: episode)!
         func response(_ status: Int, location: String? = nil) -> HTTPURLResponse {
             HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1",
                             headerFields: location.map { ["Location": $0] })!
         }
         let locked = response(302, location: "/player/\(series)/\(otherEpisode)?pc_locked_episode=\(episode)")
-        for unavailable in [locked, response(404), response(410)] {
-            do {
-                try EpisodeDiscussionAPI.validateStatus(unavailable, episodeID: episode)
-                fatalError("An unavailable page must not be accepted")
-            } catch EpisodeDiscussionAPI.ReadError.unavailable { }
-        }
+        do {
+            try EpisodeDiscussionAPI.validateStatus(locked, episodeID: episode)
+            fatalError("A lock redirect must not be accepted")
+        } catch EpisodeDiscussionAPI.ReadError.restrictedEpisode { }
         for failure in [response(302, location: "/player/\(series)/\(otherEpisode)"),
                         response(302, location: "https://example.com/?pc_locked_episode=\(episode)"),
                         response(302, location: "/player/\(series)/\(otherEpisode)?pc_locked_episode=\(otherEpisode)"),
-                        response(401), response(403), response(429), response(503)] {
+                        response(401), response(403), response(404), response(410), response(429), response(503)] {
             do {
                 try EpisodeDiscussionAPI.validateStatus(failure, episodeID: episode)
                 fatalError("An HTTP failure must not be presented as an unavailable or empty preview")
@@ -608,11 +617,12 @@ import JavaScriptCore
         precondition(url.absoluteString == "https://hongguoduanju.com/player/\(series)/\(episode)")
         let request = EpisodeDiscussionAPI.publicPageRequest(url)
         precondition(request.value(forHTTPHeaderField: "User-Agent") == WebsiteCatalog.userAgent)
-        precondition(!request.httpShouldHandleCookies && request.value(forHTTPHeaderField: "Authorization") == nil)
+        precondition(!request.httpShouldHandleCookies && request.value(forHTTPHeaderField: "Cookie") == nil &&
+                     request.value(forHTTPHeaderField: "Authorization") == nil)
         let anotherEpisodeURL = EpisodeDiscussionAPI.shareURL(seriesID: series, episodeID: otherEpisode)!
         let anotherSeriesURL = EpisodeDiscussionAPI.shareURL(seriesID: otherEpisode, episodeID: episode)!
         try await checkEpisodePreviewCache(url, anotherEpisodeURL, anotherSeriesURL, preview: preview, empty: empty)
-        print("PASS: anonymous desktop episode preview, precise IDs, counts, stable deduplication and unavailable pages.")
+        print("PASS: anonymous episode previews, counts without bodies, stable deduplication, ID checks and restricted pages.")
     }
 
     static func checkEpisodePreviewCache(_ url: URL, _ anotherEpisode: URL, _ anotherSeries: URL,
@@ -643,12 +653,16 @@ import JavaScriptCore
         let afterExpiry = try await shortLived.preview(for: url) { preview }
         precondition(afterExpiry == preview)
 
-        let retry = EpisodeDiscussionAPI.PreviewCache()
-        do {
-            _ = try await retry.preview(for: url) { throw EpisodeDiscussionAPI.ReadError.unavailable }
-            fatalError("A fetch failure must propagate")
-        } catch EpisodeDiscussionAPI.ReadError.unavailable { }
-        let recovered = try await retry.preview(for: url) { empty }
-        precondition(recovered == empty)
+        for failure: EpisodeDiscussionAPI.ReadError in [.restrictedEpisode, .httpStatus(503)] {
+            let retry = EpisodeDiscussionAPI.PreviewCache()
+            do {
+                _ = try await retry.preview(for: url) { throw failure }
+                fatalError("A fetch failure must propagate")
+            } catch let error as EpisodeDiscussionAPI.ReadError {
+                precondition(error == failure)
+            }
+            let recovered = try await retry.preview(for: url) { preview }
+            precondition(recovered == preview && recovered.hasDisplayableComments)
+        }
     }
 }

@@ -6,6 +6,36 @@ enum AppSymbol {
     static let settings = "gearshape"
 }
 
+extension Font {
+    static let playbackHeading = Font.subheadline.weight(.medium)
+}
+
+struct FollowDramaButton: View {
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: selected ? "checkmark" : "plus")
+                Text(selected ? "已追" : "追剧")
+            }
+            .font(.caption.weight(.semibold))
+            .fixedSize()
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .foregroundStyle(selected ? Color.white : .black)
+            .background(selected ? Color.black.opacity(0.65) : .white, in: Capsule())
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(selected ? "已追" : "追剧")
+        .accessibilityHint(selected ? "取消本机收藏" : "添加本机收藏")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
 struct AppControlIcon: View {
     let name: String
 
@@ -186,7 +216,9 @@ struct HeaderIcon: View {
 extension View {
     func appBackground(_ theme: ThemeColors) -> some View { self.background(theme.background.ignoresSafeArea()).toolbarBackground(theme.background, for: .navigationBar).toolbarBackground(.visible, for: .navigationBar) }
     /// Pages pushed from 我的 (settings, account) cover the tab bar, like Android's full-screen settings.
-    func secondaryPage() -> some View { self.toolbar(.hidden, for: .tabBar) }
+    func secondaryPage() -> some View {
+        toolbar(.hidden, for: .tabBar).background(InteractiveBackSwipe(enabled: true))
+    }
     /// Tab roots draw their own header; a zero-height inset keeps scrolled content from showing under the status bar.
     func tabRoot(_ theme: ThemeColors) -> some View {
         self.toolbar(.hidden, for: .navigationBar).safeAreaInset(edge: .top, spacing: 0) { Color.clear.frame(height: 0).background(theme.background) }

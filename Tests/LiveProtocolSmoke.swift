@@ -22,19 +22,23 @@ import Foundation
  }
 
  static func checkEpisodeDiscussion() async throws {
-  let seriesID = "7703065438208412697"
-  let samples = [("无限白粥 第1集", "7703065456646556696", true),
-                 ("无限白粥 第5集", "7703065456780790808", true),
-                 ("无限白粥 第6集", "7703065459783896088", false)]
-  for (label, episodeID, requiresComments) in samples {
+  let whitePorridge = "7703065438208412697"
+  let spiritGourd = "7697574151787121726"
+  let samples = [("无限白粥 第1集", whitePorridge, "7703065456646556696", true),
+                 ("无限白粥 第5集", whitePorridge, "7703065456780790808", true),
+                 ("无限白粥 第6集", whitePorridge, "7703065459783896088", false),
+                 ("灵葫仙缘 第1集", spiritGourd, "7697626904827792409", true),
+                 ("灵葫仙缘 第5集", spiritGourd, "7697626987325557785", true),
+                 ("灵葫仙缘 第6集", spiritGourd, "7697626975023664153", false)]
+  for (label, seriesID, episodeID, requiresComments) in samples {
    do {
     let preview = try await EpisodeDiscussionAPI.preview(seriesID: seriesID, episodeID: episodeID)
     guard !requiresComments || (preview.hasDisplayableComments && preview.totalCount != nil) else {
      throw HGError.message("\(label) 未取得预期的官网评论和计数")
     }
     print("discussion_live", label, "preview", preview.previewCount, "total", preview.totalCount.map(String.init) ?? "unknown")
-   } catch EpisodeDiscussionAPI.ReadError.unavailable where !requiresComments {
-    print("discussion_live", label, "unavailable")
+   } catch EpisodeDiscussionAPI.ReadError.restrictedEpisode where !requiresComments {
+    print("discussion_live", label, "restricted_episode_redirect")
    }
   }
  }

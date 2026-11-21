@@ -19,7 +19,8 @@ struct EpisodeCommentPreview: Equatable, Sendable {
 enum EpisodeDiscussionAPI {
     enum ReadError: LocalizedError, Equatable {
         case invalidIdentifier
-        case unavailable
+        case restrictedEpisode
+        case unsuccessfulPage
         case unexpectedPage
         case responseTooLarge
         case httpStatus(Int)
@@ -27,9 +28,13 @@ enum EpisodeDiscussionAPI {
         var errorDescription: String? {
             switch self {
             case .invalidIdentifier: return "剧集或分集编号无效。"
-            case .unavailable: return "官网未开放本集评论预览。"
+            case .restrictedEpisode: return "官网限制访问本集播放页，暂时无法读取评论和弹幕。"
+            case .unsuccessfulPage: return "官网未能加载本集播放信息。"
             case .unexpectedPage: return "官网返回的分集或评论格式不匹配。"
             case .responseTooLarge: return "官网返回的评论页面过大。"
+            case .httpStatus(401), .httpStatus(403): return "官网拒绝了本集播放页的匿名访问。"
+            case .httpStatus(404), .httpStatus(410): return "官网未返回本集播放页。"
+            case .httpStatus(429): return "官网暂时限制请求频率，请稍后重试。"
             case .httpStatus(let status): return "官网评论读取失败（HTTP \(status)）。"
             }
         }
@@ -142,14 +147,13 @@ enum EpisodeDiscussionAPI {
     static func validateStatus(_ response: HTTPURLResponse, episodeID: String) throws {
         switch response.statusCode {
         case 200: return
-        case 404, 410: throw ReadError.unavailable
         case 300..<400:
             if let location = response.value(forHTTPHeaderField: "Location"),
                let redirect = URL(string: location, relativeTo: response.url)?.absoluteURL,
                redirect.scheme == "https", redirect.host == response.url?.host, redirect.port == response.url?.port,
                let components = URLComponents(url: redirect, resolvingAgainstBaseURL: false),
                components.queryItems?.first(where: { $0.name == "pc_locked_episode" })?.value == episodeID {
-                throw ReadError.unavailable
+                throw ReadError.restrictedEpisode
             }
             throw ReadError.httpStatus(response.statusCode)
         default: throw ReadError.httpStatus(response.statusCode)
@@ -161,13 +165,16 @@ enum EpisodeDiscussionAPI {
         guard let page,
               ProtocolJSON.identifier(ProtocolJSON.dictionary(page["seriesDetail"])["series_id"]) == seriesID,
               ProtocolJSON.identifier(page["vid"]) == episodeID else { throw ReadError.unexpectedPage }
-        guard ProtocolJSON.bool(page["isSuccess"], default: true) else { throw ReadError.unavailable }
-        let social = ProtocolJSON.dictionary(page["episodeSocialInfo"])
-        let preview = ProtocolJSON.dictionary(social["reviews"])
-        guard let publishedReviews = preview["reviews"], !(publishedReviews is NSNull) else {
-            throw ReadError.unavailable
+        guard ProtocolJSON.bool(page["isSuccess"], default: true) else { throw ReadError.unsuccessfulPage }
+        let social = try previewFields(page["episodeSocialInfo"])
+        let preview = try previewFields(social["reviews"])
+        let reviews: [Any]
+        if let publishedReviews = preview["reviews"], !(publishedReviews is NSNull) {
+            guard let rows = publishedReviews as? [Any] else { throw ReadError.unexpectedPage }
+            reviews = rows
+        } else {
+            reviews = []
         }
-        guard let reviews = publishedReviews as? [Any] else { throw ReadError.unexpectedPage }
 
         var seen = Set<String>()
         var containsTextField = false
@@ -189,5 +196,12 @@ enum EpisodeDiscussionAPI {
         let total = isBoolean ? nil : Int(ProtocolJSON.text(rawTotal))
         let validTotal = total.flatMap { count in count >= items.count && (count > 0 || reviews.isEmpty) ? count : nil }
         return EpisodeCommentPreview(items: items, totalCount: validTotal)
+    }
+
+    private static func previewFields(_ value: Any?) throws -> [String: Any] {
+        guard let value, !(value is NSNull) else { return [:] }
+        if let fields = value as? [String: Any] { return fields }
+        if let json = value as? String, let fields = try? ProtocolJSON.object(Data(json.utf8)) { return fields }
+        throw ReadError.unexpectedPage
     }
 }

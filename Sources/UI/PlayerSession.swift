@@ -8,6 +8,15 @@ import UIKit
 /// The next episode is opened and its first seconds downloaded while the current one plays, so switching starts at once.
 @MainActor
 final class PlayerSession: ObservableObject {
+    private static let tracingPlayback = ProcessInfo.processInfo.arguments.contains("--trace-playback")
+
+    private func trace(_ event: @autoclosure () -> String) {
+        guard Self.tracingPlayback else { return }
+        let entries = (player as? AVQueuePlayer)?.items().count ?? 0
+        let message = "\(Date().timeIntervalSince1970) playback \(event()) episode=\(episode.index) queue=\(entries) rate=\(player?.rate ?? 0) size=\(videoSize)\n"
+        FileHandle.standardError.write(Data(message.utf8))
+    }
+
     let detail: DramaDetail
     let app: AppModel
     let recordsLocalHistory: Bool
@@ -72,6 +81,7 @@ final class PlayerSession: ObservableObject {
     private var startPosition: Double = 0
     /// Set by the player screen: episode changes slide like a page instead of cutting. Cleared on stop to break the cycle.
     var onSlide: (@MainActor (Int) -> Void)?
+    var onSeasonPlayback: (@MainActor (PlaybackRequest) -> Void)?
     private let requestID: UUID
     private let initialPosition: Double
     private let accountToken: UUID
@@ -252,9 +262,11 @@ final class PlayerSession: ObservableObject {
         // AVPlayer waits for enough data and then resumes by itself. Without this a slow range stalled playback and
         // left it paused until the user tapped.
         player.automaticallyWaitsToMinimizeStalling = true
-        playerObservations.append(player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
+        playerObservations.append(player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, change in
+            let status = change.newValue
             Task { @MainActor in
                 guard let self, self.player === player else { return }
+                self.trace("transport=\(status?.rawValue ?? -1)")
                 self.adoptQueuedEpisodeIfNeeded()
                 guard !self.pauseIfSleepTimerExpired() else { return }
                 if self.pausedBySleepTimer {
@@ -311,12 +323,12 @@ final class PlayerSession: ObservableObject {
         if startAt > 0.5 && !continuing {
             player.seek(to: CMTime(seconds: startAt, preferredTimescale: 600), toleranceBefore: CMTime(seconds: 0.5, preferredTimescale: 600), toleranceAfter: .zero) { [weak self] _ in
                 Task { @MainActor in
-                    guard let self, self.playID == ticket, !self.stopped,
+                guard let self, self.playID == ticket, !self.stopped, !self.pausedByRequest,
                           !self.pauseIfSleepTimerExpired(), !self.pausedBySleepTimer else { return }
                     self.player?.playImmediately(atRate: self.playbackSpeed)
                 }
             }
-        } else { player.playImmediately(atRate: playbackSpeed) }
+        } else if !pausedByRequest { player.playImmediately(atRate: playbackSpeed) }
     }
 
     private func observeItem(_ item: AVPlayerItem, ticket: UUID) {
@@ -549,6 +561,7 @@ final class PlayerSession: ObservableObject {
         guard let player, let next = stagedEpisode, player.currentItem === next.item,
               detail.episodes.indices.contains(index + 1), !stopped, !preparing, !finished else { return false }
         let target = PlaybackTarget(detail, index: index + 1, quality: quality)
+        trace("native-advance nextSize=\(next.item.presentationSize) nextDuration=\(next.item.duration.seconds)")
         pendingItemEnd = nil
         setStagedEpisode(nil)
         updateEndAction(autoNext: app.autoNext)
@@ -584,6 +597,7 @@ final class PlayerSession: ObservableObject {
            let next = stagedEpisode?.item, next.status != .failed,
            queue.items().contains(where: { $0 === next }) { return }
         guard !adoptQueuedEpisodeIfNeeded() else { return }
+        trace("finish-without-advance autoNext=\(app.autoNext) stoppedByUser=\(pausedByRequest)")
         pendingItemEnd = nil
         recordCompletion()
         endHold(); isPlaying = false; position = 0; finished = true
@@ -607,11 +621,11 @@ final class PlayerSession: ObservableObject {
             let release = (try? await DramaAPI.shared.upcomingRelease(id: next.id, title: next.drama.title)) ?? ""
             guard canAdvanceSeason() else { return }
             endMessage = "已播完最后一集，\(next.season)\(release.isEmpty ? "待上线" : release)，可在详情页预约"
-        } else if app.autoNext, app.openingDramaID == nil {
+        } else if app.autoNext, app.openingDramaID == nil, let onSeasonPlayback {
             seasonOpening = app.openPlayback(next.drama, canPresent: { [weak self] in
                 guard let self else { return false }
                 return self.canAdvanceSeason() && self.app.autoNext
-            }, sleepDeadline: { [weak self] in self?.sleepDeadline })
+            }, sleepDeadline: { [weak self] in self?.sleepDeadline }, present: onSeasonPlayback)
         } else {
             endMessage = "已播完最后一集，\(next.season)可在详情页观看"
         }
@@ -646,6 +660,7 @@ final class PlayerSession: ObservableObject {
     private func setStagedEpisode(_ episode: OpenEpisode?) {
         guard stagedEpisode !== episode else { return }
         stagedEpisode = episode
+        trace(episode == nil ? "unstaged" : "staged")
         stagedItemObservation = episode?.item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor in
                 guard let self, self.stagedEpisode?.item === item, item.status == .failed else { return }
@@ -699,7 +714,7 @@ final class PlayerSession: ObservableObject {
     func stop() {
         guard !stopped else { return }
         adoptQueuedEpisodeIfNeeded()
-        saveProgress(flush: true); stopped = true; onSlide = nil
+        saveProgress(flush: true); stopped = true; onSlide = nil; onSeasonPlayback = nil
         autoNextObservation = nil
         clearSleepTimer()
         cancelSeasonAdvance()

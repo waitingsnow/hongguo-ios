@@ -7,8 +7,13 @@ struct DiscussionEpisode: Hashable {
     let number: Int
 }
 
+enum CommentDanmakuPreference {
+    static let key = "playback.commentDanmaku"
+    static let defaultValue = true
+}
+
 struct DiscussionControls: View {
-    @AppStorage("playback.commentDanmaku") private var enabled = false
+    @AppStorage(CommentDanmakuPreference.key) private var enabled = CommentDanmakuPreference.defaultValue
     @Environment(\.episodeCommentPreview) private var preview
     var vertical = false
     let showComments: () -> Void
@@ -61,13 +66,13 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
     let foreground: Bool
     let hideDanmaku: Bool
     @Binding var presented: Bool
-    @AppStorage("playback.commentDanmaku") private var enabled = false
+    @AppStorage(CommentDanmakuPreference.key) private var enabled = CommentDanmakuPreference.defaultValue
     @State private var result: (episode: DiscussionEpisode, outcome: Outcome)?
     @State private var retry = 0
 
     private enum Outcome {
         case preview(EpisodeCommentPreview)
-        case unavailable
+        case restricted
         case failed(String)
     }
 
@@ -102,7 +107,7 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
         .task(id: request) {
             guard let target = request.episode else { return }
             switch outcome {
-            case .preview, .unavailable: return
+            case .preview, .restricted: return
             case .failed, nil: break
             }
             result = nil
@@ -112,8 +117,8 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
                 result = (target, .preview(preview))
             } catch {
                 guard !Task.isCancelled else { return }
-                if error as? EpisodeDiscussionAPI.ReadError == .unavailable {
-                    result = (target, .unavailable)
+                if error as? EpisodeDiscussionAPI.ReadError == .restrictedEpisode {
+                    result = (target, .restricted)
                 } else {
                     let message = (error as? EpisodeDiscussionAPI.ReadError)?.errorDescription ?? "请检查网络后重试。"
                     result = (target, .failed(message))
@@ -138,8 +143,9 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
                             } description: {
                                 Text(message)
                             } actions: { Button("重试") { retry += 1 } }
-                        case .unavailable:
-                            ContentUnavailableView("官网暂未开放本集评论", systemImage: "text.bubble")
+                        case .restricted:
+                            ContentUnavailableView("本集评论暂不可读", systemImage: "text.bubble",
+                                                   description: Text(EpisodeDiscussionAPI.ReadError.restrictedEpisode.localizedDescription))
                         case .preview(let preview):
                             commentList(preview)
                         }
@@ -164,7 +170,7 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
             if preview.totalCount == 0 {
                 ContentUnavailableView("本集暂无公开评论", systemImage: "text.bubble")
             } else {
-                ContentUnavailableView("官网没有可读评论预览", systemImage: "text.bubble",
+                ContentUnavailableView("官网未返回可读评论", systemImage: "text.bubble",
                                        description: preview.totalCount.map { Text("官网显示共 \($0) 条评论。") })
             }
         } else {

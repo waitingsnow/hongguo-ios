@@ -13,6 +13,7 @@ struct DetailView: View {
     @State private var showFullSummary = false
     @State private var related: [RelatedWork] = []
     @State private var reserving: RelatedWork?
+    @State private var playbackRequest: PlaybackRequest?
 
     var body: some View {
         ScrollView {
@@ -41,7 +42,7 @@ struct DetailView: View {
                         if detail.episodes.isEmpty { EmptyStateView(symbol: "film", title: "暂无可播放剧集", message: "可以稍后重试获取选集。") }
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 47), spacing: 10)], spacing: 10) {
                             ForEach(Array(detail.episodes.enumerated()), id: \.element.id) { index, episode in
-                                Button { selected = index; model.play(detail, index: index, resume: resume) } label: {
+                                Button { selected = index; play(detail, index: index) } label: {
                                     Text("\(episode.index)").font(.subheadline.weight(selected == index ? .bold : .regular)).frame(maxWidth: .infinity).frame(height: 46)
                                         .foregroundStyle(selected == index ? .white : model.appearance.ink)
                                         .background(selected == index ? model.appearance.accent : model.appearance.surface, in: RoundedRectangle(cornerRadius: 11))
@@ -52,9 +53,12 @@ struct DetailView: View {
                 }
             }.padding(20).padding(.bottom, 12)
         }.appBackground(model.appearance).navigationTitle("剧集详情").navigationBarTitleDisplayMode(.inline)
+            .toolbar(.visible, for: .navigationBar)
+            .background(InteractiveBackSwipe(enabled: true))
+            .playbackDestination($playbackRequest)
             .safeAreaInset(edge: .bottom) {
                 if let detail, !detail.episodes.isEmpty {
-                    Button { model.play(detail, index: selected, resume: resume) } label: { Label("播放第 \(detail.episodes[min(selected, detail.episodes.count - 1)].index) 集", systemImage: "play.fill").font(.headline).frame(maxWidth: .infinity).frame(height: 52) }.buttonStyle(.borderedProminent).tint(model.appearance.accent).padding(.horizontal, 20).padding(.vertical, 12).background(model.appearance.background)
+                    Button { play(detail, index: selected) } label: { Label("播放第 \(detail.episodes[min(selected, detail.episodes.count - 1)].index) 集", systemImage: "play.fill").font(.headline).frame(maxWidth: .infinity).frame(height: 52) }.buttonStyle(.borderedProminent).tint(model.appearance.accent).padding(.horizontal, 20).padding(.vertical, 12).background(model.appearance.background)
                 }
             }
             .task(id: drama.id) { await load() }
@@ -72,6 +76,10 @@ struct DetailView: View {
                 Button("预约") { Task { await account.reserve(work) } }
                 Button("取消", role: .cancel) { }
             } message: { work in Text("将在红果账号中预约《\(work.drama.title)》\(work.releaseText.isEmpty ? "" : "（\(work.releaseText)）")，上线后可在账号的预约列表查看。") }
+    }
+
+    private func play(_ detail: DramaDetail, index: Int) {
+        model.play(detail, index: index, resume: resume) { playbackRequest = $0 }
     }
 
     /// The two favorites side by side, so where each one is kept is visible: this device or the Hongguo account.

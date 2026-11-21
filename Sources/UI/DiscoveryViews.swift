@@ -8,6 +8,7 @@ struct HomeView: View {
     @StateObject private var loader = CatalogLoader()
     @State private var feed = "guess"
     @State private var guessPager: GuessPager?
+    @State private var playbackRequest: PlaybackRequest?
     /// 刷剧: the full-screen feed of the same list in the card layouts, kept across launches.
     @AppStorage("home.feedMode") private var feedMode = false
     // 推荐 is the default channel and sits at the far right; the row opens scrolled to it.
@@ -25,6 +26,7 @@ struct HomeView: View {
                               exit: model.appearance == .immersive ? nil : { feedMode = false }).toolbar(.hidden, for: .navigationBar)
             } else {
                 classicHome.appBackground(model.appearance).tabRoot(model.appearance)
+                    .playbackDestination($playbackRequest)
             }
         }
         .navigationTitle("")
@@ -90,7 +92,7 @@ struct HomeView: View {
                     }.padding(18).padding(.trailing, 110)
                 }.frame(height: 210).frame(maxWidth: .infinity).clipShape(shape).contentShape(shape)
             }.buttonStyle(.plain).accessibilityIdentifier("home.featured.\(drama.id)")
-            Button { model.play(drama) } label: {
+            Button { model.play(drama) { playbackRequest = $0 } } label: {
                 Label("立即播放", systemImage: "play.fill").font(.caption.bold()).padding(.horizontal, 13).padding(.vertical, 10)
                     .background(.white, in: Capsule()).foregroundStyle(Color(hex: 0xA9341F))
             }.buttonStyle(.plain).padding(18).accessibilityIdentifier("home.featured.play")
@@ -103,7 +105,7 @@ struct HomeView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
                     ForEach(Array(library.history.prefix(8))) { entry in
-                        Button { model.play(entry.drama) } label: {
+                        Button { model.play(entry.drama) { playbackRequest = $0 } } label: {
                             HStack(spacing: 11) {
                                 PosterView(drama: entry.drama, ratio: 0.8).frame(width: 57)
                                 VStack(alignment: .leading, spacing: 7) { Text(entry.drama.title).font(.subheadline.weight(.semibold)).foregroundStyle(model.appearance.ink).lineLimit(2); Text("第 \(entry.episodeIndex) 集 · \(timeLabel(entry.position))").font(.caption).foregroundStyle(model.appearance.muted); Label("接着看", systemImage: "play.fill").font(.caption.weight(.semibold)).foregroundStyle(model.appearance.accent) }.frame(maxWidth: .infinity, alignment: .leading)
@@ -163,6 +165,7 @@ private struct ImmersiveFeed: View {
     @EnvironmentObject private var library: LibraryStore
     @State private var current: String?
     @State private var detailDrama: Drama?
+    @State private var playbackRequest: PlaybackRequest?
     @State private var commentsVisible = false
     @StateObject private var preview = FeedPreview()
     @State private var visible = false
@@ -182,6 +185,7 @@ private struct ImmersiveFeed: View {
                                 ImmersivePage(drama: drama, index: index, insets: insets,
                                               roomy: outer.size.height + insets.top + insets.bottom >= 640, preview: preview,
                                               openDetails: { detailDrama = drama }, openComments: { commentsVisible = true },
+                                              presentPlayback: presentPlayback,
                                               retryPreview: { if preview.dramaID == drama.id { syncPreview() } })
                                     .frame(width: outer.size.width + insets.leading + insets.trailing,
                                            height: outer.size.height + insets.top + insets.bottom)
@@ -210,6 +214,7 @@ private struct ImmersiveFeed: View {
             }.ignoresSafeArea()
         }
         .navigationDestination(item: $detailDrama) { DetailView(drama: $0) }
+        .playbackDestination($playbackRequest)
         .episodeDiscussion(preview.detail.flatMap { detail in
             detail.episodes.first.map { DiscussionEpisode(seriesID: detail.drama.id, episodeID: $0.id, number: $0.index) }
         }, player: preview.player, playing: preview.rendered && !preview.paused && !preview.ended,
@@ -228,31 +233,39 @@ private struct ImmersiveFeed: View {
         .onAppear { visible = true; model.feedOnScreen = true; syncPreview() }
         .onDisappear { visible = false; model.feedOnScreen = false; model.refreshSystemAppearance(); preview.stop() }
         .onChange(of: model.playback == nil) { _, _ in syncPreview() }
+        .onChange(of: detailDrama?.id) { _, _ in syncPreview() }
+        .onChange(of: playbackRequest == nil) { _, _ in syncPreview() }
         .onChange(of: scenePhase) { _, _ in syncPreview() }
     }
 
     private func syncPreview() {
-        guard visible, detailDrama == nil, scenePhase == .active, model.playback == nil, loader.dramas.indices.contains(index) else { preview.stop(); return }
+        guard visible, detailDrama == nil, playbackRequest == nil, scenePhase == .active, model.playback == nil,
+              loader.dramas.indices.contains(index) else { preview.stop(); return }
         let index = self.index
         preview.play(loader.dramas[index], quality: model.quality, speed: model.speed,
                      following: Array(loader.dramas.dropFirst(index + 1).prefix(2)))
     }
 
     private func continueAfterPreview() {
-        guard visible, !commentsVisible, detailDrama == nil, model.playback == nil, model.autoNext,
+        guard visible, !commentsVisible, detailDrama == nil, playbackRequest == nil, model.playback == nil, model.autoNext,
               let detail = preview.detail, preview.dramaID == detail.drama.id else { return }
         if detail.episodes.count > 1 {
-            if let request = preview.handoff(index: 1) { model.presentFeedPlayback(request) }
+            if let request = preview.handoff(index: 1) { presentPlayback(request) }
         } else if loader.dramas.indices.contains(index + 1) {
             withAnimation(.easeInOut(duration: 0.3)) { current = loader.dramas[index + 1].id }
         }
+    }
+
+    private func presentPlayback(_ request: PlaybackRequest) {
+        guard visible, detailDrama == nil, playbackRequest == nil else { return }
+        playbackRequest = request
     }
 
     private var index: Int { current.flatMap { id in loader.dramas.firstIndex { $0.id == id } } ?? 0 }
     private var isLast: Bool { index >= loader.dramas.count - 1 }
 
     private func canNavigate(_ direction: HorizontalSwipeDirection) -> Bool {
-        visible && scenePhase == .active && model.playback == nil && detailDrama == nil && !commentsVisible
+        visible && scenePhase == .active && model.playback == nil && playbackRequest == nil && detailDrama == nil && !commentsVisible
             && !preview.holding && (direction == .left ? loader.dramas.indices.contains(index) : exit != nil)
     }
 
@@ -322,6 +335,7 @@ private struct ImmersivePage: View {
     @ObservedObject var preview: FeedPreview
     let openDetails: () -> Void
     let openComments: () -> Void
+    let presentPlayback: (PlaybackRequest) -> Void
     let retryPreview: () -> Void
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var library: LibraryStore
@@ -388,10 +402,10 @@ private struct ImmersivePage: View {
         return Button(action: openDetails) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    Text(drama.title).font(.body.weight(.medium)).lineLimit(2)
+                    Text(drama.title).font(.playbackHeading).lineLimit(2)
                     Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.white.opacity(0.7))
                 }
-                Text(currentEpisode).font(.subheadline.weight(.medium)).foregroundStyle(.white.opacity(0.85))
+                Text(currentEpisode).font(.playbackHeading).foregroundStyle(.white.opacity(0.85))
             }
             .multilineTextAlignment(.leading)
             .foregroundStyle(.white)
@@ -429,25 +443,20 @@ private struct ImmersivePage: View {
     }
 
     private var favoriteButton: some View {
-        let favorite = library.isFavorite(drama)
-        return Button { library.toggleFavorite(drama) } label: {
-            AppControlIcon(name: AppSymbol.favorite(favorite))
-                .foregroundStyle(.white)
+        FollowDramaButton(selected: library.isFavorite(drama)) {
+            library.toggleFavorite(drama)
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(favorite ? "已追" : "追剧")
-        .accessibilityHint(favorite ? "取消本机收藏" : "添加本机收藏")
         .accessibilityIdentifier("immersive_favorite_\(index)")
     }
 
     private func playFull() {
         let continuing = continueEpisode != nil
         if active, !preview.failed, continuing || !preview.ended {
-            preview.requestHandoff(index: continuing ? 1 : 0, present: model.presentFeedPlayback)
+            preview.requestHandoff(index: continuing ? 1 : 0, present: presentPlayback)
         } else if continuing, let detail = preview.detail {
-            model.play(detail, index: 1)
+            model.play(detail, index: 1, present: presentPlayback)
         } else {
-            model.play(drama)
+            model.play(drama, present: presentPlayback)
         }
     }
 }
@@ -648,6 +657,7 @@ struct SearchView: View {
                 }
             }.padding(20)
         }.navigationTitle("搜索").navigationBarTitleDisplayMode(.inline).appBackground(model.appearance).onDisappear { focused = false }
+            .background(InteractiveBackSwipe(enabled: true))
             // Optional help while typing: a failure simply shows no suggestions.
             .task(id: query) {
                 let value = query.trimmingCharacters(in: .whitespacesAndNewlines)

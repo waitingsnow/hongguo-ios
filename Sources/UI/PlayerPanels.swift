@@ -5,7 +5,7 @@ struct PlayerMorePanel: View {
     @ObservedObject private var session: PlayerSession
     @ObservedObject private var app: AppModel
     @Environment(\.episodeCommentPreview) private var commentPreview
-    @AppStorage("playback.commentDanmaku") private var commentDanmaku = false
+    @AppStorage(CommentDanmakuPreference.key) private var commentDanmaku = CommentDanmakuPreference.defaultValue
 
     private let enterCleanScreen: () -> Void
     private static let speeds: [Float] = [0.5, 0.75, 1, 1.25, 1.5, 2]
@@ -199,14 +199,13 @@ struct PlayerEpisodePanel: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(session.detail.drama.title)
-                .font(.headline)
                 .foregroundStyle(colors.ink)
                 .lineLimit(2)
                 .accessibilityAddTraits(.isHeader)
             Text(episodeSummary)
-                .font(.subheadline)
                 .foregroundStyle(colors.muted)
         }
+        .font(.playbackHeading)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, horizontalInset)
         .padding(.vertical, 10)

@@ -22,7 +22,6 @@ struct RootView: View {
 
     var body: some View {
         tabs
-        .fullScreenCover(item: $model.playback) { request in PlayerScreen(request: request, model: model).environmentObject(library) }
         .overlay { openingOverlay }
         .alert("暂时无法播放", isPresented: openErrorVisible) { Button("好") { model.openError = nil } } message: { Text(model.openError ?? "") }
         .sheet(isPresented: $welcomeVisible, onDismiss: { hasChosenTheme = true }) { themeWelcome }
@@ -66,7 +65,6 @@ struct RootView: View {
     private func stack<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         NavigationStack {
             content()
-                .background(NavigationBackSwipe())
                 .navigationDestination(for: Drama.self) { DetailView(drama: $0) }
         }
     }
@@ -91,67 +89,129 @@ enum HorizontalSwipeDirection {
     }
 }
 
-struct NavigationBackSwipe: UIViewControllerRepresentable {
-    var dismissRoot: (() -> Void)?
+extension View {
+    func playbackDestination(_ request: Binding<PlaybackRequest?>) -> some View {
+        navigationDestination(item: request) { PlaybackDestination(request: $0) }
+    }
+}
+
+private struct PlaybackDestination: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var request: PlaybackRequest
+
+    init(request: PlaybackRequest) { _request = State(initialValue: request) }
+
+    var body: some View {
+        PlayerScreen(request: request, model: model) { request = $0 }
+            .id(request.id)
+            .toolbar(.hidden, for: .navigationBar, .tabBar)
+    }
+}
+
+struct InteractiveBackSwipe: UIViewControllerRepresentable {
+    @Environment(\.dismiss) private var dismiss
+    let enabled: Bool
 
     func makeUIViewController(context: Context) -> Controller { Controller() }
 
     func updateUIViewController(_ controller: Controller, context: Context) {
-        controller.dismissRoot = dismissRoot
+        controller.enabled = enabled
+        controller.pop = { dismiss() }
+        controller.attach()
     }
 
     static func dismantleUIViewController(_ controller: Controller, coordinator: ()) {
-        controller.detachPan()
+        controller.detach()
     }
 
     final class Controller: UIViewController, UIGestureRecognizerDelegate {
-        var dismissRoot: (() -> Void)?
-        private weak var startController: UIViewController?
+        var enabled = false
+        var pop: (() -> Void)?
+        private weak var owner: UIViewController?
+        private var gestures: [InstalledGesture] = []
         private lazy var backPan: UIPanGestureRecognizer = {
-            let pan = UIPanGestureRecognizer(target: self, action: #selector(swiped(_:)))
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(handleBackPan(_:)))
             pan.maximumNumberOfTouches = 1
             pan.delegate = self
             return pan
         }()
 
-        override func loadView() {
-            let marker = UIView()
-            marker.isUserInteractionEnabled = false
-            view = marker
+        private final class InstalledGesture {
+            weak var recognizer: UIGestureRecognizer?
+            weak var delegate: UIGestureRecognizerDelegate?
+            let wasEnabled: Bool
+
+            init(_ recognizer: UIGestureRecognizer) {
+                self.recognizer = recognizer
+                delegate = recognizer.delegate
+                wasEnabled = recognizer.isEnabled
+            }
         }
 
-        override func didMove(toParent parent: UIViewController?) {
-            super.didMove(toParent: parent)
-            attachPan()
+        override func loadView() {
+            view = UIView()
+            view.isUserInteractionEnabled = false
         }
 
         override func viewDidAppear(_ animated: Bool) {
             super.viewDidAppear(animated)
-            attachPan()
+            attach()
         }
 
-        private func attachPan() {
-            let target = navigationController?.view
-            guard backPan.view !== target else { return }
-            detachPan()
-            target?.addGestureRecognizer(backPan)
+        override func viewDidDisappear(_ animated: Bool) {
+            super.viewDidDisappear(animated)
+            detach()
         }
 
-        func detachPan() {
+        func attach() {
+            guard viewIfLoaded?.window != nil, let navigationController else { return }
+            var ancestor = parent
+            while let node = ancestor, node.parent !== navigationController { ancestor = node.parent }
+            guard let ancestor, ancestor === navigationController.topViewController else { return }
+            owner = ancestor
+            install(navigationController.interactivePopGestureRecognizer)
+            if #available(iOS 26.0, *) {
+                install(navigationController.interactiveContentPopGestureRecognizer)
+            } else if backPan.view == nil {
+                navigationController.view.addGestureRecognizer(backPan)
+            }
+        }
+
+        private func install(_ recognizer: UIGestureRecognizer?) {
+            guard let recognizer, recognizer.delegate !== self else { return }
+            let inherited = (recognizer.delegate as? Controller)?.gestures.first { $0.recognizer === recognizer }
+            gestures.removeAll { $0.recognizer === recognizer }
+            gestures.append(inherited ?? InstalledGesture(recognizer))
+            recognizer.delegate = self
+            recognizer.isEnabled = true
+        }
+
+        func detach() {
             backPan.view?.removeGestureRecognizer(backPan)
+            for entry in gestures {
+                guard let recognizer = entry.recognizer, recognizer.delegate === self else { continue }
+                recognizer.delegate = entry.delegate
+                recognizer.isEnabled = entry.wasEnabled
+            }
+            gestures.removeAll()
+            owner = nil
         }
 
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-            guard let navigationController, navigationController.transitionCoordinator == nil,
-                  navigationController.viewControllers.count > 1 || dismissRoot != nil,
-                  HorizontalSwipeDirection(movement: backPan.velocity(in: backPan.view)) == .right else { return false }
-            startController = navigationController.topViewController
-            return startController != nil
+            guard enabled, let owner, let navigationController, owner === navigationController.topViewController,
+                  navigationController.viewControllers.count > 1, navigationController.transitionCoordinator == nil,
+                  navigationController.presentedViewController == nil else { return false }
+            if gestureRecognizer === backPan {
+                return HorizontalSwipeDirection(movement: backPan.velocity(in: backPan.view)) == .right
+            }
+            return true
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            guard enabled else { return false }
+            if gestureRecognizer === navigationController?.interactivePopGestureRecognizer { return true }
             var touchedView = touch.view
-            while let view = touchedView, view !== backPan.view {
+            while let view = touchedView, view !== gestureRecognizer.view {
                 if view is UIControl || view is UITextView { return false }
                 if let scroll = view as? UIScrollView, scroll.isScrollEnabled,
                    scroll.alwaysBounceHorizontal || scroll.contentSize.width > scroll.bounds.width + 1 { return false }
@@ -160,23 +220,19 @@ struct NavigationBackSwipe: UIViewControllerRepresentable {
             return true
         }
 
-        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRequireFailureOf other: UIGestureRecognizer) -> Bool {
-            guard let navigationController else { return false }
-            if other === navigationController.interactivePopGestureRecognizer { return true }
-            if #available(iOS 26.0, *) { return other === navigationController.interactiveContentPopGestureRecognizer }
-            return false
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+            if other === backPan { return gestureRecognizer === navigationController?.interactivePopGestureRecognizer }
+            guard let ownerView = owner?.viewIfLoaded, let otherView = other.view else { return false }
+            return other is UIPanGestureRecognizer && otherView.isDescendant(of: ownerView)
         }
 
-        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-            (other.view as? UIScrollView)?.panGestureRecognizer === other
-        }
-
-        @objc private func swiped(_ pan: UIPanGestureRecognizer) {
-            guard pan.state == .ended, let navigationController, let startController,
-                  startController === navigationController.topViewController, navigationController.transitionCoordinator == nil,
-                  HorizontalSwipeDirection.right.completes(pan.translation(in: pan.view)) else { return }
-            if navigationController.viewControllers.count > 1 { navigationController.popViewController(animated: true) }
-            else { dismissRoot?() }
+        @objc private func handleBackPan(_ pan: UIPanGestureRecognizer) {
+            guard pan.state == .ended, enabled, let view = pan.view, let owner, let navigationController,
+                  owner === navigationController.topViewController, navigationController.transitionCoordinator == nil,
+                  navigationController.presentedViewController == nil else { return }
+            let minimumDistance = max(56, min(100, view.bounds.width * 0.25))
+            guard HorizontalSwipeDirection(movement: pan.translation(in: view), minimumDistance: minimumDistance) == .right else { return }
+            pop?()
         }
     }
 }

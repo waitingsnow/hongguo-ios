@@ -22,7 +22,7 @@ struct PlayerScreen: View {
     @State private var locked = false
     @State private var lockButtonVisible = false
     @State private var backgroundPlayback = BackgroundPlayback.foreground
-    /// 短剧详情 over the player; the episode waits paused underneath and goes on when the sheet closes.
+    @State private var started = false
     @State private var detailVisible = false
     @State private var resumeAfterDetail = false
     // Page drag: the current picture follows the finger and the neighbouring episode number slides in.
@@ -41,14 +41,14 @@ struct PlayerScreen: View {
     /// Set when the episode changed under a hold-then-drag; the rest of that gesture moves nothing.
     @State private var seekDragAbandoned = false
     @State private var speedLockZone: SpeedLockZone?
-    private var inlineForeground: Bool { scenePhase == .active && !surface.pipInProgress }
+    private var inlineForeground: Bool { scenePhase == .active && !surface.pipInProgress && !detailVisible }
     private var waitingForPlayback: Bool {
         session.preparing || session.buffering || (session.isPlaying && !session.rendered)
     }
     /// Holding for 2× hides the same elements, for as long as the hold lasts.
     private var chromeHidden: Bool { !inlineForeground || cleanScreen || session.holding || locked }
     private var awaitsBackgroundSuspension: Bool {
-        scenePhase == .background && !surface.pipInProgress && backgroundPlayback != .suspended
+        scenePhase == .background && !detailVisible && !surface.pipInProgress && backgroundPlayback != .suspended
     }
     private var sheetVisible: Bool { episodesVisible || moreVisible || detailVisible || commentsVisible }
     /// Just under a picture wider than tall, as in the official app.
@@ -57,9 +57,14 @@ struct PlayerScreen: View {
             && session.videoSize.width > session.videoSize.height
     }
 
-    private let requestID: UUID
+    private let request: PlaybackRequest
+    private let replacePlayback: (PlaybackRequest) -> Void
 
-    init(request: PlaybackRequest, model: AppModel) { requestID = request.id; _session = StateObject(wrappedValue: PlayerSession(request: request, app: model)) }
+    init(request: PlaybackRequest, model: AppModel, replacePlayback: @escaping (PlaybackRequest) -> Void) {
+        self.request = request
+        self.replacePlayback = replacePlayback
+        _session = StateObject(wrappedValue: PlayerSession(request: request, app: model))
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -71,6 +76,7 @@ struct PlayerScreen: View {
                                      tap: videoTapped, doubleTap: videoDoubleTapped, holdBegan: speedHoldBegan, holdEnded: session.endHold,
                                      lockSpeed: { if session.holding && !sliding && !sheetVisible { session.lockSpeed() } },
                                      dragChanged: dragChanged, dragEnded: dragEnded, dragCancelled: dragCancelled,
+                                     allowsRightSwipe: landscape,
                                      navigate: videoSwiped,
                                      seekChanged: seekDragChanged, seekEnded: seekDragEnded, seekCancelled: seekDragCancelled,
                                      pinched: { enabled in if !landscape { setCleanScreen(enabled) } })
@@ -174,7 +180,7 @@ struct PlayerScreen: View {
                     .onChange(of: full.size) { _, size in pageHeight = max(size.height, 1); landscape = size.width > size.height }
             }.background(.black).ignoresSafeArea().allowsHitTesting(false)
         }
-        .preferredColorScheme(.dark).statusBarHidden(landscape).persistentSystemOverlays(landscape && inlineForeground && chromeHidden ? .hidden : .automatic)
+        .environment(\.colorScheme, .dark).statusBarHidden(landscape).persistentSystemOverlays(landscape && inlineForeground && chromeHidden ? .hidden : .automatic)
             .sheet(isPresented: $episodesVisible) {
                 PlayerEpisodePanel(session: session) { index in
                     episodesVisible = false
@@ -193,13 +199,25 @@ struct PlayerScreen: View {
                                player: session.player, playing: session.isPlaying,
                                foreground: inlineForeground, hideDanmaku: explicitCleanScreen,
                                presented: $commentsVisible)
-            .sheet(isPresented: $detailVisible, onDismiss: detailClosed) { detailSheet }
+            .background(InteractiveBackSwipe(enabled: inlineForeground && !landscape && !locked && !sheetVisible
+                                             && !dragging && !sliding && !session.scrubbing && !session.holding))
+            .navigationDestination(isPresented: $detailVisible) {
+                DetailView(drama: session.detail.drama).toolbar(.hidden, for: .tabBar)
+            }
+            .onChange(of: detailVisible) { _, shown in if !shown { detailClosed() } }
+            .onAppear { if !detailVisible { session.app.showPlayback(request) } }
             .task {
+                guard !started else { return }
+                started = true
                 surface.bind(session)
                 surface.onPiPEnd = { suspendBackgroundPlayback() }
+                session.onSeasonPlayback = replacePlayback
                 session.onSlide = { target in slide(to: target) }; session.start()
             }
-            .onDisappear { unlock(); session.stop(); surface.unbind() }
+            .onDisappear {
+                session.app.hidePlayback(request.id)
+                if !detailVisible { unlock(); session.stop(); surface.unbind() }
+            }
             .onChange(of: inlineForeground) { _, foreground in
                 if !foreground {
                     dragCancelled()
@@ -300,12 +318,12 @@ struct PlayerScreen: View {
     private func videoSwiped(_ direction: HorizontalSwipeDirection) {
         guard inlineForeground, !locked, !sheetVisible, !dragging, !sliding, !session.scrubbing else { return }
         if direction == .left { openDetail() }
-        else { goBack() }
+        else if landscape { exitFullScreen() }
     }
 
     private func goBack() {
         if landscape { exitFullScreen() }
-        else { session.stop(); dismiss() }
+        else { dismiss() }
     }
 
     /// Locking also holds the current landscape, so turning the phone does not leave full screen either.
@@ -337,8 +355,9 @@ struct PlayerScreen: View {
 
     private var videoAccessibilityHint: String {
         if locked { return "显示解锁屏幕按钮" }
+        let back = landscape ? "右滑退出全屏" : "右滑返回"
         return (session.isPlaying ? "轻点暂停" : "轻点继续播放")
-            + "，左滑查看详情，右滑返回，长按后左右拖动调整进度，上下拖动切换剧集"
+            + "，左滑查看详情，\(back)，长按后左右拖动调整进度，上下拖动切换剧集"
     }
 
     private func speedHoldBegan(_ zone: SpeedLockZone) -> Bool {
@@ -378,15 +397,18 @@ struct PlayerScreen: View {
     }
 
     private func openDetail() {
-        resumeAfterDetail = session.isPlaying
-        if session.isPlaying { session.pause() }
+        guard !detailVisible else { return }
+        resumeAfterDetail = session.preparing || session.isPlaying || session.player?.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        if resumeAfterDetail { session.pause() }
         detailVisible = true
     }
 
     private func detailClosed() {
-        // Playing an episode from the detail page replaces this player, so nothing resumes behind the new one.
-        if resumeAfterDetail, !session.isPlaying, !session.pausedBySleepTimer,
-           session.app.playback?.id == requestID { session.toggle() }
+        session.app.showPlayback(request)
+        if resumeAfterDetail, !session.isPlaying, !session.pausedBySleepTimer {
+            try? AVAudioSession.sharedInstance().setActive(true)
+            session.toggle()
+        }
         resumeAfterDetail = false
     }
 
@@ -516,8 +538,8 @@ struct PlayerScreen: View {
     private var topBar: some View {
         HStack(alignment: .center, spacing: 4) {
             Button(action: goBack) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Image(systemName: "chevron.left").font(.title3.weight(.medium))
+                HStack(alignment: .center, spacing: 8) {
+                    Image(systemName: "chevron.left").font(.body.weight(.medium))
                     if !landscape { episodeHeading }
                 }
                 .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
@@ -533,14 +555,14 @@ struct PlayerScreen: View {
     }
 
     private var episodeHeading: some View {
-        Text("第 \(visibleEpisode.index) 集").font(.title3.weight(.semibold)).monospacedDigit()
+        Text("第 \(visibleEpisode.index) 集").font(.playbackHeading).monospacedDigit()
             .fixedSize(horizontal: true, vertical: false)
     }
 
     private var dramaTitle: some View {
         Button(action: openDetail) {
             HStack(spacing: 5) {
-                Text(session.detail.drama.title).font(.body.weight(.medium)).lineLimit(1)
+                Text(session.detail.drama.title).font(.playbackHeading).lineLimit(1)
                 if !landscape { Image(systemName: "chevron.right").font(.caption.weight(.semibold)) }
             }.frame(minHeight: 44).contentShape(Rectangle())
         }.buttonStyle(.plain).accessibilityLabel("\(session.detail.drama.title)，第 \(visibleEpisode.index) 集")
@@ -550,10 +572,9 @@ struct PlayerScreen: View {
     private var sideActions: some View {
         let layout = landscape ? AnyLayout(HStackLayout(spacing: 8)) : AnyLayout(VStackLayout(spacing: 4))
         return layout {
-            let favorite = library.isFavorite(session.detail.drama)
-            Button { library.toggleFavorite(session.detail.drama) } label: {
-                AppControlIcon(name: AppSymbol.favorite(favorite))
-            }.accessibilityLabel(favorite ? "取消本机收藏" : "添加本机收藏").accessibilityIdentifier("player.favorite")
+            FollowDramaButton(selected: library.isFavorite(session.detail.drama)) {
+                library.toggleFavorite(session.detail.drama)
+            }.accessibilityIdentifier("player.favorite")
             DiscussionControls(vertical: !landscape) { commentsVisible = true }
         }.buttonStyle(.plain).shadow(color: .black.opacity(0.8), radius: 2, y: 1)
     }
@@ -578,7 +599,7 @@ struct PlayerScreen: View {
 
     private func bottomBar(compact: Bool) -> some View {
         VStack(alignment: .leading, spacing: compact ? 0 : 3) {
-            if !landscape { dramaTitle.padding(.trailing, 52) }
+            if !landscape { dramaTitle.padding(.trailing, 68) }
             if showingHint {
                 Text("长按 2× · 纵滑锁定 · 横滑调进度").font(.caption2)
                     .foregroundStyle(.white.opacity(0.75)).accessibilityIdentifier("player.gestureHint")
@@ -598,16 +619,6 @@ struct PlayerScreen: View {
                 }.fixedSize(horizontal: landscape, vertical: false).accessibilityIdentifier("player.episodes")
             }.buttonStyle(.plain)
         }
-    }
-
-    /// The same page the library and home open, themed like them rather than like the dark player.
-    private var detailSheet: some View {
-        NavigationStack {
-            DetailView(drama: session.detail.drama)
-                .background(NavigationBackSwipe(dismissRoot: { detailVisible = false }))
-                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { detailVisible = false } } }
-        }.environment(\.colorScheme, session.app.isDark ? .dark : .light).preferredColorScheme(session.app.isDark ? .dark : .light)
-        .presentationDragIndicator(.visible)
     }
 
     private var speedLabel: String { String(format: "%g×", session.app.speed) }

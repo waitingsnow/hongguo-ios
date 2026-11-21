@@ -39,6 +39,7 @@ struct LocalLibraryGrid: View {
     @Binding var editing: Bool
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var library: LibraryStore
+    @State private var playbackRequest: PlaybackRequest?
     private var entries: [LibraryEntry] { favorites ? library.favorites : library.history }
 
     var body: some View {
@@ -50,11 +51,12 @@ struct LocalLibraryGrid: View {
                 }
                 if !entries.isEmpty { Text("收藏与历史各最多保留 200 部，仅保存在这台设备。\n卸载应用会移除本机记录。").font(.caption).lineSpacing(4).foregroundStyle(model.appearance.muted).padding(.top, 12) }
         }
+        .playbackDestination($playbackRequest)
         .onChange(of: entries.isEmpty) { _, empty in if empty { editing = false } }
     }
 
     private func libraryCell(_ entry: LibraryEntry) -> some View {
-        Button { model.play(entry.drama) } label: {
+        Button { model.play(entry.drama) { playbackRequest = $0 } } label: {
             LibraryPosterCell(drama: entry.drama, subtitle: entry.episodeIndex > 0 ? "第 \(entry.episodeIndex) 集 · \(timeLabel(entry.position))" : nil).contentShape(Rectangle())
         }
         .buttonStyle(.plain)

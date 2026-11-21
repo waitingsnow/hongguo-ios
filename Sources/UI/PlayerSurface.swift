@@ -255,6 +255,7 @@ struct VideoGestureView: UIViewRepresentable {
     let dragChanged: (CGFloat) -> Void
     let dragEnded: (CGFloat, CGFloat) -> Void
     let dragCancelled: () -> Void
+    let allowsRightSwipe: Bool
     let navigate: (HorizontalSwipeDirection) -> Void
     let seekChanged: (CGFloat) -> Void
     let seekEnded: (CGFloat) -> Void
@@ -370,6 +371,7 @@ struct VideoGestureView: UIViewRepresentable {
             let velocity = pan.velocity(in: view)
             if abs(velocity.y) > abs(velocity.x) { return true }
             navigationDirection = HorizontalSwipeDirection(movement: velocity)
+            if navigationDirection == .right && !parent.allowsRightSwipe { return false }
             return navigationDirection != nil
         }
     }
