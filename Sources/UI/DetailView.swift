@@ -78,7 +78,7 @@ struct DetailView: View {
     private var favoritePair: some View {
         HStack(spacing: 10) {
             Button { library.toggleFavorite(detail?.drama ?? drama) } label: {
-                favoriteChip(symbol: "iphone", title: library.isFavorite(drama) ? "本机已收藏" : "本机收藏", caption: "仅存这台设备", selected: library.isFavorite(drama))
+                favoriteChip(symbol: AppSymbol.favorite(library.isFavorite(drama)), title: library.isFavorite(drama) ? "本机已收藏" : "本机收藏", caption: "仅存这台设备", selected: library.isFavorite(drama))
             }.buttonStyle(.plain)
             if account.authenticated {
                 Button { Task { if account.pendingFavorites.contains(drama.id) { await account.refresh() } else { await account.toggleFavorite(detail?.drama ?? drama) } } } label: {

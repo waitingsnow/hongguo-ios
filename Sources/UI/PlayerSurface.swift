@@ -259,6 +259,7 @@ struct VideoGestureView: UIViewRepresentable {
     let dragChanged: (CGFloat) -> Void
     let dragEnded: (CGFloat, CGFloat) -> Void
     let dragCancelled: () -> Void
+    let navigate: (HorizontalSwipeDirection) -> Void
     let seekChanged: (CGFloat) -> Void
     let seekEnded: (CGFloat) -> Void
     let seekCancelled: () -> Void
@@ -296,6 +297,7 @@ struct VideoGestureView: UIViewRepresentable {
         weak var singleTap: UIGestureRecognizer?
         private var pinchDecided = false
         private var holdDrag: HoldDrag?
+        private var navigationDirection: HorizontalSwipeDirection?
 
         init(_ parent: VideoGestureView) { self.parent = parent }
 
@@ -350,6 +352,12 @@ struct VideoGestureView: UIViewRepresentable {
 
         @objc func panned(_ gesture: UIPanGestureRecognizer) {
             guard let view = gesture.view else { return }
+            if let direction = navigationDirection {
+                if gesture.state == .ended, direction.completes(gesture.translation(in: view)) {
+                    parent.navigate(direction)
+                }
+                return
+            }
             switch gesture.state {
             case .began, .changed: parent.dragChanged(gesture.translation(in: view).y)
             case .ended: parent.dragEnded(gesture.translation(in: view).y, gesture.velocity(in: view).y)
@@ -359,9 +367,12 @@ struct VideoGestureView: UIViewRepresentable {
         }
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
             guard let pan = gestureRecognizer as? UIPanGestureRecognizer, let view = pan.view else { return true }
+            navigationDirection = nil
             guard holdDrag == nil, pan.numberOfTouches <= 1 else { return false }
             let velocity = pan.velocity(in: view)
-            return abs(velocity.y) > abs(velocity.x)
+            if abs(velocity.y) > abs(velocity.x) { return true }
+            navigationDirection = HorizontalSwipeDirection(movement: velocity)
+            return navigationDirection != nil
         }
     }
 }

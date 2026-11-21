@@ -4,8 +4,8 @@ import SwiftUI
 struct PlayerMorePanel: View {
     @ObservedObject private var session: PlayerSession
     @ObservedObject private var app: AppModel
+    @Environment(\.episodeCommentPreview) private var commentPreview
     @AppStorage("playback.commentDanmaku") private var commentDanmaku = false
-    @ScaledMetric(relativeTo: .subheadline) private var speedWidth: CGFloat = 50
 
     private let enterCleanScreen: () -> Void
     private static let speeds: [Float] = [0.5, 0.75, 1, 1.25, 1.5, 2]
@@ -33,9 +33,11 @@ struct PlayerMorePanel: View {
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        Divider()
-                        Toggle("轮播本集评论弹幕", isOn: $commentDanmaku)
-                            .frame(minHeight: 48)
+                        if commentPreview?.hasDisplayableComments == true {
+                            Divider()
+                            Toggle("轮播本集评论弹幕", isOn: $commentDanmaku)
+                                .frame(minHeight: 48)
+                        }
                     }
                     .font(.subheadline)
                     .padding(.horizontal, 14)
@@ -52,11 +54,25 @@ struct PlayerMorePanel: View {
     private var speedOptions: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("播放倍速").font(.headline).accessibilityAddTraits(.isHeader)
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: max(44, min(speedWidth, 108))), spacing: 8)], spacing: 8) {
-                ForEach(Self.speeds, id: \.self) { speed in
-                    PlayerPanelOption(title: String(format: "%g×", speed),
-                                      selected: app.speed == speed, colors: colors) {
-                        session.setSpeed(speed)
+            ViewThatFits(in: .horizontal) {
+                speedGrid(columns: 6)
+                speedGrid(columns: 3)
+                speedGrid(columns: 2)
+                speedGrid(columns: 1)
+            }
+        }
+    }
+
+    private func speedGrid(columns: Int) -> some View {
+        Grid(horizontalSpacing: 6, verticalSpacing: 8) {
+            ForEach(0..<(Self.speeds.count / columns), id: \.self) { row in
+                GridRow {
+                    ForEach(0..<columns, id: \.self) { column in
+                        let speed = Self.speeds[row * columns + column]
+                        PlayerPanelOption(title: String(format: "%g×", speed),
+                                          selected: app.speed == speed, colors: colors) {
+                            session.setSpeed(speed)
+                        }
                     }
                 }
             }
@@ -251,10 +267,11 @@ private struct PlayerPanelOption: View {
         Button(action: action) {
             Text(title)
                 .font(.subheadline.weight(.semibold).monospacedDigit())
-                .multilineTextAlignment(.center)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .padding(.horizontal, 4)
                 .padding(.vertical, 10)
-                .frame(maxWidth: .infinity, minHeight: showsCheckmark ? 48 : 44)
+                .frame(minWidth: 44, maxWidth: .infinity, minHeight: showsCheckmark ? 48 : 44)
                 .foregroundStyle(selected ? colors.accent : colors.ink)
                 .background(selected ? colors.soft : colors.surface, in: shape)
                 .overlay {

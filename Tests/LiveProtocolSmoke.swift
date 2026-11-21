@@ -2,7 +2,7 @@
 import Foundation
 // Opt-in anonymous read-only catalogue probe. It does not download media or use an account.
 @main struct LiveProtocolSmoke {
- static func main() async {
+ static func main() async throws {
   let root = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
   let api=DramaAPI(resourceDirectory:root.appendingPathComponent("Sources/Networking"))
   do {
@@ -18,5 +18,24 @@ import Foundation
    let first=try await api.search(query:"重生",offset:0), next=try await api.search(query:"重生",offset:first.nextOffset)
    print("search_pages",first.dramas.count,next.dramas.count,"overlap",Set(first.dramas.map(\.id)).intersection(next.dramas.map(\.id)).count)
   }catch{print("search_error",error.localizedDescription)}
+  try await checkEpisodeDiscussion()
+ }
+
+ static func checkEpisodeDiscussion() async throws {
+  let seriesID = "7703065438208412697"
+  let samples = [("无限白粥 第1集", "7703065456646556696", true),
+                 ("无限白粥 第5集", "7703065456780790808", true),
+                 ("无限白粥 第6集", "7703065459783896088", false)]
+  for (label, episodeID, requiresComments) in samples {
+   do {
+    let preview = try await EpisodeDiscussionAPI.preview(seriesID: seriesID, episodeID: episodeID)
+    guard !requiresComments || (preview.hasDisplayableComments && preview.totalCount != nil) else {
+     throw HGError.message("\(label) 未取得预期的官网评论和计数")
+    }
+    print("discussion_live", label, "preview", preview.previewCount, "total", preview.totalCount.map(String.init) ?? "unknown")
+   } catch EpisodeDiscussionAPI.ReadError.unavailable where !requiresComments {
+    print("discussion_live", label, "unavailable")
+   }
+  }
  }
 }

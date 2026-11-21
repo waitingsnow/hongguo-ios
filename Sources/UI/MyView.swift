@@ -7,13 +7,13 @@ struct MyView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 20) {
-                TabHeader(title: "我的") { NavigationLink { SettingsView() } label: { HeaderIcon(symbol: "gearshape") }.buttonStyle(.plain).accessibilityLabel("设置").accessibilityIdentifier("my.settings") }
+                TabHeader(title: "我的") { NavigationLink { SettingsView() } label: { HeaderIcon(symbol: AppSymbol.settings) }.buttonStyle(.plain).accessibilityLabel("设置").accessibilityIdentifier("my.settings") }
                 NavigationLink { AccountView() } label: { accountCard }.buttonStyle(.plain)
-                HStack(spacing: 14) { stat("本机收藏", count: library.favorites.count, symbol: "star", page: LocalFavoritesView()); stat("本机看过", count: library.history.count, symbol: "clock", page: PlayHistoryView(startLocal: true)) }
+                HStack(spacing: 14) { stat("本机收藏", count: library.favorites.count, symbol: AppSymbol.favorite(), page: LocalFavoritesView()); stat("本机看过", count: library.history.count, symbol: AppSymbol.history, page: PlayHistoryView(startLocal: true)) }
                 VStack(spacing: 0) {
-                    NavigationLink { PlayHistoryView() } label: { menuRow("播放历史", subtitle: "继续上次看到的地方", symbol: "clock.arrow.circlepath") }
+                    NavigationLink { PlayHistoryView() } label: { menuRow("播放历史", subtitle: "继续上次看到的地方", symbol: AppSymbol.history) }
                     Divider().padding(.leading, 55)
-                    NavigationLink { SettingsView() } label: { menuRow("设置", subtitle: "主题、播放偏好、缓存、更新与关于", symbol: "slider.horizontal.3") }
+                    NavigationLink { SettingsView() } label: { menuRow("设置", subtitle: "主题、播放偏好、缓存与关于", symbol: AppSymbol.settings) }
                 }.background(model.appearance.surface, in: RoundedRectangle(cornerRadius: 21)).buttonStyle(.plain)
             }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 20)
         }.navigationTitle("我的").appBackground(model.appearance).tabRoot(model.appearance)

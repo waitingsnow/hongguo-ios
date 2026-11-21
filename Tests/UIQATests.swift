@@ -67,7 +67,8 @@ final class HongguoQATests: XCTestCase {
         assertPlayerChoice("720P", in: app)
         closePlayerMore(reopened)
         app.buttons["关闭播放器"].tap()
-        XCTAssertTrue(app.buttons["immersive_exit"].waitForExistence(timeout: 10)); app.buttons["immersive_exit"].tap()
+        XCTAssertTrue(app.buttons["immersive_exit"].waitForExistence(timeout: 10))
+        swipeRight(in: app.scrollViews["immersive_feed"], from: 0.25)
         XCTAssertTrue(app.buttons["home.feedMode"].waitForExistence(timeout: 10))
         // A relaunch paints the saved home list without waiting for the network.
         app.terminate(); app.launch()
@@ -118,6 +119,34 @@ final class HongguoQATests: XCTestCase {
             app.alerts.buttons["好"].tap()
         }
         capture("16-update-sources")
+    }
+
+    func testNavigationSwipeReturnsOneLevel() {
+        continueAfterFailure = false
+        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        app.launchArguments = ["-theme", "warm", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO"]
+        app.launch()
+
+        let myTab = app.tabBars.buttons["我的"]
+        XCTAssertTrue(myTab.wait(for: \.isHittable, toEqual: true, timeout: 10))
+        myTab.tap()
+        let settings = app.buttons["my.settings"]
+        settings.tap()
+        let theme = app.staticTexts["主题样式"]
+        XCTAssertTrue(theme.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        theme.tap()
+        let themeBar = app.navigationBars["主题样式"]
+        XCTAssertTrue(themeBar.waitForExistence(timeout: 5))
+        let settingsBar = app.navigationBars["设置"]
+
+        swipeRight(in: app, from: 0.25)
+        XCTAssertTrue(settingsBar.waitForExistence(timeout: 5))
+        XCTAssertFalse(themeBar.exists)
+        XCTAssertFalse(settings.isHittable)
+
+        swipeRight(in: app, from: 0.02)
+        XCTAssertTrue(settings.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        XCTAssertFalse(settingsBar.exists)
     }
 
     func testRealNavigationAndPlayback() throws {
@@ -219,12 +248,25 @@ final class HongguoQATests: XCTestCase {
     /// Anonymous live playback on a task simulator.
     func testPlayerTapGestures() throws {
         continueAfterFailure = false
+        let device = XCUIDevice.shared
+        let previousOrientation = device.orientation
+        device.orientation = .portrait
         let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        defer {
+            app.terminate()
+            device.orientation = previousOrientation
+        }
         app.launchArguments = ["-theme", "immersive", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO", "-autoNext", "NO"]
         app.launch()
+        let portrait = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            app.frame.height > app.frame.width
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [portrait], timeout: 10), .completed)
         openFirstEpisode(in: app, search: "无限白粥")
         assertPlayback("播放中", in: app, timeout: 90)
         let video = app.buttons["视频画面"]
+        let detailBar = app.navigationBars["剧集详情"]
+        let sheetDone = detailBar.buttons["完成"].firstMatch
         func point(_ x: CGFloat) -> XCUICoordinate { video.coordinate(withNormalizedOffset: CGVector(dx: x, dy: 0.5)) }
         let progress = app.sliders["播放进度"]
         func percent() -> Double { Double((progress.value as? String ?? "0").filter { $0.isNumber || $0 == "." }) ?? 0 }
@@ -237,12 +279,11 @@ final class HongguoQATests: XCTestCase {
         point(0.12).doubleTap()
         assertPlayback("已暂停", in: app, timeout: 5)
         XCTAssertLessThan(abs(percent() - start), 3, "side double taps do not jump")
-        // A sideways swipe without holding never seeks; holding first and then dragging does.
-        point(0.2).press(forDuration: 0.05, thenDragTo: point(0.8)); sleep(1)
-        XCTAssertLessThan(abs(percent() - start), 3, "a quick sideways swipe does not seek")
+        // A hold followed by a horizontal drag seeks without leaving the player.
         point(0.2).press(forDuration: 0.8, thenDragTo: point(0.7)); sleep(1)
         capture("20-hold-drag-seek")
         XCTAssertGreaterThan(percent(), start + 5, "holding and dragging right moves ahead")
+        XCTAssertFalse(sheetDone.isHittable)
         let episodePicker = app.buttons["player.episodes"]
         point(0.75).tap()
         XCTAssertTrue(episodePicker.wait(for: \.isHittable, toEqual: false, timeout: 5))
@@ -251,11 +292,21 @@ final class HongguoQATests: XCTestCase {
         XCTAssertTrue(episodePicker.wait(for: \.isHittable, toEqual: true, timeout: 5))
         point(0.27).doubleTap()
         assertPlayback("播放中", in: app, timeout: 5)
-        app.buttons["player.dramaTitle"].tap()
-        XCTAssertTrue(app.navigationBars["剧集详情"].waitForExistence(timeout: 5))
+        let currentDrama = String(app.buttons["player.dramaTitle"].label.dropLast("，第 1 集".count))
+        point(0.75).press(forDuration: 0.05, thenDragTo: point(0.25), withVelocity: .fast, thenHoldForDuration: 0)
+        XCTAssertTrue(sheetDone.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        XCTAssertTrue(app.staticTexts[currentDrama].firstMatch.waitForExistence(timeout: 5))
         capture("21-detail-over-player")
-        app.buttons["完成"].tap()
+        swipeRight(in: app, from: 0.25)
+        XCTAssertTrue(sheetDone.wait(for: \.exists, toEqual: false, timeout: 5))
+        assertEpisode(1, in: app)
         assertPlayback("播放中", in: app, timeout: 5)
+
+        point(0.75).tap()
+        XCTAssertTrue(episodePicker.wait(for: \.isHittable, toEqual: false, timeout: 5))
+        swipeRight(in: video, from: 0.25)
+        XCTAssertTrue(video.wait(for: \.exists, toEqual: false, timeout: 5))
+        XCTAssertTrue(detailBar.waitForExistence(timeout: 5))
     }
 
     func testPlayerMoreCleanScreenAndSleepTimer() throws {
@@ -383,6 +434,7 @@ final class HongguoQATests: XCTestCase {
 
         let lock = app.buttons.matching(NSPredicate(format: "identifier == %@ AND label == %@", "player.lock", "锁定屏幕")).firstMatch
         let unlock = app.buttons.matching(NSPredicate(format: "identifier == %@ AND label == %@", "player.lock", "解锁屏幕")).firstMatch
+        let sheetDone = app.navigationBars["剧集详情"].buttons["完成"].firstMatch
         XCTAssertTrue(lock.wait(for: \.isHittable, toEqual: true, timeout: 5))
         let title = app.buttons["player.dramaTitle"]
         let episodeNumber = app.staticTexts["第 1 集"]
@@ -426,9 +478,15 @@ final class HongguoQATests: XCTestCase {
         XCTAssertTrue(episodePicker.wait(for: \.isHittable, toEqual: false, timeout: 5))
         capture("player-landscape-locked")
         upper.press(forDuration: 0.05, thenDragTo: lower, withVelocity: .fast, thenHoldForDuration: 0)
-        XCTAssertTrue(unlock.wait(for: \.exists, toEqual: false, timeout: 5))
-        app.coordinate(withNormalizedOffset: CGVector(dx: 0.35, dy: 0.5)).tap()
-        XCTAssertTrue(unlock.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        video.swipeLeft()
+        XCTAssertFalse(sheetDone.exists && sheetDone.isHittable, "A left swipe while locked must not open the player's detail sheet")
+        swipeRight(in: video, from: 0.25)
+        XCTAssertGreaterThan(app.frame.width, app.frame.height)
+        XCTAssertFalse(sheetDone.exists && sheetDone.isHittable)
+        XCTAssertTrue(unlock.wait(for: \.isHittable, toEqual: false, timeout: 5))
+        video.coordinate(withNormalizedOffset: CGVector(dx: 0.35, dy: 0.5)).tap()
+        XCTAssertTrue(unlock.wait(for: \.isHittable, toEqual: true, timeout: 5),
+                      "A tap after the locked swipes must reveal the player's unlock button")
         unlock.tap()
         assertEpisode(2, in: app)
         assertPlayback("已暂停", in: app, timeout: 5)
@@ -437,6 +495,9 @@ final class HongguoQATests: XCTestCase {
         assertEpisode(1, in: app)
         assertPlayback("播放中", in: app)
         capture("player-landscape-unlocked-previous")
+        swipeRight(in: video, from: 0.25)
+        XCTAssertTrue(app.buttons["player.close"].wait(for: \.isHittable, toEqual: true, timeout: 10))
+        assertEpisode(1, in: app)
     }
 
     func testImmersiveHomeControlsPagingAndFirstEpisode() throws {
@@ -461,7 +522,8 @@ final class HongguoQATests: XCTestCase {
             guard opened else { return }
             XCTAssertTrue(app.staticTexts[title].firstMatch.waitForExistence(timeout: 8),
                           "The opened detail must show \(title)")
-            detailBar.buttons.firstMatch.tap()
+            swipeRight(in: app, from: 0.25)
+            XCTAssertTrue(detailBar.wait(for: \.exists, toEqual: false, timeout: 5))
         }
         func lockAndUnlock(_ surface: XCUIElement, buttonID: String) {
             let start = surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.60))
@@ -499,7 +561,7 @@ final class HongguoQATests: XCTestCase {
             capture("immersive-recommendation-actions")
         }
 
-        XCTContext.runActivity(named: "Swipe up, tap the second title, and swipe down") { _ in
+        XCTContext.runActivity(named: "Swipe up, left into the current detail, right back, and down") { _ in
             feed.swipeUp()
             let next = visible(secondTitle)
             XCTAssertTrue(next, "An upward swipe must page to the second drama")
@@ -507,7 +569,7 @@ final class HongguoQATests: XCTestCase {
             XCTAssertFalse(detailBar.exists)
             let secondName = secondTitle.label
             XCTAssertNotEqual(secondName, firstName)
-            secondTitle.tap()
+            feed.swipeLeft()
             checkDetailAndReturn(title: secondName)
             let restored = visible(secondTitle)
             XCTAssertTrue(restored, "Returning from details must keep the second page")
@@ -522,6 +584,8 @@ final class HongguoQATests: XCTestCase {
             feed.swipeLeft()
             checkDetailAndReturn(title: firstName)
             XCTAssertTrue(visible(firstTitle), "Returning from details must keep the first page")
+            swipeRight(in: feed, from: 0.25)
+            XCTAssertTrue(visible(firstTitle), "The immersive root stays in place on a right swipe")
         }
 
         XCTContext.runActivity(named: "Play episode 1 from the 1.5× preview") { _ in
@@ -635,6 +699,7 @@ final class HongguoQATests: XCTestCase {
         }
         XCTAssertTrue(title.label.hasSuffix("，第 1 集"))
 
+        XCTAssertTrue(toggle.wait(for: \.isEnabled, toEqual: true, timeout: 30))
         if toggle.value as? String != "开启" { toggle.tap() }
         expectValue("开启", of: toggle)
         let loadedCount = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
@@ -714,6 +779,7 @@ final class HongguoQATests: XCTestCase {
         expectValue("关闭", of: toggle)
         app.terminate(); app.launch()
         XCTAssertTrue(toggle.wait(for: \.isHittable, toEqual: true, timeout: 45))
+        XCTAssertTrue(toggle.wait(for: \.isEnabled, toEqual: true, timeout: 30))
         expectValue("关闭", of: toggle)
 
         XCTContext.runActivity(named: "Landscape home discussion controls") { _ in
@@ -723,6 +789,7 @@ final class HongguoQATests: XCTestCase {
             }, object: nil)
             XCTAssertEqual(XCTWaiter.wait(for: [landscape], timeout: 10), .completed)
             XCTAssertTrue(toggle.wait(for: \.isHittable, toEqual: true, timeout: 10))
+            XCTAssertTrue(toggle.wait(for: \.isEnabled, toEqual: true, timeout: 30))
             toggle.tap()
             expectValue("开启", of: toggle)
             capture("landscape-home-discussion-controls")
@@ -796,15 +863,27 @@ final class HongguoQATests: XCTestCase {
     }
 
     private func openFirstEpisodeFromDetail(in app: XCUIApplication) {
+        XCTAssertTrue(app.navigationBars["剧集详情"].waitForExistence(timeout: 10))
         waitForDetailPlaybackOptions(in: app)
         let firstEpisode = app.buttons.matching(NSPredicate(format: "label == %@", "播放第 1 集"))
+        if let play = firstEpisode.allElementsBoundByIndex.first(where: \.isHittable) {
+            play.tap()
+            assertEpisode(1, in: app)
+            return
+        }
+
+        let episodeList = app.scrollViews.containing(.staticText, identifier: "选集").firstMatch
+        XCTAssertTrue(episodeList.waitForExistence(timeout: 5))
+        let lower = episodeList.coordinate(withNormalizedOffset: CGVector(dx: 0.35, dy: 0.75))
+        let upper = episodeList.coordinate(withNormalizedOffset: CGVector(dx: 0.35, dy: 0.40))
+        let firstEpisodeRows = episodeList.buttons.matching(NSPredicate(format: "label == %@", "播放第 1 集"))
         for _ in 0..<8 {
-            if let play = firstEpisode.allElementsBoundByIndex.first(where: \.isHittable) {
-                play.tap()
+            lower.press(forDuration: 0.05, thenDragTo: upper, withVelocity: .slow, thenHoldForDuration: 0)
+            if let row = firstEpisodeRows.allElementsBoundByIndex.first(where: \.isHittable) {
+                row.tap()
                 assertEpisode(1, in: app)
                 return
             }
-            app.scrollViews.firstMatch.swipeUp()
         }
         XCTFail("Could not find episode 1 in the detail page's episode list")
     }
@@ -812,6 +891,12 @@ final class HongguoQATests: XCTestCase {
     private func waitForDetailPlaybackOptions(in app: XCUIApplication) {
         let playButtons = app.buttons.matching(NSPredicate(format: "label MATCHES %@", "播放第 [0-9]+ 集"))
         XCTAssertTrue(playButtons.firstMatch.waitForExistence(timeout: 30))
+    }
+
+    private func swipeRight(in element: XCUIElement, from start: CGFloat) {
+        let origin = element.coordinate(withNormalizedOffset: CGVector(dx: start, dy: 0.5))
+        let destination = element.coordinate(withNormalizedOffset: CGVector(dx: 0.75, dy: 0.5))
+        origin.press(forDuration: 0.05, thenDragTo: destination, withVelocity: .fast, thenHoldForDuration: 0)
     }
 
     private func returnFromThemeSettings(in app: XCUIApplication) {

@@ -44,7 +44,7 @@ struct LocalLibraryGrid: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
                 if let error = library.storageError { FailureView(message: error) { library.reload() } }
-                if entries.isEmpty && !library.storageLocked { EmptyStateView(symbol: favorites ? "star" : "clock.arrow.circlepath", title: favorites ? "把喜欢的故事留在这里" : "从一部好剧开始", message: favorites ? "在详情或播放器中添加本机收藏。" : "开始播放后，这里会记住看到哪一集。") }
+                if entries.isEmpty && !library.storageLocked { EmptyStateView(symbol: favorites ? AppSymbol.favorite() : AppSymbol.history, title: favorites ? "把喜欢的故事留在这里" : "从一部好剧开始", message: favorites ? "在详情或播放器中添加本机收藏。" : "开始播放后，这里会记住看到哪一集。") }
                 else {
                     LazyVGrid(columns: threePosterColumns, spacing: 18) { ForEach(entries) { entry in libraryCell(entry) } }
                 }

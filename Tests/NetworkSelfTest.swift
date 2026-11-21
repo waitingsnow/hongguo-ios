@@ -541,21 +541,39 @@ import JavaScriptCore
         let fixture = #""reviews":{"total_count":"600","reviews":[{"content":"  带有 } 和 { 的评论  ","user_name":"甲","create_time":1700000000,"digg_count":1},{"content":"带有 } 和 { 的评论","user_name":"甲","create_time":1700000000,"digg_count":2},{"content":"匿名评论","create_time":1700000001},{"content":" "},{"content":123},null]}"#
         let preview = try EpisodeDiscussionAPI.parse(page(fixture), seriesID: series, episodeID: episode)
         precondition(preview.items.map(\.text) == ["带有 } 和 { 的评论", "匿名评论"] && preview.items.map(\.author) == ["甲", ""])
-        precondition(preview.previewCount == 2 && preview.totalCount == 600)
+        precondition(preview.hasDisplayableComments && preview.previewCount == 2 && preview.totalCount == 600 && preview.displayCount == 600)
+        let multiline = try EpisodeDiscussionAPI.parse(page(#""reviews":{"reviews":[{"content":"第一行\r\n\n第二行\t\u3000 第三行"}]}"#),
+                                                       seriesID: series, episodeID: episode)
+        precondition(multiline.items.map(\.text) == ["第一行\r\n\n第二行\t\u{3000} 第三行"])
+        precondition(multiline.items.map(\.singleLineText) == ["第一行 第二行 第三行"])
         let withMoreLikes = try EpisodeDiscussionAPI.parse(page(fixture.replacingOccurrences(of: "digg_count\":1", with: "digg_count\":7")), seriesID: series, episodeID: episode)
         precondition(preview == withMoreLikes)
         let acrossEpisodes = try EpisodeDiscussionAPI.parse(page(fixture, vid: otherEpisode), seriesID: series, episodeID: otherEpisode)
         precondition(preview.items.map(\.id) != acrossEpisodes.items.map(\.id))
         let empty = try EpisodeDiscussionAPI.parse(page(#""reviews":{"total_count":0,"reviews":[]}"#), seriesID: series, episodeID: episode)
-        precondition(empty.previewCount == 0 && empty.totalCount == 0)
-        for field in ["", #""total_count":"-1","#, #""total_count":"unknown","#] {
+        precondition(!empty.hasDisplayableComments && empty.previewCount == 0 && empty.totalCount == 0 && empty.displayCount == 0)
+        let emptyWithTotal = try EpisodeDiscussionAPI.parse(page(#""reviews":{"total_count":"18","reviews":[]}"#), seriesID: series, episodeID: episode)
+        precondition(!emptyWithTotal.hasDisplayableComments && emptyWithTotal.displayCount == 18)
+        let emptyWithoutTotal = try EpisodeDiscussionAPI.parse(page(#""reviews":{"reviews":[]}"#), seriesID: series, episodeID: episode)
+        precondition(!emptyWithoutTotal.hasDisplayableComments && emptyWithoutTotal.displayCount == nil)
+        let untrustedZero = try EpisodeDiscussionAPI.parse(page(#""reviews":{"total_count":false,"reviews":[]}"#), seriesID: series, episodeID: episode)
+        precondition(untrustedZero.items.isEmpty && untrustedZero.displayCount == nil)
+        for field in ["", #""total_count":"-1","#, #""total_count":"unknown","#, #""total_count":"0","#] {
             let withoutTotal = try EpisodeDiscussionAPI.parse(page(#""reviews":{\#(field)"reviews":[{"content":"预览"}]}"#), seriesID: series, episodeID: episode)
-            precondition(withoutTotal.previewCount == 1 && withoutTotal.totalCount == nil)
+            precondition(withoutTotal.previewCount == 1 && withoutTotal.totalCount == nil && withoutTotal.displayCount == 1)
         }
-        do {
-            _ = try EpisodeDiscussionAPI.parse(page(#""reviews":{"total_count":"18"}"#), seriesID: series, episodeID: episode)
-            fatalError("Missing episode preview must not be presented as a valid empty list or as series reviews")
-        } catch EpisodeDiscussionAPI.ReadError.unavailable { }
+        for unpublished in [#""reviews":{"total_count":"18"}"#, #""reviews":{"reviews":null}"#] {
+            do {
+                _ = try EpisodeDiscussionAPI.parse(page(unpublished), seriesID: series, episodeID: episode)
+                fatalError("Missing episode preview must not be presented as a valid empty list or as series reviews")
+            } catch EpisodeDiscussionAPI.ReadError.unavailable { }
+        }
+        for malformed in [#""reviews":{"reviews":{}}"#, #""reviews":{"reviews":[{"content":123},null]}"#] {
+            do {
+                _ = try EpisodeDiscussionAPI.parse(page(malformed), seriesID: series, episodeID: episode)
+                fatalError("Malformed previews must not be presented as empty or unpublished")
+            } catch EpisodeDiscussionAPI.ReadError.unexpectedPage { }
+        }
         do {
             _ = try EpisodeDiscussionAPI.parse(page(fixture, vid: otherEpisode), seriesID: series, episodeID: episode)
             fatalError("A different episode's comments must not be returned")

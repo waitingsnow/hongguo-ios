@@ -9,31 +9,33 @@ struct DiscussionEpisode: Hashable {
 
 struct DiscussionControls: View {
     @AppStorage("playback.commentDanmaku") private var enabled = false
-    @Environment(\.episodeCommentCount) private var count
+    @Environment(\.episodeCommentPreview) private var preview
     var vertical = false
     let showComments: () -> Void
 
     var body: some View {
         let layout = vertical ? AnyLayout(VStackLayout(spacing: 4)) : AnyLayout(HStackLayout(spacing: 2))
+        let available = preview?.hasDisplayableComments == true
+        let count = preview?.displayCount
         layout {
             Button { enabled.toggle() } label: {
-                Text(verbatim: "弹").font(.system(size: 14, weight: .bold))
-                    .fixedSize().frame(width: 24, height: 24)
-                    .background(enabled ? Color.white : .clear, in: RoundedRectangle(cornerRadius: 6))
-                    .overlay { RoundedRectangle(cornerRadius: 6).strokeBorder(lineWidth: 1.6) }
-                    .foregroundStyle(enabled ? Color.black : .white)
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
+                AppControlIcon(name: available && enabled ? "captions.bubble.fill" : "captions.bubble")
+                    .opacity(available ? 1 : 0.45)
             }
-            .accessibilityLabel("评论弹幕").accessibilityValue(enabled ? "开启" : "关闭")
+            .disabled(!available)
+            .accessibilityLabel("评论弹幕")
+            .accessibilityValue(available ? (enabled ? "开启" : "关闭") : "暂不可用，请查看本集评论")
             .accessibilityIdentifier("discussion.toggle")
             Button(action: showComments) {
-                VStack(spacing: 2) {
-                    Image(systemName: "ellipsis.bubble.fill").font(.system(size: 23))
-                    if vertical || count != nil {
-                        Text(count.map(String.init) ?? "评论").font(.caption2.weight(.semibold)).monospacedDigit()
+                AppControlIcon(name: "text.bubble")
+                    .offset(y: count == nil ? 0 : -6)
+                    .overlay(alignment: .bottom) {
+                        if let count {
+                            Text(count.formatted()).font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                                .fixedSize()
+                        }
                     }
-                }.frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+                    .contentShape(Rectangle())
             }
             .accessibilityLabel("本集评论").accessibilityValue(count.map { "\($0) 条" } ?? "暂未取得数量")
             .accessibilityIdentifier("discussion.comments")
@@ -41,14 +43,14 @@ struct DiscussionControls: View {
     }
 }
 
-private enum EpisodeCommentCount: EnvironmentKey {
-    static let defaultValue: Int? = nil
+private enum EpisodeCommentPreviewKey: EnvironmentKey {
+    static let defaultValue: EpisodeCommentPreview? = nil
 }
 
-private extension EnvironmentValues {
-    var episodeCommentCount: Int? {
-        get { self[EpisodeCommentCount.self] }
-        set { self[EpisodeCommentCount.self] = newValue }
+extension EnvironmentValues {
+    var episodeCommentPreview: EpisodeCommentPreview? {
+        get { self[EpisodeCommentPreviewKey.self] }
+        set { self[EpisodeCommentPreviewKey.self] = newValue }
     }
 }
 
@@ -60,96 +62,128 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
     let hideDanmaku: Bool
     @Binding var presented: Bool
     @AppStorage("playback.commentDanmaku") private var enabled = false
-    @State private var loadedEpisode: DiscussionEpisode?
-    @State private var comments: [EpisodeComment] = []
-    @State private var totalCount: Int?
-    @State private var failure: String?
-    @State private var previewUnavailable = false
+    @State private var result: (episode: DiscussionEpisode, outcome: Outcome)?
     @State private var retry = 0
+
+    private enum Outcome {
+        case preview(EpisodeCommentPreview)
+        case unavailable
+        case failed(String)
+    }
 
     private struct Request: Equatable {
         let episode: DiscussionEpisode?
         let retry: Int
     }
+
     private var request: Request {
         Request(episode: foreground ? episode : nil, retry: retry)
     }
 
+    private var outcome: Outcome? {
+        guard let result, result.episode == episode else { return nil }
+        return result.outcome
+    }
+
+    private var preview: EpisodeCommentPreview? {
+        guard case .preview(let preview) = outcome else { return nil }
+        return preview
+    }
+
     func body(content: Content) -> some View {
-        content.environment(\.episodeCommentCount, loadedEpisode == episode && loadedEpisode != nil && failure == nil && !previewUnavailable ? (totalCount ?? comments.count) : nil)
+        content.environment(\.episodeCommentPreview, preview)
         .overlay(alignment: .top) {
-            if enabled, foreground, !hideDanmaku, !presented, loadedEpisode == episode, !comments.isEmpty, let player {
-                CommentDanmaku(comments: comments, player: player, playing: playing)
+            if enabled, foreground, !hideDanmaku, !presented, let preview, preview.hasDisplayableComments, let player {
+                CommentDanmaku(comments: preview.items, player: player, playing: playing)
                     .padding(.top, 68)
                     .allowsHitTesting(false).accessibilityHidden(true)
             }
         }
         .task(id: request) {
             guard let target = request.episode else { return }
-            guard target != loadedEpisode || failure != nil else { return }
-            loadedEpisode = nil; comments = []; totalCount = nil; failure = nil; previewUnavailable = false
+            switch outcome {
+            case .preview, .unavailable: return
+            case .failed, nil: break
+            }
+            result = nil
             do {
                 let preview = try await EpisodeDiscussionAPI.preview(seriesID: target.seriesID, episodeID: target.episodeID)
                 try Task.checkCancellation()
-                comments = preview.items; totalCount = preview.totalCount; loadedEpisode = target
+                result = (target, .preview(preview))
             } catch {
                 guard !Task.isCancelled else { return }
-                loadedEpisode = target
                 if error as? EpisodeDiscussionAPI.ReadError == .unavailable {
-                    previewUnavailable = true
+                    result = (target, .unavailable)
                 } else {
-                    failure = (error as? EpisodeDiscussionAPI.ReadError)?.errorDescription ?? "请检查网络后重试。"
+                    let message = (error as? EpisodeDiscussionAPI.ReadError)?.errorDescription ?? "请检查网络后重试。"
+                    result = (target, .failed(message))
                 }
             }
         }
         .onChange(of: presented) { _, open in
-            if open && failure != nil { retry += 1 }
+            if open, case .failed = outcome { retry += 1 }
         }
         .sheet(isPresented: $presented) {
             NavigationStack {
                 Group {
                     if episode == nil {
                         ContentUnavailableView("当前分集信息暂不可用", systemImage: "text.bubble")
-                    } else if loadedEpisode != episode {
-                        ProgressView("正在加载本集评论")
-                    } else if let failure {
-                        ContentUnavailableView {
-                            Label("评论暂时无法加载", systemImage: "wifi.exclamationmark")
-                        } description: {
-                            Text(failure)
-                        } actions: { Button("重试") { retry += 1 } }
-                    } else if previewUnavailable {
-                        ContentUnavailableView("官网暂未开放本集评论", systemImage: "text.bubble",
-                                               description: Text("此集目前没有可读取的评论预览或弹幕。"))
-                    } else if comments.isEmpty {
-                        ContentUnavailableView("本集暂无公开评论", systemImage: "text.bubble")
                     } else {
-                        List {
-                            Section {
-                                ForEach(comments) { entry in
-                                    VStack(alignment: .leading, spacing: 5) {
-                                        if !entry.author.isEmpty { Text(entry.author).font(.caption).foregroundStyle(.secondary) }
-                                        Text(entry.text).font(.body).textSelection(.enabled)
-                                    }.padding(.vertical, 4)
-                                }
-                            } header: {
-                                if let totalCount, totalCount > comments.count {
-                                    Text("共 \(totalCount) 条评论 · 官网公开预览 \(comments.count) 条")
-                                } else {
-                                    Text("官方播放页公开评论 · \(comments.count) 条")
-                                }
-                            }
-                        }.listStyle(.plain)
+                        switch outcome {
+                        case nil:
+                            ProgressView("正在加载本集评论")
+                        case .failed(let message):
+                            ContentUnavailableView {
+                                Label("评论暂时无法加载", systemImage: "wifi.exclamationmark")
+                            } description: {
+                                Text(message)
+                            } actions: { Button("重试") { retry += 1 } }
+                        case .unavailable:
+                            ContentUnavailableView("官网暂未开放本集评论", systemImage: "text.bubble")
+                        case .preview(let preview):
+                            commentList(preview)
+                        }
                     }
                 }
                 .navigationTitle(episode.map { "第 \($0.number) 集评论" } ?? "本集评论")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { presented = false } } }
                 .safeAreaInset(edge: .bottom) {
-                    Toggle("轮播本集评论弹幕", isOn: $enabled)
-                        .font(.subheadline).padding(.horizontal).padding(.vertical, 8).background(.bar)
+                    if preview?.hasDisplayableComments == true {
+                        Toggle("轮播本集评论弹幕", isOn: $enabled)
+                            .font(.subheadline).padding(.horizontal).padding(.vertical, 8).background(.bar)
+                    }
                 }
             }.presentationDetents([.medium, .large]).presentationDragIndicator(.visible)
+        }
+    }
+
+    @ViewBuilder
+    private func commentList(_ preview: EpisodeCommentPreview) -> some View {
+        if !preview.hasDisplayableComments {
+            if preview.totalCount == 0 {
+                ContentUnavailableView("本集暂无公开评论", systemImage: "text.bubble")
+            } else {
+                ContentUnavailableView("官网没有可读评论预览", systemImage: "text.bubble",
+                                       description: preview.totalCount.map { Text("官网显示共 \($0) 条评论。") })
+            }
+        } else {
+            List {
+                Section {
+                    ForEach(preview.items) { entry in
+                        VStack(alignment: .leading, spacing: 5) {
+                            if !entry.author.isEmpty { Text(entry.author).font(.caption).foregroundStyle(.secondary) }
+                            Text(entry.text).font(.body).textSelection(.enabled)
+                        }.padding(.vertical, 4)
+                    }
+                } header: {
+                    if let total = preview.totalCount, total > preview.previewCount {
+                        Text("共 \(total) 条评论 · 官网公开预览 \(preview.previewCount) 条")
+                    } else {
+                        Text("官方播放页公开评论 · \(preview.previewCount) 条")
+                    }
+                }
+            }.listStyle(.plain)
         }
     }
 }
@@ -169,15 +203,16 @@ private struct CommentDanmaku: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        let lines = comments.map { String($0.singleLineText.prefix(70)) }
         TimelineView(.animation(minimumInterval: reduceMotion ? 0.5 : 1 / 24, paused: !playing)) { _ in
             let seconds = player.currentTime().seconds
             Canvas { context, size in
-                guard seconds.isFinite, seconds >= 0, seconds < Double(Int32.max), !comments.isEmpty else { return }
-                let lanes = reduceMotion ? 1 : min(3, comments.count)
+                guard seconds.isFinite, seconds >= 0, seconds < Double(Int32.max), !lines.isEmpty else { return }
+                let lanes = reduceMotion ? 1 : min(3, lines.count)
                 let spacing = reduceMotion ? 6.0 : 8.4 / Double(lanes)
                 let latest = Int(seconds / spacing)
                 for index in max(0, latest - lanes + 1)...latest {
-                    let text = String(comments[index % comments.count].text.prefix(70))
+                    let text = lines[index % lines.count]
                     let label = context.resolve(Text(verbatim: text).font(.subheadline.weight(.semibold)).foregroundStyle(.white))
                     let width = label.measure(in: CGSize(width: CGFloat.greatestFiniteMagnitude, height: 28)).width
                     let phase = (seconds - Double(index) * spacing) / (spacing * Double(lanes))

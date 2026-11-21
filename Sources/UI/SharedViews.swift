@@ -1,5 +1,23 @@
 import SwiftUI
 
+enum AppSymbol {
+    static func favorite(_ selected: Bool = false) -> String { selected ? "bookmark.fill" : "bookmark" }
+    static let history = "clock.arrow.circlepath"
+    static let settings = "gearshape"
+}
+
+struct AppControlIcon: View {
+    let name: String
+
+    var body: some View {
+        Image(systemName: name)
+            .font(.title3.weight(.medium))
+            .symbolRenderingMode(.monochrome)
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
+    }
+}
+
 struct PlaybackEpisodeStrip: View {
     let title: String
     let detail: String
@@ -158,7 +176,11 @@ extension TabHeader where Trailing == EmptyView { init(title: String) { self.ini
 struct HeaderIcon: View {
     @EnvironmentObject private var model: AppModel
     let symbol: String
-    var body: some View { Image(systemName: symbol).font(.system(size: 17, weight: .semibold)).foregroundStyle(model.appearance.accent).frame(width: 40, height: 40).background(model.appearance.surface, in: Circle()) }
+    var body: some View {
+        AppControlIcon(name: symbol)
+            .foregroundStyle(model.appearance.accent)
+            .background { Circle().fill(model.appearance.surface).padding(2) }
+    }
 }
 
 extension View {

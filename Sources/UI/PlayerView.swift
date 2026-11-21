@@ -70,6 +70,7 @@ struct PlayerScreen: View {
                                      tap: videoTapped, doubleTap: videoDoubleTapped, holdBegan: speedHoldBegan, holdEnded: session.endHold,
                                      lockSpeed: { if session.holding && !sliding && !sheetVisible { session.lockSpeed() } },
                                      dragChanged: dragChanged, dragEnded: dragEnded, dragCancelled: dragCancelled,
+                                     navigate: videoSwiped,
                                      seekChanged: seekDragChanged, seekEnded: seekDragEnded, seekCancelled: seekDragCancelled,
                                      pinched: { enabled in if !landscape { setCleanScreen(enabled) } })
                         .overlay {
@@ -173,10 +174,6 @@ struct PlayerScreen: View {
             }.background(.black).ignoresSafeArea().allowsHitTesting(false)
         }
         .preferredColorScheme(.dark).statusBarHidden(landscape).persistentSystemOverlays(landscape && inlineForeground && chromeHidden ? .hidden : .automatic)
-            .episodeDiscussion(DiscussionEpisode(seriesID: session.detail.drama.id, episodeID: session.episode.id, number: session.episode.index),
-                               player: session.player, playing: session.isPlaying,
-                               foreground: inlineForeground, hideDanmaku: explicitCleanScreen,
-                               presented: $commentsVisible)
             .sheet(isPresented: $episodesVisible) {
                 PlayerEpisodePanel(session: session) { index in
                     episodesVisible = false
@@ -191,6 +188,10 @@ struct PlayerScreen: View {
                     setCleanScreen(true)
                 }
             }
+            .episodeDiscussion(DiscussionEpisode(seriesID: session.detail.drama.id, episodeID: session.episode.id, number: session.episode.index),
+                               player: session.player, playing: session.isPlaying,
+                               foreground: inlineForeground, hideDanmaku: explicitCleanScreen,
+                               presented: $commentsVisible)
             .sheet(isPresented: $detailVisible, onDismiss: detailClosed) { detailSheet }
             .task {
                 surface.bind(session)
@@ -290,6 +291,17 @@ struct PlayerScreen: View {
         else { cleanScreen = true }
     }
 
+    private func videoSwiped(_ direction: HorizontalSwipeDirection) {
+        guard inlineForeground, !locked, !sheetVisible, !dragging, !sliding, !session.scrubbing else { return }
+        if direction == .left { openDetail() }
+        else { goBack() }
+    }
+
+    private func goBack() {
+        if landscape { exitFullScreen() }
+        else { session.stop(); dismiss() }
+    }
+
     /// Locking also holds the current landscape, so turning the phone does not leave full screen either.
     private func toggleLock() {
         if locked { unlock(); return }
@@ -307,8 +319,8 @@ struct PlayerScreen: View {
 
     private var lockButton: some View {
         Button(action: toggleLock) {
-            Image(systemName: locked ? "lock.fill" : "lock.open.fill").font(.system(size: 20, weight: .semibold))
-                .frame(width: 44, height: 44).background(.black.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+            AppControlIcon(name: locked ? "lock.fill" : "lock.open")
+                .background(.black.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
         }.buttonStyle(.plain).foregroundStyle(.white)
             .accessibilityLabel(locked ? "解锁屏幕" : "锁定屏幕").accessibilityIdentifier("player.lock")
     }
@@ -320,7 +332,7 @@ struct PlayerScreen: View {
     private var videoAccessibilityHint: String {
         if locked { return "显示解锁屏幕按钮" }
         return (session.isPlaying ? "轻点暂停" : "轻点继续播放")
-            + "，长按后左右拖动调整进度，上下拖动切换剧集"
+            + "，左滑查看详情，右滑返回，长按后左右拖动调整进度，上下拖动切换剧集"
     }
 
     private func speedHoldBegan(_ zone: SpeedLockZone) -> Bool {
@@ -491,27 +503,33 @@ struct PlayerScreen: View {
     }
 
     private var topBar: some View {
-        HStack(spacing: 4) {
-            Button { if landscape { exitFullScreen() } else { session.stop(); dismiss() } } label: {
-                Image(systemName: "chevron.left").font(.title3.weight(.medium))
-                    .frame(width: 44, height: 44).contentShape(Rectangle())
+        HStack(alignment: .center, spacing: 4) {
+            Button(action: goBack) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "chevron.left").font(.title3.weight(.medium))
+                    if !landscape { episodeHeading }
+                }
+                .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
             }.accessibilityLabel(landscape ? "退出全屏" : "关闭播放器")
+                .accessibilityValue(landscape ? "" : "第 \(visibleEpisode.index) 集")
                 .accessibilityIdentifier(landscape ? "player.exitFullScreen" : "player.close")
-            if landscape { dramaTitle }
-            Text("第 \(visibleEpisode.index) 集").font(.subheadline.weight(.semibold)).monospacedDigit()
-                .foregroundStyle(.white.opacity(landscape ? 0.82 : 1)).fixedSize(horizontal: true, vertical: false)
+            if landscape { dramaTitle; episodeHeading }
             Spacer(minLength: 6)
             Button { moreVisible = true } label: {
-                Image(systemName: "ellipsis").font(.title3.weight(.bold))
-                    .frame(width: 44, height: 44).contentShape(Rectangle())
+                AppControlIcon(name: "ellipsis")
             }.accessibilityLabel("更多").accessibilityIdentifier("player.more")
         }.buttonStyle(.plain).shadow(color: .black.opacity(0.55), radius: 2, y: 1)
+    }
+
+    private var episodeHeading: some View {
+        Text("第 \(visibleEpisode.index) 集").font(.title3.weight(.semibold)).monospacedDigit()
+            .fixedSize(horizontal: true, vertical: false)
     }
 
     private var dramaTitle: some View {
         Button(action: openDetail) {
             HStack(spacing: 5) {
-                Text(session.detail.drama.title).font(landscape ? .headline : .title3.weight(.semibold)).lineLimit(1)
+                Text(session.detail.drama.title).font(.body.weight(.medium)).lineLimit(1)
                 if !landscape { Image(systemName: "chevron.right").font(.caption.weight(.semibold)) }
             }.frame(minHeight: 44).contentShape(Rectangle())
         }.buttonStyle(.plain).accessibilityLabel("\(session.detail.drama.title)，第 \(visibleEpisode.index) 集")
@@ -523,9 +541,7 @@ struct PlayerScreen: View {
         return layout {
             let favorite = library.isFavorite(session.detail.drama)
             Button { library.toggleFavorite(session.detail.drama) } label: {
-                Image(systemName: favorite ? "star.fill" : "star")
-                    .font(.system(size: 24, weight: .semibold)).foregroundStyle(.white)
-                    .frame(width: 44, height: 44).contentShape(Rectangle())
+                AppControlIcon(name: AppSymbol.favorite(favorite))
             }.accessibilityLabel(favorite ? "取消本机收藏" : "添加本机收藏").accessibilityIdentifier("player.favorite")
             DiscussionControls(vertical: !landscape) { commentsVisible = true }
         }.buttonStyle(.plain).shadow(color: .black.opacity(0.8), radius: 2, y: 1)
@@ -577,6 +593,7 @@ struct PlayerScreen: View {
     private var detailSheet: some View {
         NavigationStack {
             DetailView(drama: session.detail.drama)
+                .background(NavigationBackSwipe(dismissRoot: { detailVisible = false }))
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { detailVisible = false } } }
         }.environment(\.colorScheme, session.app.isDark ? .dark : .light).preferredColorScheme(session.app.isDark ? .dark : .light)
         .presentationDragIndicator(.visible)

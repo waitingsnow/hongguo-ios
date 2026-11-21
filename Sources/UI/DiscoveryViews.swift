@@ -190,8 +190,10 @@ private struct ImmersiveFeed: View {
                         }
                         .scrollTargetLayout()
                         .background {
-                            FeedDetailSwipe(canBegin: { !preview.holding }) {
-                                if loader.dramas.indices.contains(index) { detailDrama = loader.dramas[index] }
+                            FeedNavigationSwipe(canNavigate: canNavigate) { direction in
+                                guard canNavigate(direction) else { return }
+                                if direction == .left { detailDrama = loader.dramas[index] }
+                                else { exit?() }
                             }
                         }
                     }
@@ -249,6 +251,11 @@ private struct ImmersiveFeed: View {
     private var index: Int { current.flatMap { id in loader.dramas.firstIndex { $0.id == id } } ?? 0 }
     private var isLast: Bool { index >= loader.dramas.count - 1 }
 
+    private func canNavigate(_ direction: HorizontalSwipeDirection) -> Bool {
+        visible && scenePhase == .active && model.playback == nil && detailDrama == nil && !commentsVisible
+            && !preview.holding && (direction == .left ? loader.dramas.indices.contains(index) : exit != nil)
+    }
+
     private func prefetch() {
         if loader.dramas.indices.contains(index) { loader.preloadCovers(after: loader.dramas[index]) }
         if index >= loader.dramas.count - 3 && loader.hasMore && loader.error == nil && !loader.isLoading { load(true) }
@@ -257,10 +264,10 @@ private struct ImmersiveFeed: View {
     private var topBar: some View {
         HStack(spacing: 0) {
             if let exit {
-                Button(action: exit) { Image(systemName: "square.grid.2x2").font(.system(size: 18, weight: .semibold)).frame(width: 44, height: 44) }
+                Button(action: exit) { AppControlIcon(name: "square.grid.2x2") }
                     .accessibilityLabel("返回卡片首页").accessibilityIdentifier("immersive_exit")
             }
-            Button { load(false) } label: { Image(systemName: "arrow.clockwise").font(.system(size: 18, weight: .semibold)).frame(width: 44, height: 44) }
+            Button { load(false) } label: { AppControlIcon(name: "arrow.clockwise") }
                 .accessibilityLabel("刷新推荐")
             HStack(spacing: 16) {
                 ForEach(feeds, id: \.0) { value, name in
@@ -274,7 +281,7 @@ private struct ImmersiveFeed: View {
                     }.buttonStyle(.plain).accessibilityAddTraits(selected ? .isSelected : [])
                 }
             }.frame(maxWidth: .infinity)
-            NavigationLink { SearchView() } label: { Image(systemName: "magnifyingglass").font(.system(size: 18, weight: .semibold)).frame(width: 44, height: 44) }
+            NavigationLink { SearchView() } label: { AppControlIcon(name: "magnifyingglass") }
                 .accessibilityLabel("搜索")
         }.foregroundStyle(.white).padding(.horizontal, 8).padding(.top, 2)
             .shadow(color: .black.opacity(0.85), radius: 3, y: 1)
@@ -381,10 +388,10 @@ private struct ImmersivePage: View {
         return Button(action: openDetails) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    Text(drama.title).font(.title3.weight(.semibold)).lineLimit(2)
+                    Text(drama.title).font(.body.weight(.medium)).lineLimit(2)
                     Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.white.opacity(0.7))
                 }
-                Text(currentEpisode).font(.footnote).foregroundStyle(.white.opacity(0.74))
+                Text(currentEpisode).font(.subheadline.weight(.medium)).foregroundStyle(.white.opacity(0.85))
             }
             .multilineTextAlignment(.leading)
             .foregroundStyle(.white)
@@ -424,11 +431,8 @@ private struct ImmersivePage: View {
     private var favoriteButton: some View {
         let favorite = library.isFavorite(drama)
         return Button { library.toggleFavorite(drama) } label: {
-            Image(systemName: favorite ? "star.fill" : "star")
-                .font(.system(size: 24, weight: .semibold))
+            AppControlIcon(name: AppSymbol.favorite(favorite))
                 .foregroundStyle(.white)
-                .frame(width: 44, height: 44)
-                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(favorite ? "已追" : "追剧")
@@ -448,9 +452,9 @@ private struct ImmersivePage: View {
     }
 }
 
-private struct FeedDetailSwipe: UIViewRepresentable {
-    let canBegin: () -> Bool
-    let openDetails: () -> Void
+private struct FeedNavigationSwipe: UIViewRepresentable {
+    let canNavigate: (HorizontalSwipeDirection) -> Bool
+    let navigate: (HorizontalSwipeDirection) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -459,8 +463,8 @@ private struct FeedDetailSwipe: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: AttachmentView, context: Context) {
-        context.coordinator.canBegin = canBegin
-        context.coordinator.openDetails = openDetails
+        context.coordinator.canNavigate = canNavigate
+        context.coordinator.navigate = navigate
     }
 
     static func dismantleUIView(_ uiView: AttachmentView, coordinator: Coordinator) {
@@ -490,8 +494,9 @@ private struct FeedDetailSwipe: UIViewRepresentable {
     }
 
     @MainActor final class Coordinator: NSObject, UIGestureRecognizerDelegate {
-        var canBegin: (() -> Bool)?
-        var openDetails: (() -> Void)?
+        var canNavigate: ((HorizontalSwipeDirection) -> Bool)?
+        var navigate: ((HorizontalSwipeDirection) -> Void)?
+        private var direction: HorizontalSwipeDirection?
         lazy var pan: UIPanGestureRecognizer = {
             let pan = UIPanGestureRecognizer(target: self, action: #selector(didPan(_:)))
             pan.maximumNumberOfTouches = 1
@@ -500,10 +505,11 @@ private struct FeedDetailSwipe: UIViewRepresentable {
         }()
 
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-            guard canBegin?() == true, let scrollView = gestureRecognizer.view as? UIScrollView,
-                  !scrollView.isDecelerating else { return false }
-            let velocity = pan.velocity(in: scrollView)
-            return velocity.x < -abs(velocity.y) * 1.35
+            guard let scrollView = gestureRecognizer.view as? UIScrollView, !scrollView.isDecelerating,
+                  let direction = HorizontalSwipeDirection(movement: pan.velocity(in: scrollView)),
+                  canNavigate?(direction) == true else { return false }
+            self.direction = direction
+            return true
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
@@ -511,9 +517,8 @@ private struct FeedDetailSwipe: UIViewRepresentable {
         }
 
         @objc private func didPan(_ pan: UIPanGestureRecognizer) {
-            guard pan.state == .ended else { return }
-            let movement = pan.translation(in: pan.view)
-            if movement.x <= -56 && -movement.x > abs(movement.y) * 1.35 { openDetails?() }
+            guard pan.state == .ended, let direction, direction.completes(pan.translation(in: pan.view)) else { return }
+            navigate?(direction)
         }
     }
 }

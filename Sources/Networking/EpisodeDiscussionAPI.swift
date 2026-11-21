@@ -1,15 +1,19 @@
+import CoreFoundation
 import Foundation
 
 struct EpisodeComment: Identifiable, Equatable, Sendable {
     let id: String
     let text: String
     let author: String
+    var singleLineText: String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
 }
 
 struct EpisodeCommentPreview: Equatable, Sendable {
     let items: [EpisodeComment]
     let totalCount: Int?
     var previewCount: Int { items.count }
+    var hasDisplayableComments: Bool { !items.isEmpty }
+    var displayCount: Int? { totalCount ?? (hasDisplayableComments ? previewCount : nil) }
 }
 
 enum EpisodeDiscussionAPI {
@@ -160,13 +164,16 @@ enum EpisodeDiscussionAPI {
         guard ProtocolJSON.bool(page["isSuccess"], default: true) else { throw ReadError.unavailable }
         let social = ProtocolJSON.dictionary(page["episodeSocialInfo"])
         let preview = ProtocolJSON.dictionary(social["reviews"])
-        guard let reviews = preview["reviews"] as? [Any] else {
+        guard let publishedReviews = preview["reviews"], !(publishedReviews is NSNull) else {
             throw ReadError.unavailable
         }
+        guard let reviews = publishedReviews as? [Any] else { throw ReadError.unexpectedPage }
 
         var seen = Set<String>()
+        var containsTextField = false
         let items: [EpisodeComment] = try reviews.compactMap { value in
             guard let review = value as? [String: Any], let content = review["content"] as? String else { return nil }
+            containsTextField = true
             let text = content.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return nil }
             let author = review["user_name"] as? String ?? ""
@@ -176,7 +183,11 @@ enum EpisodeDiscussionAPI {
             guard seen.insert(id).inserted else { return nil }
             return EpisodeComment(id: id, text: text, author: author)
         }
-        let total = Int(ProtocolJSON.text(preview["total_count"]))
-        return EpisodeCommentPreview(items: items, totalCount: total.flatMap { $0 >= 0 ? $0 : nil })
+        guard reviews.isEmpty || containsTextField else { throw ReadError.unexpectedPage }
+        let rawTotal = preview["total_count"]
+        let isBoolean = (rawTotal as? NSNumber).map { CFGetTypeID($0) == CFBooleanGetTypeID() } ?? false
+        let total = isBoolean ? nil : Int(ProtocolJSON.text(rawTotal))
+        let validTotal = total.flatMap { count in count >= items.count && (count > 0 || reviews.isEmpty) ? count : nil }
+        return EpisodeCommentPreview(items: items, totalCount: validTotal)
     }
 }
