@@ -44,6 +44,8 @@ final class FeedPreview: ObservableObject {
     private var quality: VideoQuality = .p1080
     private var speed: Float = 1
     private var following: [Drama] = []
+    private(set) var isScrolling = false
+    private var selectionTask: Task<Void, Never>?
     private var lookahead: PlaybackLookahead
     init(lookahead: PlaybackLookahead? = nil, library: LibraryStore? = nil) {
         self.lookahead = lookahead ?? PlaybackLookahead()
@@ -61,11 +63,41 @@ final class FeedPreview: ObservableObject {
     var position: Double { guard let seconds = player?.currentTime().seconds, seconds.isFinite else { return 0 }; return max(0, seconds) }
     var playbackSpeed: Float { holding || speedLocked ? 2 : speed }
 
+    func setScrolling(_ moving: Bool) {
+        guard isScrolling != moving else { return }
+        isScrolling = moving
+        if moving {
+            selectionTask?.cancel(); selectionTask = nil
+            lookahead.pause()
+            frameTask?.cancel()
+        }
+    }
+
+    func select(_ drama: Drama, quality: VideoQuality, speed: Float, following: [Drama], debounce: Bool) {
+        selectionTask?.cancel(); selectionTask = nil
+        if isScrolling || (debounce && dramaID != nil && dramaID != drama.id) {
+            player?.isMuted = dramaID != drama.id
+            if isScrolling {
+                if dramaID != drama.id, !rendered, task != nil { resetPlayer() }
+                return
+            }
+            lookahead.pause()
+            selectionTask = Task { [weak self] in
+                do { try await Task.sleep(for: .milliseconds(140)) } catch { return }
+                self?.selectionTask = nil
+                self?.play(drama, quality: quality, speed: speed, following: following)
+            }
+            return
+        }
+        play(drama, quality: quality, speed: speed, following: following)
+    }
+
     func play(_ drama: Drama, quality: VideoQuality, speed: Float, following: [Drama]) {
         let rateChanged = self.speed != speed
         self.speed = speed
-        self.following = Array(following.prefix(2))
+        self.following = following
         if dramaID == drama.id, self.quality == quality, !failed {
+            player?.isMuted = false
             if rateChanged && !paused && !ended && !restoringPosition { player?.defaultRate = playbackSpeed; player?.rate = playbackSpeed }
             schedule()
             return
@@ -141,8 +173,8 @@ final class FeedPreview: ObservableObject {
     }
 
     private func schedule() {
-        guard rendered, !ended, !paused, let player, let detail else { return }
-        var targets = following.map { PlaybackTarget($0, quality: quality) }
+        guard !isScrolling, selectionTask == nil, rendered, !ended, !paused, let player, let detail else { return }
+        var targets = Array(following.map { PlaybackTarget($0, quality: quality) }.filter { !lookahead.canRevisit($0) }.prefix(2))
         if detail.episodes.count > 1 {
             let remaining = (player.currentItem?.duration.seconds ?? .infinity) - position
             targets.insert(PlaybackTarget(detail, index: 1, quality: quality), at: remaining < 8 * Double(playbackSpeed) ? 0 : min(1, targets.count))
@@ -173,6 +205,7 @@ final class FeedPreview: ObservableObject {
     func handoff(index: Int) -> PlaybackRequest? {
         guard !restoringPosition, let episode, episode.detail.episodes.indices.contains(index), let player else { return nil }
         let live = index == 0 && !ended
+        if live { player.isMuted = false }
         let handoff = FeedHandoff(lookahead: lookahead, live: live ? (player, episode) : nil, speedLocked: speedLocked)
         if live { handoff.displayedFrame = layerHost?.snapshotDisplayedFrame() }
         else { handoff.displayedFrame = PlaybackLookahead.frame(PlaybackTarget(episode.detail, index: index, quality: quality)) ?? layerHost?.snapshotDisplayedFrame() }
@@ -226,7 +259,7 @@ final class FeedPreview: ObservableObject {
             let target = PlaybackTarget(detail, index: 0, quality: quality)
             let key = target.key as NSString
             if ended { recentFrames.removeObject(forKey: key) }
-            else if !keepPlaying, let frame = layerHost?.snapshotDisplayedFrame(), let image = frame.cgImage {
+            else if !keepPlaying, let frame = layerHost?.snapshotDisplayedFrame(maxDimension: 640), let image = frame.cgImage {
                 recentFrames.setObject(frame, forKey: key, cost: image.bytesPerRow * image.height)
             }
         }
@@ -240,7 +273,10 @@ final class FeedPreview: ObservableObject {
         player = nil; episode = nil; dramaID = nil; rendered = false; paused = false
         ended = false; failed = false; holding = false; speedLocked = false; restoringPosition = false
     }
-    func stop() { resetPlayer(); lookahead.clear() }
+    func stop() {
+        selectionTask?.cancel(); selectionTask = nil; isScrolling = false
+        resetPlayer(); lookahead.clear()
+    }
 }
 
 extension FeedPreview {

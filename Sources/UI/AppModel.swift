@@ -211,7 +211,9 @@ final class CatalogLoader: ObservableObject {
     private var offset = 0
     private var generation = UUID()
     private var task: Task<Void, Never>?
-    private var preloadedCovers = Set<String>()
+    private let coverPrefetch = CoverPrefetchWindow()
+    private var coverAnchorID: String?
+    private var coverPrefetchEnabled = true
     /// A saved list this recent is shown without asking the network again; older ones are shown and then refreshed.
     static let freshFor: TimeInterval = 30 * 60
     static let keptFor: TimeInterval = 7 * 24 * 3600
@@ -220,13 +222,12 @@ final class CatalogLoader: ObservableObject {
     @discardableResult
     func restore(key: String?) -> Restored {
         task?.cancel(); generation = UUID(); isLoading = false; error = nil
-        cacheKey = key; anchorID = nil; preloadedCovers = []
+        cacheKey = key; anchorID = nil; resetCoverPrefetch()
         guard let key, let saved = ContentCache.shared.value(CatalogSnapshot.self, for: "catalog." + key),
               saved.age < Self.keptFor, !saved.value.dramas.isEmpty else {
             dramas = []; offset = 0; hasMore = false; return .none
         }
         dramas = saved.value.dramas; offset = saved.value.nextOffset; hasMore = saved.value.hasMore
-        ImageLoading.prefetch(dramas.prefix(12).map(\.coverURL))
         return saved.age < Self.freshFor ? .fresh : .stale
     }
 
@@ -238,7 +239,7 @@ final class CatalogLoader: ObservableObject {
         task?.cancel()
         let ticket = UUID(); generation = ticket
         let requestedOffset = reset || inPlace ? 0 : offset
-        if reset && !inPlace { dramas = []; offset = 0; hasMore = false; preloadedCovers = [] }
+        if reset && !inPlace { dramas = []; offset = 0; hasMore = false; resetCoverPrefetch() }
         isLoading = true; error = nil
         task = Task { [weak self] in
             do {
@@ -249,12 +250,12 @@ final class CatalogLoader: ObservableObject {
                     let kept = self.anchorID.flatMap { id in self.dramas.firstIndex { $0.id == id } }.map { Array(self.dramas[...$0]) } ?? []
                     var seen = Set(kept.map(\.id))
                     self.dramas = kept + page.dramas.filter { seen.insert($0.id).inserted }
-                    self.preloadedCovers = []
                 } else {
                     var existing = Set(self.dramas.map(\.id))
                     let fresh = page.dramas.filter { existing.insert($0.id).inserted }
                     self.dramas += fresh
                 }
+                self.updateCoverPrefetch()
                 self.hasMore = page.hasMore && !page.dramas.isEmpty && page.nextOffset > requestedOffset
                 self.offset = page.nextOffset
                 self.isLoading = false
@@ -268,7 +269,7 @@ final class CatalogLoader: ObservableObject {
         }
     }
 
-    func cancel() { task?.cancel(); generation = UUID(); isLoading = false }
+    func cancel() { task?.cancel(); generation = UUID(); isLoading = false; resetCoverPrefetch() }
 
     private func persist() {
         guard let cacheKey, !dramas.isEmpty else { return }
@@ -279,16 +280,31 @@ final class CatalogLoader: ObservableObject {
     /// Call as a row appears. Requests the next page once it is within 12 of the end, so it is in the list before the
     /// user gets there. A failed page waits for the retry button, so a dead network cannot turn scrolling into a loop.
     func itemAppeared(_ drama: Drama, load: () -> Void) {
-        preloadCovers(after: drama)
+        if dramas.contains(where: { $0.id == drama.id }) {
+            coverAnchorID = drama.id
+            updateCoverPrefetch()
+        }
         guard hasMore, error == nil, !isLoading, dramas.suffix(12).contains(where: { $0.id == drama.id }) else { return }
         load()
     }
 
-    /// Puts the next covers into the image disk cache before they scroll into view.
-    func preloadCovers(after drama: Drama) {
-        guard let index = dramas.firstIndex(where: { $0.id == drama.id }) else { return }
-        let next = dramas[(index + 1)...].prefix(9).map(\.coverURL).filter { preloadedCovers.insert($0).inserted }
-        ImageLoading.prefetch(next)
+    func setCoverPrefetchEnabled(_ enabled: Bool) {
+        guard coverPrefetchEnabled != enabled else { return }
+        coverPrefetchEnabled = enabled
+        updateCoverPrefetch()
+    }
+
+    private func updateCoverPrefetch() {
+        guard coverPrefetchEnabled, let coverAnchorID, let index = dramas.firstIndex(where: { $0.id == coverAnchorID }) else {
+            coverPrefetch.update([])
+            return
+        }
+        coverPrefetch.update(dramas.dropFirst(index + 1).prefix(9).map(\.coverURL))
+    }
+
+    private func resetCoverPrefetch() {
+        coverAnchorID = nil
+        coverPrefetch.update([])
     }
 }
 

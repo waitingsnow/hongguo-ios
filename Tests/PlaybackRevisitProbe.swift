@@ -30,7 +30,10 @@ struct PlaybackRevisitProbe {
         let detail = DramaDetail(drama: drama, episodes: episodes)
         let otherDetail = DramaDetail(drama: other, episodes: [episodes[0]])
         var firstOpenCount = 0
+        var skippedOpens = 0
+        let skipped = (1...5).map { Drama(id: "skipped-\($0)", title: "Skipped", coverURL: "", summary: "", episodeCount: 1) }
         let lookahead = PlaybackLookahead { target in
+            if skipped.contains(where: { $0.id == target.drama.id }) { skippedOpens += 1 }
             if target.drama.id == drama.id && target.index == 0 { firstOpenCount += 1 }
             let selected = target.drama.id == drama.id ? detail : otherDetail
             let track = VideoTrack(url: URL(string: "https://test.qznovelvod.com/fixture.mp4")!, spadeA: "", encrypted: false, definition: "720p")
@@ -49,8 +52,17 @@ struct PlaybackRevisitProbe {
         preview.markRendered(first)
         await first.seek(to: CMTime(seconds: 4, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         try await eventually("Preview seek never settled") { preview.position >= 4 }
-        preview.play(other, quality: .p720, speed: 1.5, following: [])
+        preview.setScrolling(true)
+        for target in skipped { preview.select(target, quality: .p720, speed: 1.5, following: [], debounce: false) }
+        try await Task.sleep(for: .milliseconds(180))
+        try require(skippedOpens == 0 && preview.player === first && first.isMuted, "Fling opened an intermediate page or kept playing its audio")
+        preview.setScrolling(false)
+        preview.select(drama, quality: .p720, speed: 1.5, following: [], debounce: false)
+        try require(preview.player === first && !first.isMuted, "Cancelled drag did not reuse the unmuted player")
+        for target in skipped { preview.select(target, quality: .p720, speed: 1.5, following: [], debounce: true) }
+        preview.select(other, quality: .p720, speed: 1.5, following: [], debounce: true)
         try await eventually("Other drama picked up the first drama's position") { preview.position > 0.1 && preview.position < 2 }
+        try require(preview.dramaID == other.id && skippedOpens == 0, "Debounced scrolling opened an intermediate target")
         guard let otherPlayer = preview.player else { throw Failure(description: "Missing other player") }
         preview.markRendered(otherPlayer)
         preview.play(drama, quality: .p720, speed: 1.5, following: [])
@@ -81,6 +93,11 @@ struct PlaybackRevisitProbe {
         try require(firstOpenCount == 1, "Switching back reopened episode one's video source")
         session.load(index: 1)
         try await eventually("Swipe path did not restore episode 2") { session.index == 1 && session.rendered && player.currentTime().seconds > 6.5 }
-        print("PASS: preview A/B/A resumes at its own position, live handoff preserves the player, and manual episode A/B/A/B restores both positions")
+        preview.play(other, quality: .p720, speed: 1, following: [])
+        preview.select(skipped[0], quality: .p720, speed: 1, following: [], debounce: true)
+        preview.stop()
+        try await Task.sleep(for: .milliseconds(200))
+        try require(skippedOpens == 0 && preview.player == nil, "A delayed preview opened after leaving the feed")
+        print("PASS: 5 intermediate targets opened 0 streams in both fling modes; cancelled swipe preserved player and sound; exit cancelled pending playback; A/B/A revisit and live handoff restored positions")
     }
 }

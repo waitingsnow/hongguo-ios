@@ -4,8 +4,9 @@ import SwiftUI
 struct PlayerMorePanel: View {
     @ObservedObject private var session: PlayerSession
     @ObservedObject private var app: AppModel
-    @Environment(\.episodeCommentPreview) private var commentPreview
     @AppStorage(CommentDanmakuPreference.key) private var commentDanmaku = CommentDanmakuPreference.defaultValue
+    @AppStorage(CommentDanmakuPreference.fontSizeKey) private var danmakuFontSize: CommentDanmakuPreference.FontSize = .standard
+    @AppStorage(CommentDanmakuPreference.scrollSpeedKey) private var danmakuScrollSpeed: CommentDanmakuPreference.ScrollSpeed = .standard
 
     private let enterCleanScreen: () -> Void
     private static let speeds: [Float] = [0.5, 0.75, 1, 1.25, 1.5, 2]
@@ -33,15 +34,11 @@ struct PlayerMorePanel: View {
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        if commentPreview?.hasDisplayableComments == true {
-                            Divider()
-                            Toggle("轮播本集评论弹幕", isOn: $commentDanmaku)
-                                .frame(minHeight: 48)
-                        }
                     }
                     .font(.subheadline)
                     .padding(.horizontal, 14)
                     .background(colors.surface, in: RoundedRectangle(cornerRadius: 14))
+                    danmakuOptions
                 }
                 .foregroundStyle(colors.ink)
                 .padding(20)
@@ -49,6 +46,28 @@ struct PlayerMorePanel: View {
                 .frame(maxWidth: .infinity)
             }
         }
+    }
+
+    private var danmakuOptions: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("弹幕").font(.headline).accessibilityAddTraits(.isHeader)
+            Toggle("轮播本集评论弹幕", isOn: $commentDanmaku)
+                .frame(minHeight: 44)
+            Text("字体大小").foregroundStyle(colors.muted).accessibilityHidden(true)
+            Picker("弹幕字体大小", selection: $danmakuFontSize) {
+                ForEach(CommentDanmakuPreference.FontSize.allCases) { size in Text(size.title).tag(size) }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityIdentifier("player.danmaku.fontSize")
+            Text("滚动速度").foregroundStyle(colors.muted).accessibilityHidden(true)
+            Picker("弹幕滚动速度", selection: $danmakuScrollSpeed) {
+                ForEach(CommentDanmakuPreference.ScrollSpeed.allCases) { speed in Text(speed.title).tag(speed) }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityIdentifier("player.danmaku.scrollSpeed")
+        }
+        .font(.subheadline)
+        .tint(colors.accent)
     }
 
     private var speedOptions: some View {

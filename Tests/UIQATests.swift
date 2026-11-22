@@ -922,7 +922,8 @@ final class HongguoQATests: XCTestCase {
         }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [loadedCount], timeout: 30), .completed,
                        "The real episode must show a positive accessibility comment count")
-        let count = try XCTUnwrap(commentCount(in: openComments.value as? String))
+        let countValue = try XCTUnwrap(openComments.value as? String)
+        let count = try XCTUnwrap(commentCount(in: countValue))
         capture("portrait-player-right-rail")
         let progress = app.sliders["播放进度"]
         let timestamps = app.staticTexts.matching(NSPredicate(format: "label MATCHES %@", "[0-9]+:[0-9]{2}"))
@@ -947,7 +948,7 @@ final class HongguoQATests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [playedFiveSeconds], timeout: 30), .completed)
         assertPlayback("播放中", in: app, timeout: 5)
         XCTAssertEqual(toggle.value as? String, "开启")
-        XCTAssertEqual(commentCount(in: openComments.value as? String), count)
+        XCTAssertEqual(openComments.value as? String, countValue)
         let firstFrame = XCUIScreen.main.screenshot()
         Thread.sleep(forTimeInterval: 0.7)
         let secondFrame = XCUIScreen.main.screenshot()
@@ -963,6 +964,7 @@ final class HongguoQATests: XCTestCase {
         XCTAssertTrue(header.waitForExistence(timeout: 10))
         let counts = header.label.split(whereSeparator: { !$0.isASCII || !$0.isNumber }).compactMap { Int($0) }
         if header.label.hasPrefix("共 ") {
+            XCTAssertFalse(countValue.hasPrefix("公开预览 "), "A known total must not be announced as a preview count")
             XCTAssertEqual(counts.count, 2)
             XCTAssertEqual(counts.first, count, "The sheet total must match the comment button")
             let previewCount = try XCTUnwrap(counts.last)
@@ -971,7 +973,7 @@ final class HongguoQATests: XCTestCase {
         } else {
             XCTAssertEqual(counts.count, 1)
             let previewCount = try XCTUnwrap(counts.first)
-            XCTAssertGreaterThanOrEqual(previewCount, count, "Only a larger total uses the two-count header")
+            XCTAssertEqual(previewCount, count, "Without a larger total, the button count must match the visible preview count")
         }
         let rows = app.collectionViews.cells.allElementsBoundByIndex
         let visibleBodies = rows.compactMap { row -> XCUIElement? in
@@ -1022,6 +1024,70 @@ final class HongguoQATests: XCTestCase {
             XCTAssertTrue(toggle.wait(for: \.isHittable, toEqual: true, timeout: 10))
             toggle.tap()
             expectValue("关闭", of: toggle)
+        }
+    }
+
+    func testPlayerMoreDanmakuSettingsPersist() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["HONGGUO_QA_MODE"] == "--live")
+        continueAfterFailure = false
+        let device = XCUIDevice.shared
+        let previousOrientation = device.orientation
+        device.orientation = .portrait
+        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        defer {
+            app.terminate()
+            device.orientation = previousOrientation
+        }
+        app.launchArguments = ["-theme", "immersive", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO", "-autoNext", "NO"]
+
+        let font = app.segmentedControls["player.danmaku.fontSize"]
+        let speed = app.segmentedControls["player.danmaku.scrollSpeed"]
+        let scroll = app.scrollViews.containing(.segmentedControl, identifier: "player.danmaku.fontSize").firstMatch
+
+        @MainActor func reveal(_ option: XCUIElement, line: UInt = #line) {
+            for _ in 0..<4 where !option.isHittable { scroll.swipeUp() }
+            XCTAssertTrue(option.wait(for: \.isHittable, toEqual: true, timeout: 5), line: line)
+        }
+
+        @MainActor func select(_ label: String, in picker: XCUIElement, line: UInt = #line) {
+            let option = picker.buttons[label]
+            reveal(option, line: line)
+            option.tap()
+            XCTAssertTrue(option.wait(for: \.isSelected, toEqual: true, timeout: 5), line: line)
+        }
+
+        app.launch()
+        openFirstEpisode(in: app, search: "灵葫仙缘")
+        let done = openPlayerMore(in: app)
+        XCTAssertTrue(scroll.waitForExistence(timeout: 5))
+        reveal(font.buttons["大"])
+        XCTAssertEqual(font.buttons.allElementsBoundByIndex.map(\.label), ["小", "中", "大"])
+        let originalFont = try XCTUnwrap(font.buttons.allElementsBoundByIndex.first(where: \.isSelected)?.label)
+        let newFont = originalFont == "大" ? "小" : "大"
+        select(newFont, in: font)
+        XCTAssertTrue(done.isHittable, "Font selection must keep the More panel open")
+
+        reveal(speed.buttons["快"])
+        XCTAssertEqual(speed.buttons.allElementsBoundByIndex.map(\.label), ["慢", "标准", "快"])
+        let originalSpeed = try XCTUnwrap(speed.buttons.allElementsBoundByIndex.first(where: \.isSelected)?.label)
+        let newSpeed = originalSpeed == "快" ? "慢" : "快"
+        select(newSpeed, in: speed)
+        XCTAssertTrue(done.isHittable, "Danmaku speed selection must keep the More panel open")
+        capture("player-more-danmaku-settings")
+        closePlayerMore(done)
+
+        for relaunch in [false, true] {
+            if relaunch {
+                app.terminate()
+                app.launch()
+                openFirstEpisode(in: app, search: "灵葫仙缘")
+            }
+            let reopened = openPlayerMore(in: app)
+            reveal(font.buttons[newFont])
+            XCTAssertTrue(font.buttons[newFont].isSelected)
+            reveal(speed.buttons[newSpeed])
+            XCTAssertTrue(speed.buttons[newSpeed].isSelected)
+            closePlayerMore(reopened)
         }
     }
 
@@ -1178,7 +1244,9 @@ final class HongguoQATests: XCTestCase {
 
     private func commentCount(in value: String?) -> Int? {
         guard let value, value.hasSuffix(" 条") else { return nil }
-        return Int(value.dropLast(2))
+        let number = value.dropLast(" 条".count)
+        let previewPrefix = "公开预览 "
+        return Int(number.hasPrefix(previewPrefix) ? number.dropFirst(previewPrefix.count) : number)
     }
 
     private func capture(_ name: String) {

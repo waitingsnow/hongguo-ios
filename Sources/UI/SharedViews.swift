@@ -11,21 +11,76 @@ extension Font {
 }
 
 struct FollowDramaButton: View {
+    let seriesID: String
     let selected: Bool
     let action: () -> Void
+    @Environment(\.discussionSeriesFavoriteCount) private var seriesFavoriteCount
 
     var body: some View {
+        let count = seriesFavoriteCount?.seriesID == seriesID ? seriesFavoriteCount?.count : nil
         Button(action: action) {
-            Image(systemName: AppSymbol.favorite(selected))
-                .font(.system(size: 21, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 44, height: 44)
-                .contentShape(Rectangle())
+            InteractionButtonIcon(glyph: .symbol(AppSymbol.favorite(selected)), count: count)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(selected ? "已追" : "追剧")
+        .accessibilityValue(count.map { "\($0) 人收藏" } ?? "暂未取得收藏数")
         .accessibilityHint(selected ? "取消本机收藏" : "添加本机收藏")
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+struct InteractionButtonIcon: View {
+    enum Glyph {
+        case symbol(String)
+        case danmaku(enabled: Bool)
+    }
+
+    let glyph: Glyph
+    let count: Int?
+
+    var body: some View {
+        VStack(spacing: 2) {
+            icon
+                .frame(height: 23)
+                .accessibilityHidden(true)
+            Text(verbatim: count.map(Self.countLabel) ?? "")
+                .font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                .lineLimit(1).minimumScaleFactor(0.7)
+                .frame(height: 13)
+        }
+        .foregroundStyle(.white)
+        .frame(width: 44, height: 44)
+        .contentShape(Rectangle())
+    }
+
+    @ViewBuilder private var icon: some View {
+        switch glyph {
+        case .symbol(let name):
+            Image(systemName: name)
+                .font(.system(size: 20, weight: .semibold))
+                .symbolRenderingMode(.monochrome)
+        case .danmaku(let enabled):
+            Text(verbatim: "弹")
+                .font(.system(size: 17, weight: .semibold))
+                .opacity(enabled ? 1 : 0.55)
+                .overlay {
+                    if !enabled {
+                        Capsule().fill(.white)
+                            .frame(width: 22, height: 1.5)
+                            .rotationEffect(.degrees(45))
+                    }
+                }
+        }
+    }
+
+    private static func countLabel(_ count: Int) -> String {
+        guard count >= 1_000 else { return String(count) }
+        let millions = count >= 1_000_000
+        let divisor = millions ? 1_000_000 : 1_000
+        let whole = count / divisor
+        let tenth = (count % divisor) / (divisor / 10)
+        let number = tenth == 0 ? "\(whole)" : "\(whole).\(tenth)"
+        return number + (millions ? "m" : "k")
     }
 }
 

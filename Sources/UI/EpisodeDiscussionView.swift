@@ -10,6 +10,22 @@ struct DiscussionEpisode: Hashable {
 enum CommentDanmakuPreference {
     static let key = "playback.commentDanmaku"
     static let defaultValue = true
+    static let fontSizeKey = "playback.commentDanmaku.fontSize"
+    static let scrollSpeedKey = "playback.commentDanmaku.scrollSpeed"
+
+    enum FontSize: String, CaseIterable, Identifiable {
+        case small, standard, large
+        var id: Self { self }
+        var title: String { switch self { case .small: "小"; case .standard: "中"; case .large: "大" } }
+        var points: CGFloat { switch self { case .small: 12; case .standard: 15; case .large: 19 } }
+    }
+
+    enum ScrollSpeed: String, CaseIterable, Identifiable {
+        case slow, standard, fast
+        var id: Self { self }
+        var title: String { switch self { case .slow: "慢"; case .standard: "标准"; case .fast: "快" } }
+        var multiplier: Double { switch self { case .slow: 0.75; case .standard: 1; case .fast: 1.35 } }
+    }
 }
 
 struct DiscussionControls: View {
@@ -18,41 +34,29 @@ struct DiscussionControls: View {
     var vertical = false
     let showComments: () -> Void
 
-    static func countLabel(_ count: Int) -> String {
-        guard count >= 1_000 else { return String(count) }
-        let millions = count >= 1_000_000
-        let divisor = millions ? 1_000_000 : 1_000
-        let whole = count / divisor
-        let tenth = (count % divisor) / (divisor / 10)
-        let number = tenth == 0 ? "\(whole)" : "\(whole).\(tenth)"
-        return number + (millions ? "m" : "k")
-    }
-
     var body: some View {
         let layout = vertical ? AnyLayout(VStackLayout(spacing: 4)) : AnyLayout(HStackLayout(spacing: 2))
         let available = preview?.hasDisplayableComments == true
-        let count = preview?.displayCount
+        let danmakuCount = preview?.playableDanmakuCount
+        let commentCount = preview?.displayCount
+        let commentCountValue = commentCount.map { count in
+            preview?.totalCount == nil ? "公开预览 \(count) 条" : "\(count) 条"
+        } ?? "暂未取得数量"
         layout {
             Button { enabled.toggle() } label: {
-                AppControlIcon(name: available && enabled ? "captions.bubble.fill" : "captions.bubble")
+                InteractionButtonIcon(glyph: .danmaku(enabled: available && enabled), count: danmakuCount)
                     .opacity(available ? 1 : 0.45)
             }
             .disabled(!available)
             .accessibilityLabel("评论弹幕")
-            .accessibilityValue(available ? (enabled ? "开启" : "关闭") : "暂不可用，请查看本集评论")
+            .accessibilityValue(available ? (enabled ? "开启" : "关闭") : "暂无可轮播内容")
+            .accessibilityHint(danmakuCount.map { "轮播本集 \($0) 条公开评论" } ?? "查看本集评论了解内容状态")
             .accessibilityIdentifier("discussion.toggle")
             Button(action: showComments) {
-                AppControlIcon(name: "text.bubble")
-                    .offset(y: count == nil ? 0 : -6)
-                    .overlay(alignment: .bottom) {
-                        if let count {
-                            Text(verbatim: Self.countLabel(count)).font(.system(size: 11, weight: .semibold)).monospacedDigit()
-                                .fixedSize()
-                        }
-                    }
-                    .contentShape(Rectangle())
+                InteractionButtonIcon(glyph: .symbol("text.bubble"), count: commentCount)
             }
-            .accessibilityLabel("本集评论").accessibilityValue(count.map { "\($0) 条" } ?? "暂未取得数量")
+            .accessibilityLabel("本集评论").accessibilityValue(commentCountValue)
+            .accessibilityHint("打开本集评论")
             .accessibilityIdentifier("discussion.comments")
         }.buttonStyle(.plain)
     }
@@ -62,10 +66,19 @@ private enum EpisodeCommentPreviewKey: EnvironmentKey {
     static let defaultValue: EpisodeCommentPreview? = nil
 }
 
+private enum DiscussionSeriesFavoriteCountKey: EnvironmentKey {
+    static let defaultValue: (seriesID: String, count: Int)? = nil
+}
+
 extension EnvironmentValues {
     var episodeCommentPreview: EpisodeCommentPreview? {
         get { self[EpisodeCommentPreviewKey.self] }
         set { self[EpisodeCommentPreviewKey.self] = newValue }
+    }
+
+    var discussionSeriesFavoriteCount: (seriesID: String, count: Int)? {
+        get { self[DiscussionSeriesFavoriteCountKey.self] }
+        set { self[DiscussionSeriesFavoriteCountKey.self] = newValue }
     }
 }
 
@@ -77,6 +90,7 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
     @Binding var presented: Bool
     @AppStorage(CommentDanmakuPreference.key) private var enabled = CommentDanmakuPreference.defaultValue
     @State private var result: (episode: DiscussionEpisode, outcome: Outcome)?
+    @State private var seriesFavoriteCount: (seriesID: String, count: Int)?
     @State private var retry = 0
 
     private enum Outcome {
@@ -106,6 +120,7 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
 
     func body(content: Content) -> some View {
         content.environment(\.episodeCommentPreview, preview)
+        .environment(\.discussionSeriesFavoriteCount, seriesFavoriteCount?.seriesID == episode?.seriesID ? seriesFavoriteCount : nil)
         .overlay(alignment: .top) {
             if enabled, foreground, !hideDanmaku, !presented, let preview, preview.hasDisplayableComments, let player {
                 CommentDanmaku(comments: preview.items, player: player)
@@ -124,6 +139,7 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
             do {
                 let preview = try await EpisodeDiscussionAPI.preview(seriesID: target.seriesID, episodeID: target.episodeID)
                 try Task.checkCancellation()
+                if let count = preview.seriesFavoriteCount { seriesFavoriteCount = (target.seriesID, count) }
                 result = (target, .preview(preview))
             } catch {
                 guard !Task.isCancelled else { return }
@@ -216,21 +232,24 @@ private struct CommentDanmaku: View {
     let comments: [EpisodeComment]
     let player: AVPlayer
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage(CommentDanmakuPreference.fontSizeKey) private var fontSize: CommentDanmakuPreference.FontSize = .standard
+    @AppStorage(CommentDanmakuPreference.scrollSpeedKey) private var scrollSpeed: CommentDanmakuPreference.ScrollSpeed = .standard
     @State private var elapsed: TimeInterval = 0
     @State private var startedAt: TimeInterval?
 
     var body: some View {
         let labels = ForEach(comments) { comment in
             Text(verbatim: String(comment.singleLineText.prefix(70)))
-                .font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                .font(.system(size: fontSize.points, weight: .semibold)).foregroundStyle(.white)
                 .fixedSize().shadow(color: .black, radius: 1.5, y: 1)
                 .padding(2).tag(comment.id)
         }
+        let lanes = reduceMotion ? 1 : min(3, comments.count)
+        let laneHeight = fontSize.points + 11
         TimelineView(.animation(minimumInterval: reduceMotion ? 0.5 : nil, paused: startedAt == nil)) { _ in
-            let seconds = elapsed + (startedAt.map { CACurrentMediaTime() - $0 } ?? 0)
+            let seconds = elapsed + (startedAt.map { (CACurrentMediaTime() - $0) * scrollSpeed.multiplier } ?? 0)
             Canvas { context, size in
-                guard !comments.isEmpty else { return }
-                let lanes = reduceMotion ? 1 : min(3, comments.count)
+                guard lanes > 0 else { return }
                 let spacing = reduceMotion ? 6.0 : 10.0 / Double(lanes)
                 let latest = Int(seconds / spacing)
                 for index in max(0, latest - lanes + 1)...latest {
@@ -240,14 +259,20 @@ private struct CommentDanmaku: View {
                     let phase = (seconds - Double(index) * spacing) / (spacing * Double(lanes))
                     let entryX = size.width - min(width, 44)
                     let x = reduceMotion ? 12 : entryX - phase * (entryX + width + 12)
-                    let y = CGFloat(index % lanes) * 26
+                    let y = CGFloat(index % lanes) * laneHeight
                     context.draw(label, at: CGPoint(x: x, y: y), anchor: .topLeading)
                 }
             } symbols: { labels }
-            .frame(height: reduceMotion ? 28 : 80).clipped()
+            .frame(height: CGFloat(lanes) * laneHeight + 2).clipped()
         }
         .onChange(of: player, initial: true) { _, _ in alignToVideo() }
-        .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemTimeJumped, object: player.currentItem)) { event in
+        .onChange(of: scrollSpeed) { previousSpeed, _ in
+            guard let start = startedAt else { return }
+            let now = CACurrentMediaTime()
+            elapsed += (now - start) * previousSpeed.multiplier
+            startedAt = now
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemTimeJumped)) { event in
             if let item = event.object as? AVPlayerItem, item === player.currentItem { alignToVideo() }
         }
         .onReceive(player.publisher(for: \.timeControlStatus).removeDuplicates().receive(on: RunLoop.main)) { _ in
@@ -255,7 +280,7 @@ private struct CommentDanmaku: View {
             if player.timeControlStatus == .playing {
                 if startedAt == nil { startedAt = now }
             } else if let start = startedAt {
-                elapsed += now - start
+                elapsed += (now - start) * scrollSpeed.multiplier
                 startedAt = nil
             }
         }
@@ -263,7 +288,7 @@ private struct CommentDanmaku: View {
 
     private func alignToVideo() {
         let seconds = player.currentTime().seconds
-        elapsed = seconds.isFinite && seconds >= 0 && seconds < Double(Int32.max) ? seconds : 0
+        elapsed = seconds.isFinite && seconds >= 0 && seconds < Double(Int32.max) ? seconds * scrollSpeed.multiplier : 0
         startedAt = player.timeControlStatus == .playing ? CACurrentMediaTime() : nil
     }
 }

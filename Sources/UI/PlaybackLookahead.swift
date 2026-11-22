@@ -146,7 +146,7 @@ final class PlaybackLookahead {
     func claim(_ target: PlaybackTarget) -> Task<OpenEpisode, Error> {
         let slot = slots.removeValue(forKey: target.key)
         pause()
-        if slot == nil, let recent = previous, recent.key == target.key {
+        if slot == nil, let recent = previous, canRevisit(target) {
             previous = nil
             recent.episode.renewItemForRevisit()
             return Task {
@@ -163,6 +163,8 @@ final class PlaybackLookahead {
         guard episode.item.status == .readyToPlay else { return }
         previous = (target.key, episode)
     }
+
+    func canRevisit(_ target: PlaybackTarget) -> Bool { previous?.key == target.key && previous?.episode.item.status != .failed }
 
     func pause() {
         generation = UUID()

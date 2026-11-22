@@ -83,19 +83,23 @@ final class PlayerLayerHost: UIView {
         }
     }
 
-    func snapshotDisplayedFrame() -> UIImage? {
+    func snapshotDisplayedFrame(maxDimension: CGFloat? = nil) -> UIImage? {
         guard playerLayer.isReadyForDisplay else { return nil }
         let image: CGImage?
         if #available(iOS 27.0, *) {
-            image = playerLayer.displayedReadOnlyPixelBuffer()?.withUnsafeBuffer { renderFrame($0) }
+            image = playerLayer.displayedReadOnlyPixelBuffer()?.withUnsafeBuffer { renderFrame($0, maxDimension: maxDimension) }
         } else {
-            image = playerLayer.displayedPixelBuffer().flatMap(renderFrame)
+            image = playerLayer.displayedPixelBuffer().flatMap { renderFrame($0, maxDimension: maxDimension) }
         }
         return image.map { UIImage(cgImage: $0) }
     }
 
-    private func renderFrame(_ buffer: CVPixelBuffer) -> CGImage? {
-        let image = CIImage(cvPixelBuffer: buffer).transformed(by: frameTransform)
+    private func renderFrame(_ buffer: CVPixelBuffer, maxDimension: CGFloat?) -> CGImage? {
+        var image = CIImage(cvPixelBuffer: buffer).transformed(by: frameTransform)
+        if let maxDimension, max(image.extent.width, image.extent.height) > maxDimension {
+            let scale = maxDimension / max(image.extent.width, image.extent.height)
+            image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        }
         return Self.imageContext.createCGImage(image, from: image.extent)
     }
 }

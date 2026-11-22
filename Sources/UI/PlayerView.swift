@@ -572,7 +572,7 @@ struct PlayerScreen: View {
     private var sideActions: some View {
         let layout = landscape ? AnyLayout(HStackLayout(spacing: 8)) : AnyLayout(VStackLayout(spacing: 4))
         return layout {
-            FollowDramaButton(selected: library.isFavorite(session.detail.drama)) {
+            FollowDramaButton(seriesID: session.detail.drama.id, selected: library.isFavorite(session.detail.drama)) {
                 library.toggleFavorite(session.detail.drama)
             }.accessibilityIdentifier("player.favorite")
             DiscussionControls(vertical: !landscape) { commentsVisible = true }

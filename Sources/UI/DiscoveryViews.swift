@@ -26,6 +26,7 @@ struct HomeView: View {
                               exit: model.appearance == .immersive ? nil : { feedMode = false }).toolbar(.hidden, for: .navigationBar)
             } else {
                 classicHome.appBackground(model.appearance).tabRoot(model.appearance)
+                    .onAppear { loader.setCoverPrefetchEnabled(true) }
                     .playbackDestination($playbackRequest)
             }
         }
@@ -166,6 +167,7 @@ private struct ImmersiveFeed: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var library: LibraryStore
     @State private var current: String?
+    @State private var direction = 1
     @State private var detailDrama: Drama?
     @State private var playbackRequest: PlaybackRequest?
     @State private var commentsVisible = false
@@ -207,6 +209,10 @@ private struct ImmersiveFeed: View {
                     .scrollIndicators(.hidden)
                     // Anchored at the top so folding or unfolding iPhone Duo keeps the current page whole after the resize.
                     .scrollPosition(id: $current, anchor: .top)
+                    .feedScrollActivity { moving in
+                        preview.setScrolling(moving)
+                        if !moving { syncPreview(); if preview.ended { continueAfterPreview() } }
+                    }
                     .ignoresSafeArea()
                     .accessibilityIdentifier("immersive_feed")
                     if isLast, let banner { endBanner(banner).padding(.top, insets.top + 64) }
@@ -221,18 +227,25 @@ private struct ImmersiveFeed: View {
             detail.episodes.first.map { DiscussionEpisode(seriesID: detail.drama.id, episodeID: $0.id, number: $0.index) }
         }, player: preview.player,
            foreground: visible && scenePhase == .active && model.playback == nil && detailDrama == nil,
+           hideDanmaku: current != nil && preview.dramaID != current,
            presented: $commentsVisible)
         .onChange(of: commentsVisible) { _, shown in if !shown && preview.ended { continueAfterPreview() } }
-        .onChange(of: current) { _, id in loader.anchorID = id; prefetch(); syncPreview() }
+        .onChange(of: current) { old, id in
+            guard let id else { return }
+            if let old, let before = loader.dramas.firstIndex(where: { $0.id == old }),
+               let after = loader.dramas.firstIndex(where: { $0.id == id }) { direction = after < before ? -1 : 1 }
+            loader.anchorID = id
+            syncPreview()
+        }
         // Not swiping on: when episode 1 ends, the drama continues with episode 2 in the full player.
         .onChange(of: preview.ended) { _, ended in if ended { continueAfterPreview() } }
-        .onChange(of: loader.dramas.first?.id) { _, _ in current = loader.dramas.first?.id; syncPreview() }
+        .onChange(of: loader.dramas.first?.id) { _, id in direction = 1; current = id; syncPreview() }
         .onChange(of: loader.dramas.count) { _, _ in syncPreview() }
         .onChange(of: model.speed) { _, _ in syncPreview() }
         .onChange(of: model.quality) { _, _ in syncPreview() }
         // Only the visible, foreground feed plays: pushing a page, switching tab, opening the full player or
         // backgrounding releases the preview, and coming back starts the current page again.
-        .onAppear { visible = true; model.feedOnScreen = true; syncPreview() }
+        .onAppear { loader.setCoverPrefetchEnabled(false); visible = true; model.feedOnScreen = true; syncPreview() }
         .onDisappear { visible = false; model.feedOnScreen = false; model.refreshSystemAppearance(); preview.stop() }
         .onChange(of: model.playback == nil) { _, _ in syncPreview() }
         .onChange(of: detailDrama?.id) { _, _ in syncPreview() }
@@ -244,13 +257,19 @@ private struct ImmersiveFeed: View {
         guard visible, detailDrama == nil, playbackRequest == nil, scenePhase == .active, model.playback == nil,
               loader.dramas.indices.contains(index) else { preview.stop(); return }
         let index = self.index
-        preview.play(loader.dramas[index], quality: model.quality, speed: model.speed,
-                     following: Array(loader.dramas.dropFirst(index + 1).prefix(2)))
+        let neighbors = [direction, direction * 2, -direction].compactMap { step in
+            loader.dramas.indices.contains(index + step) ? loader.dramas[index + step] : nil
+        }
+        let debounce: Bool
+        if #available(iOS 18, *) { debounce = false } else { debounce = true }
+        preview.select(loader.dramas[index], quality: model.quality, speed: model.speed, following: neighbors, debounce: debounce)
+        if !preview.isScrolling { prefetch() }
     }
 
     private func continueAfterPreview() {
         guard visible, !commentsVisible, detailDrama == nil, playbackRequest == nil, model.playback == nil, model.autoNext,
-              let detail = preview.detail, preview.dramaID == detail.drama.id else { return }
+              !preview.isScrolling, loader.dramas.indices.contains(index),
+              let detail = preview.detail, loader.dramas[index].id == detail.drama.id else { return }
         if detail.episodes.count > 1 {
             if let request = preview.handoff(index: 1) { presentPlayback(request) }
         } else if loader.dramas.indices.contains(index + 1) {
@@ -272,7 +291,6 @@ private struct ImmersiveFeed: View {
     }
 
     private func prefetch() {
-        if loader.dramas.indices.contains(index) { loader.preloadCovers(after: loader.dramas[index]) }
         if index >= loader.dramas.count - 3 && loader.hasMore && loader.error == nil && !loader.isLoading { load(true) }
     }
 
@@ -326,6 +344,16 @@ private struct ImmersiveFeed: View {
             if let action = banner.1 { Button(action, action: banner.2).font(.footnote.weight(.semibold)).foregroundStyle(Color(hex: 0xFFC56B)) }
         }.padding(.leading, 16).padding(.trailing, banner.1 == nil ? 16 : 8).frame(minHeight: 40)
             .background(.black.opacity(0.62), in: RoundedRectangle(cornerRadius: 20)).padding(.horizontal, 24)
+    }
+}
+
+private extension View {
+    @ViewBuilder func feedScrollActivity(_ changed: @escaping (Bool) -> Void) -> some View {
+        if #available(iOS 18, *) {
+            onScrollPhaseChange { _, phase in
+                if phase != .tracking { changed(phase != .idle) }
+            }
+        } else { self }
     }
 }
 
@@ -445,7 +473,7 @@ private struct ImmersivePage: View {
     }
 
     private var favoriteButton: some View {
-        FollowDramaButton(selected: library.isFavorite(drama)) {
+        FollowDramaButton(seriesID: drama.id, selected: library.isFavorite(drama)) {
             library.toggleFavorite(drama)
         }
         .accessibilityIdentifier("immersive_favorite_\(index)")

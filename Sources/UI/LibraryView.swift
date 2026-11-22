@@ -72,6 +72,25 @@ struct LocalLibraryGrid: View {
     }
 }
 
+@MainActor
+private enum LibraryCardMetadata {
+    final class Entry {
+        let drama: Drama
+        let expires: Date
+
+        init(_ drama: Drama, age: TimeInterval) {
+            self.drama = drama
+            expires = Date().addingTimeInterval(DramaDetails.freshFor - age)
+        }
+    }
+
+    static let cache: NSCache<NSString, Entry> = {
+        let cache = NSCache<NSString, Entry>()
+        cache.countLimit = 256
+        return cache
+    }()
+}
+
 struct LibraryDramaCard<Content: View>: View {
     let drama: Drama
     var onResolved: ((Drama) -> Void)? = nil
@@ -79,17 +98,28 @@ struct LibraryDramaCard<Content: View>: View {
     @State private var metadata: Drama?
 
     var body: some View {
-        content(drama.replacingMetadata(with: metadata))
+        let key = drama.id as NSString
+        let saved = LibraryCardMetadata.cache.object(forKey: key)
+        content(drama.replacingMetadata(with: metadata ?? saved?.drama))
+            .environment(\.libraryCoverOwner, drama.id)
             .task(id: drama.id) {
+                if let saved = LibraryCardMetadata.cache.object(forKey: key), saved.expires > Date() {
+                    if metadata != saved.drama { metadata = saved.drama }
+                    onResolved?(saved.drama)
+                    return
+                }
                 if let cached = DramaDetails.cached(drama.id) {
-                    metadata = cached.detail.drama
+                    LibraryCardMetadata.cache.setObject(.init(cached.detail.drama, age: cached.age), forKey: key)
+                    if metadata != cached.detail.drama { metadata = cached.detail.drama }
                     if cached.age < DramaDetails.freshFor {
                         onResolved?(cached.detail.drama)
                         return
                     }
                 }
                 guard let detail = try? await DramaDetails.load(drama), !Task.isCancelled, detail.drama.id == drama.id else { return }
-                metadata = detail.drama
+                let age = DramaDetails.cached(drama.id)?.age ?? DramaDetails.freshFor
+                LibraryCardMetadata.cache.setObject(.init(detail.drama, age: age), forKey: key)
+                if metadata != detail.drama { metadata = detail.drama }
                 onResolved?(detail.drama)
             }
     }

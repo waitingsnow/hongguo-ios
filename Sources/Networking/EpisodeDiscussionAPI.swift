@@ -11,9 +11,11 @@ struct EpisodeComment: Identifiable, Equatable, Sendable {
 struct EpisodeCommentPreview: Equatable, Sendable {
     let items: [EpisodeComment]
     let totalCount: Int?
+    var seriesFavoriteCount: Int? = nil
     var previewCount: Int { items.count }
     var hasDisplayableComments: Bool { !items.isEmpty }
     var displayCount: Int? { totalCount ?? (hasDisplayableComments ? previewCount : nil) }
+    var playableDanmakuCount: Int? { hasDisplayableComments || totalCount == 0 ? previewCount : nil }
 }
 
 enum EpisodeDiscussionAPI {
@@ -166,6 +168,8 @@ enum EpisodeDiscussionAPI {
               ProtocolJSON.identifier(ProtocolJSON.dictionary(page["seriesDetail"])["series_id"]) == seriesID,
               ProtocolJSON.identifier(page["vid"]) == episodeID else { throw ReadError.unexpectedPage }
         guard ProtocolJSON.bool(page["isSuccess"], default: true) else { throw ReadError.unsuccessfulPage }
+        let seriesSocial = try? previewFields(page["seriesSocialInfo"])
+        let seriesFavoriteCount = interactionCount(seriesSocial?["series_favorite_count"])
         let social = try previewFields(page["episodeSocialInfo"])
         let preview = try previewFields(social["reviews"])
         let reviews: [Any]
@@ -191,11 +195,15 @@ enum EpisodeDiscussionAPI {
             return EpisodeComment(id: id, text: text, author: author)
         }
         guard reviews.isEmpty || containsTextField else { throw ReadError.unexpectedPage }
-        let rawTotal = preview["total_count"]
-        let isBoolean = (rawTotal as? NSNumber).map { CFGetTypeID($0) == CFBooleanGetTypeID() } ?? false
-        let total = isBoolean ? nil : Int(ProtocolJSON.text(rawTotal))
+        let total = interactionCount(preview["total_count"])
         let validTotal = total.flatMap { count in count >= items.count && (count > 0 || reviews.isEmpty) ? count : nil }
-        return EpisodeCommentPreview(items: items, totalCount: validTotal)
+        return EpisodeCommentPreview(items: items, totalCount: validTotal, seriesFavoriteCount: seriesFavoriteCount)
+    }
+
+    private static func interactionCount(_ value: Any?) -> Int? {
+        if let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() { return nil }
+        guard let count = Int(ProtocolJSON.text(value)), count >= 0 else { return nil }
+        return count
     }
 
     private static func previewFields(_ value: Any?) throws -> [String: Any] {
