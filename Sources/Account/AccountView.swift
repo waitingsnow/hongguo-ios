@@ -174,7 +174,11 @@ struct AccountPosterLists: View {
         LazyVGrid(columns: threePosterColumns, spacing: 16) {
             ForEach(rows, id: \.drama.id) { row in
                 if row.opens {
-                    Button { opening = PosterTarget(drama: row.drama, resume: row.resume) } label: { LibraryPosterCell(drama: row.drama, subtitle: row.subtitle).contentShape(Rectangle()) }.buttonStyle(.plain)
+                    LibraryDramaCard(drama: row.drama) { drama in
+                        Button { opening = PosterTarget(drama: drama, resume: row.resume) } label: {
+                            LibraryPosterCell(drama: drama, subtitle: row.subtitle).contentShape(Rectangle())
+                        }.buttonStyle(.plain)
+                    }
                 } else { LibraryPosterCell(drama: row.drama, subtitle: row.subtitle) }
             }
         }

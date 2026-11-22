@@ -9,6 +9,54 @@ struct AccountStats: Sendable {
 }
 
 enum AccountRules {
+    static func detailMetadata(_ raw: [String: Any], requested: Set<String>) -> [String: Drama] {
+        var result: [String: Drama] = [:]
+        for value in ProtocolJSON.array(raw["data"]) {
+            let row = ProtocolJSON.dictionary(value)
+            guard let id = ProtocolJSON.identifier(row["book_id"]) ?? ProtocolJSON.identifier(row["series_id"]),
+                  requested.contains(id) else { continue }
+            let title = [row["book_name"], row["series_title"]].compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty } ?? ""
+            let cover = posterURL(row["thumb_url"], row["series_cover"], row["series_cover_url"], row["cover"])
+            let metadata = Drama(id: id, title: title, coverURL: cover, summary: ProtocolJSON.text(row["abstract"]),
+                                 episodeCount: max(ProtocolJSON.integer(row["episode_cnt"]), ProtocolJSON.integer(row["episode_count"])))
+            result[id] = result[id]?.replacingMetadata(with: metadata) ?? metadata
+        }
+        return result
+    }
+
+    static func posterURL(_ values: Any?...) -> String {
+        for raw in values {
+            let candidates = (raw as? String).map { [$0 as Any] } ?? ProtocolJSON.array(ProtocolJSON.dictionary(raw)["url_list"])
+            for candidate in candidates {
+                guard let text = candidate as? String else { continue }
+                let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .replacingOccurrences(of: "\\/", with: "/").replacingOccurrences(of: "&amp;", with: "&")
+                if let url = safeImageURL(cleaned) { return url }
+            }
+        }
+        return ""
+    }
+
+    static func mergeHistory(progress: [LibraryEntry], records: [LibraryEntry]) -> [LibraryEntry] {
+        var newest: [String: LibraryEntry] = [:]
+        for entry in progress where newest[entry.id].map({ $0.updatedAt < entry.updatedAt }) ?? true {
+            newest[entry.id] = entry
+        }
+        for record in records {
+            guard var current = newest[record.id], current.updatedAt >= record.updatedAt else {
+                newest[record.id] = record
+                continue
+            }
+            let drama = record.drama
+            let title = drama.title == "剧集" ? "" : drama.title
+            current.drama = current.drama.replacingMetadata(with: Drama(id: drama.id, title: title, coverURL: drama.coverURL,
+                                                                        summary: drama.summary, episodeCount: drama.episodeCount))
+            newest[record.id] = current
+        }
+        return Array(newest.values.sorted { $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt }.prefix(200))
+    }
+
     /// Light `bookshelf/video/list` shelf: ids and times only, newest first. Accounts on this logic get
     /// `data: null` from the older `video/info` read (Android issue #6, 2026-11-11).
     static func favoriteList(_ raw: [String: Any]) throws -> [String] {
@@ -41,11 +89,11 @@ enum AccountRules {
             let row = ProtocolJSON.dictionary(value)
             let video = ProtocolJSON.dictionary(row["video_data"] ?? row["book_data"])
             func first(_ values: Any?...) -> String { values.map { ProtocolJSON.text($0) }.first { !$0.isEmpty } ?? "" }
-            let id = first(video["series_id"], row["series_id"], row["book_id"]), title = first(row["series_title"], video["title"], row["book_name"])
-            guard !video.isEmpty, ProtocolJSON.identifier(id) != nil, !title.isEmpty, seen.insert(id).inserted else { continue }
+            let id = first(video["series_id"], row["series_id"], row["book_id"]), title = first(row["series_title"], video["series_title"], row["book_name"], video["book_name"])
+            guard !video.isEmpty, ProtocolJSON.identifier(id) != nil, seen.insert(id).inserted else { continue }
             let count = [video["episode_cnt"], video["episode_count"], row["episode_cnt"]].map { ProtocolJSON.integer($0) }.first { $0 > 0 } ?? 0
             let liked = Int64(ProtocolJSON.integer(video["user_digg_timestamp_ms"]))
-            let drama = Drama(id: id, title: title, coverURL: first(row["series_cover_url"], video["cover"], video["cover_url"], video["thumb_url"]).replacingOccurrences(of: "\\/", with: "/"),
+            let drama = Drama(id: id, title: title.isEmpty ? "剧集 \(id)" : title, coverURL: posterURL(row["series_cover_url"], video["series_cover"], video["cover"], video["cover_url"], video["thumb_url"]),
                               summary: first(row["series_intro"], video["video_desc"]), episodeCount: count)
             rows.append((drama, liked > 0 ? liked : Int64(ProtocolJSON.integer(video["create_time"])) * 1000))
         }
@@ -64,7 +112,7 @@ enum AccountRules {
             var stamp = Double(first(row["read_timestamp_ms"], row["last_watch_time"])) ?? 0
             if stamp > 1e10 { stamp /= 1000 }
             let title = first(row["series_title"], row["book_name"]), position = max(0, Double(first(row["current_play_position"], row["current_play_time"])) ?? 0) / 1000
-            let drama = Drama(id: id, title: title.isEmpty ? "剧集" : title, coverURL: first(row["series_cover_url"], row["thumb_url"], row["cover"]).replacingOccurrences(of: "\\/", with: "/"),
+            let drama = Drama(id: id, title: title.isEmpty ? "剧集" : title, coverURL: posterURL(row["series_cover_url"], row["series_cover"], row["thumb_url"], row["cover"]),
                               summary: "", episodeCount: max(0, [row["episode_cnt"], row["episode_count"]].map { ProtocolJSON.integer($0) }.first { $0 > 0 } ?? 0))
             let entry = LibraryEntry(drama: drama, episodeID: episode, episodeIndex: max(1, ProtocolJSON.integer(row["vid_index"])), position: position, updatedAt: Date(timeIntervalSince1970: stamp))
             if let current = newest[id], current.updatedAt >= entry.updatedAt { continue }

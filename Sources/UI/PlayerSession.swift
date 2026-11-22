@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Combine
+import OSLog
 import UIKit
 
 /// One drama's playback. A single `AVPlayer` lives for the whole session and episodes swap its item, so the picture
@@ -9,12 +10,13 @@ import UIKit
 @MainActor
 final class PlayerSession: ObservableObject {
     private static let tracingPlayback = ProcessInfo.processInfo.arguments.contains("--trace-playback")
+    private static let logger = Logger(subsystem: "Hongguo", category: "playback")
 
     private func trace(_ event: @autoclosure () -> String) {
         guard Self.tracingPlayback else { return }
         let entries = (player as? AVQueuePlayer)?.items().count ?? 0
         let message = "\(Date().timeIntervalSince1970) playback \(event()) episode=\(episode.index) queue=\(entries) rate=\(player?.rate ?? 0) size=\(videoSize)\n"
-        FileHandle.standardError.write(Data(message.utf8))
+        Self.logger.info("\(message, privacy: .public)")
     }
 
     let detail: DramaDetail
@@ -76,6 +78,7 @@ final class PlayerSession: ObservableObject {
     private var sessionNotifications: [NSObjectProtocol] = []
     private var stopped = false
     private var lastSave = Date.distantPast
+    private var sessionPositions: [String: Double] = [:]
     private var pausedByRequest = false
     private var resumeAfterInterruption = false
     /// Silent reloads from the current position after a playback failure, per episode.
@@ -83,6 +86,7 @@ final class PlayerSession: ObservableObject {
     private static let maximumRecoveries = 2
     /// Where the current item started, so the first advance of time counts as a shown frame.
     private var startPosition: Double = 0
+    private var positioning = false
     /// Set by the player screen: episode changes slide like a page instead of cutting. Cleared on stop to break the cycle.
     var onSlide: (@MainActor (Int) -> Void)?
     var onSeasonPlayback: (@MainActor (PlaybackRequest) -> Void)?
@@ -215,6 +219,9 @@ final class PlayerSession: ObservableObject {
         let destination = PlaybackTarget(detail, index: target, quality: chosen)
         let queuedNext = target == index + 1 && chosen == quality ? stagedEpisodes.first?.item : nil
         let opening = lookahead.claim(destination)
+        if target != index, rendered, error == nil, let currentEpisode {
+            lookahead.rememberForRevisit(currentEpisode, target: PlaybackTarget(detail, index: index, quality: quality))
+        }
         transitionFrame = PlaybackLookahead.frame(destination)
         detachItem(keeping: queuedNext)
         if target != index, stopsAtEpisodeEnd { clearSleepTimer() }
@@ -229,7 +236,9 @@ final class PlayerSession: ObservableObject {
                 self.transitionFrame = PlaybackLookahead.frame(destination)
             }
         }
-        let saved = startAt ?? (recordsLocalHistory ? app.library.progress(for: detail.drama.id).flatMap { $0.episodeID == nextEpisode.id ? $0.position : nil } : nil) ?? 0
+        let saved = startAt ?? sessionPositions[nextEpisode.id]
+            ?? (recordsLocalHistory ? app.library.position(for: detail.drama.id, episodeID: nextEpisode.id) : nil) ?? 0
+        positioning = false
         position = saved; duration = 0; previewPosition = saved
         preparing = true; stage = "正在准备播放"; progress = 0; error = nil
         rendered = false; endMessage = nil; holding = false; videoSize = .zero; scrubbing = false; finished = false
@@ -324,10 +333,13 @@ final class PlayerSession: ObservableObject {
         retiringEpisode = nil
         player.defaultRate = playbackSpeed
         if startAt > 0.5 && !continuing {
+            positioning = true
             player.seek(to: CMTime(seconds: startAt, preferredTimescale: 600), toleranceBefore: CMTime(seconds: 0.5, preferredTimescale: 600), toleranceAfter: .zero) { [weak self] _ in
                 Task { @MainActor in
-                guard let self, self.playID == ticket, !self.stopped, !self.pausedByRequest,
-                          !self.pauseIfSleepTimerExpired(), !self.pausedBySleepTimer else { return }
+                    guard let self, self.playID == ticket, !self.stopped else { return }
+                    self.positioning = false
+                    if self.rendered { self.recordFirstFrame() }
+                    guard !self.pausedByRequest, !self.pauseIfSleepTimerExpired(), !self.pausedBySleepTimer else { return }
                     self.player?.playImmediately(atRate: self.playbackSpeed)
                 }
             }
@@ -355,7 +367,7 @@ final class PlayerSession: ObservableObject {
         let didAdvance = adoptQueuedEpisodeIfNeeded()
         finishPendingItemEnd()
         guard let player, let item = currentPlaybackItem, player.currentItem === item,
-              !stopped, !preparing, !finished else { return }
+              !stopped, !preparing, !finished, !positioning else { return }
         let now = player.currentTime().seconds
         if now.isFinite { position = max(0, now) }
         let total = item.duration.seconds
@@ -403,11 +415,14 @@ final class PlayerSession: ObservableObject {
             frameTask?.cancel()
             frameTask = Task(priority: .utility) { await PlaybackLookahead.capture(episode, target: target) }
         }
-        if recordsLocalHistory {
-            let value = player.currentTime().seconds
-            app.library.record(drama: detail.drama, episode: episode, position: value.isFinite ? max(0, value) : position)
-            app.library.flush()
-        }
+        if !positioning { recordFirstFrame() }
+    }
+
+    private func recordFirstFrame() {
+        guard recordsLocalHistory, let player else { return }
+        let value = player.currentTime().seconds
+        app.library.record(drama: detail.drama, episode: episode, position: value.isFinite ? max(0, value) : position)
+        app.library.flush()
     }
 
     func firstFrame(for item: AVPlayerItem) -> UUID? {
@@ -523,12 +538,12 @@ final class PlayerSession: ObservableObject {
             if target == index { toggle() }
             else {
                 pausedBySleepTimer = false
-                load(index: target, startAt: 0)
+                load(index: target)
             }
             return
         }
         guard target != index else { return }
-        if let onSlide { onSlide(target) } else { load(index: target, startAt: 0) }
+        if let onSlide { onSlide(target) } else { load(index: target) }
     }
     func retry() {
         guard !stopped, !pauseIfSleepTimerExpired() else { return }
@@ -556,6 +571,7 @@ final class PlayerSession: ObservableObject {
     func preferencesChanged() { prepareUpcomingIfReady() }
 
     private func recordCompletion() {
+        sessionPositions[episode.id] = 0
         let itemDuration = currentPlaybackItem?.duration.seconds ?? 0
         let total = itemDuration.isFinite && itemDuration > 0 ? itemDuration : duration
         if rendered { AccountService.shared.observePlayback(drama: detail.drama, episode: episode, position: total, duration: total, token: accountToken, force: true) }
@@ -578,6 +594,7 @@ final class PlayerSession: ObservableObject {
         trace("native-advance target=\(nextIndex + 1) nextSize=\(item.presentationSize) nextDuration=\(item.duration.seconds) successorStaged=\(successor != nil) successorStatus=\(successor.map { String($0.status.rawValue) } ?? "none")")
         recordCompletion()
         removeItemObservers()
+        if let currentEpisode { lookahead.rememberForRevisit(currentEpisode, target: PlaybackTarget(detail, index: index, quality: quality)) }
         frameTask?.cancel(); frameTask = nil
         endHold()
         currentEpisode = next
@@ -713,9 +730,10 @@ final class PlayerSession: ObservableObject {
     }
 
     private func saveProgress(flush: Bool = false) {
-        guard rendered, !finished, let item = currentPlaybackItem, player?.currentItem === item else { return }
+        guard rendered, !finished, !positioning, let item = currentPlaybackItem, player?.currentItem === item else { return }
         let value = player?.currentTime().seconds ?? position
         let current = value.isFinite ? max(0, value) : position
+        sessionPositions[episode.id] = current
         if recordsLocalHistory {
             app.library.updatePosition(dramaID: detail.drama.id, episodeID: episode.id, position: current)
             if flush { app.library.flush() }

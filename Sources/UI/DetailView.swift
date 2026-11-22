@@ -54,7 +54,7 @@ struct DetailView: View {
             }.padding(20).padding(.bottom, 12)
         }.appBackground(model.appearance).navigationTitle("剧集详情").navigationBarTitleDisplayMode(.inline)
             .toolbar(.visible, for: .navigationBar)
-            .background(InteractiveBackSwipe(enabled: true))
+            .secondaryPage()
             .playbackDestination($playbackRequest)
             .safeAreaInset(edge: .bottom) {
                 if let detail, !detail.episodes.isEmpty {

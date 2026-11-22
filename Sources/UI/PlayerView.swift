@@ -202,7 +202,7 @@ struct PlayerScreen: View {
             .background(InteractiveBackSwipe(enabled: inlineForeground && !landscape && !locked && !sheetVisible
                                              && !dragging && !sliding && !session.scrubbing && !session.holding))
             .navigationDestination(isPresented: $detailVisible) {
-                DetailView(drama: session.detail.drama).toolbar(.hidden, for: .tabBar)
+                DetailView(drama: session.detail.drama)
             }
             .onChange(of: detailVisible) { _, shown in if !shown { detailClosed() } }
             .onAppear { if !detailVisible { session.app.showPlayback(request) } }
@@ -515,7 +515,7 @@ struct PlayerScreen: View {
     /// Autoplay, buttons and the episode sheet slide the same way a swipe does. Touches are off until the slide ends.
     private func slide(to target: Int) {
         guard !sliding, !dragging, target != session.index, session.detail.episodes.indices.contains(target) else { return }
-        if landscape || !inlineForeground { session.load(index: target, startAt: 0); return }
+        if landscape || !inlineForeground { session.load(index: target); return }
         commitSlide(to: target)
     }
 
@@ -527,7 +527,7 @@ struct PlayerScreen: View {
             var transaction = Transaction(); transaction.disablesAnimations = true
             withTransaction(transaction) {
                 if session.playID == origin, !session.pausedBySleepTimer {
-                    session.load(index: target, startAt: 0)
+                    session.load(index: target)
                 }
                 dragOffset = 0; slideTarget = nil; sliding = false
             }

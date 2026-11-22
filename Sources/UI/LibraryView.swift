@@ -56,17 +56,42 @@ struct LocalLibraryGrid: View {
     }
 
     private func libraryCell(_ entry: LibraryEntry) -> some View {
-        Button { model.play(entry.drama) { playbackRequest = $0 } } label: {
-            LibraryPosterCell(drama: entry.drama, subtitle: entry.episodeIndex > 0 ? "第 \(entry.episodeIndex) 集 · \(timeLabel(entry.position))" : nil).contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .overlay(alignment: .topTrailing) {
-            if editing {
-                Button(role: .destructive) { if favorites { library.removeFavorite(id: entry.id) } else { library.removeHistory(id: entry.id) } } label: {
-                    Image(systemName: "minus.circle.fill").font(.title3).symbolRenderingMode(.palette).foregroundStyle(.white, .red).frame(width: 44, height: 44)
-                }.accessibilityLabel(favorites ? "取消收藏\(entry.drama.title)" : "删除\(entry.drama.title)的记录")
+        LibraryDramaCard(drama: entry.drama, onResolved: library.updateDramaMetadata) { drama in
+            Button { model.play(drama) { playbackRequest = $0 } } label: {
+                LibraryPosterCell(drama: drama, subtitle: entry.episodeIndex > 0 ? "第 \(entry.episodeIndex) 集 · \(timeLabel(entry.position))" : nil).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .overlay(alignment: .topTrailing) {
+                if editing {
+                    Button(role: .destructive) { if favorites { library.removeFavorite(id: entry.id) } else { library.removeHistory(id: entry.id) } } label: {
+                        Image(systemName: "minus.circle.fill").font(.title3).symbolRenderingMode(.palette).foregroundStyle(.white, .red).frame(width: 44, height: 44)
+                    }.accessibilityLabel(favorites ? "取消收藏\(drama.title)" : "删除\(drama.title)的记录")
+                }
             }
         }
+    }
+}
+
+struct LibraryDramaCard<Content: View>: View {
+    let drama: Drama
+    var onResolved: ((Drama) -> Void)? = nil
+    @ViewBuilder var content: (Drama) -> Content
+    @State private var metadata: Drama?
+
+    var body: some View {
+        content(drama.replacingMetadata(with: metadata))
+            .task(id: drama.id) {
+                if let cached = DramaDetails.cached(drama.id) {
+                    metadata = cached.detail.drama
+                    if cached.age < DramaDetails.freshFor {
+                        onResolved?(cached.detail.drama)
+                        return
+                    }
+                }
+                guard let detail = try? await DramaDetails.load(drama), !Task.isCancelled, detail.drama.id == drama.id else { return }
+                metadata = detail.drama
+                onResolved?(detail.drama)
+            }
     }
 }
 

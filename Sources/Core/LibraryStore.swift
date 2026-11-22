@@ -5,17 +5,25 @@ import Combine
 @MainActor
 final class LibraryStore: ObservableObject {
     static let shared = LibraryStore()
+    private static let previousEpisodeLimit = 32
     @Published private(set) var favorites: [LibraryEntry] = []
     @Published private(set) var history: [LibraryEntry] = []
     @Published private(set) var storageError: String?
     @Published private(set) var storageLocked = false
     private let fileURL: URL
     private var lastWrite = Date.distantPast
+    private var previousEpisodes: [String: [EpisodePosition]] = [:]
+
+    private struct EpisodePosition: Codable {
+        let id: String
+        let position: Double
+    }
 
     private struct Snapshot: Codable {
         var version: Int = 1
         var favorites: [LibraryEntry]
         var history: [LibraryEntry]
+        var previousEpisodes: [String: [EpisodePosition]]? = nil
     }
 
     init(directory: URL? = nil) {
@@ -35,6 +43,14 @@ final class LibraryStore: ObservableObject {
                 let snapshot = try JSONDecoder().decode(Snapshot.self, from: data)
                 favorites = normalized(snapshot.favorites)
                 history = normalized(snapshot.history)
+                previousEpisodes = [:]
+                for entry in history {
+                    let positions = snapshot.previousEpisodes?[entry.id] ?? []
+                    let valid = positions.lazy.filter {
+                        !$0.id.isEmpty && $0.id.count <= 128 && $0.position.isFinite && $0.position >= 0
+                    }.prefix(Self.previousEpisodeLimit)
+                    if !valid.isEmpty { previousEpisodes[entry.id] = Array(valid) }
+                }
             }
             storageLocked = false; storageError = nil
         } catch {
@@ -63,15 +79,45 @@ final class LibraryStore: ObservableObject {
         guard !drama.id.isEmpty, !episode.id.isEmpty, position.isFinite else { return }
         let entry = LibraryEntry(drama: drama, episodeID: episode.id, episodeIndex: episode.index,
                                  position: max(0, position), updatedAt: Date())
+        if let previous = history.first(where: { $0.id == drama.id }), !previous.episodeID.isEmpty, previous.episodeID != episode.id {
+            var positions = previousEpisodes[drama.id] ?? []
+            positions.removeAll { $0.id == previous.episodeID || $0.id == episode.id }
+            positions.insert(EpisodePosition(id: previous.episodeID, position: previous.position), at: 0)
+            previousEpisodes[drama.id] = Array(positions.prefix(Self.previousEpisodeLimit))
+        }
         history.removeAll { $0.id == drama.id }
         history.insert(entry, at: 0)
         history = normalized(history)
+        if history.count == 200 && !previousEpisodes.isEmpty {
+            let retained = Set(history.map(\.id))
+            previousEpisodes = previousEpisodes.filter { retained.contains($0.key) }
+        }
         if let index = favorites.firstIndex(where: { $0.id == drama.id }) { favorites[index] = entry }
         if Date().timeIntervalSince(lastWrite) >= 2 { save() }
     }
 
     func progress(for dramaID: String) -> LibraryEntry? {
         history.first { $0.id == dramaID } ?? favorites.first { $0.id == dramaID }
+    }
+
+    func position(for dramaID: String, episodeID: String) -> Double? {
+        if let entry = history.first(where: { $0.id == dramaID && $0.episodeID == episodeID }) { return entry.position }
+        if let position = previousEpisodes[dramaID]?.first(where: { $0.id == episodeID })?.position { return position }
+        return favorites.first { $0.id == dramaID && $0.episodeID == episodeID }?.position
+    }
+
+    func updateDramaMetadata(_ metadata: Drama) {
+        guard !storageLocked else { return }
+        var changed = false
+        if let index = favorites.firstIndex(where: { $0.id == metadata.id }) {
+            let drama = favorites[index].drama.replacingMetadata(with: metadata)
+            if drama != favorites[index].drama { favorites[index].drama = drama; changed = true }
+        }
+        if let index = history.firstIndex(where: { $0.id == metadata.id }) {
+            let drama = history[index].drama.replacingMetadata(with: metadata)
+            if drama != history[index].drama { history[index].drama = drama; changed = true }
+        }
+        if changed { save() }
     }
     func updatePosition(dramaID: String, episodeID: String, position: Double) {
         guard !storageLocked else { return }
@@ -84,9 +130,9 @@ final class LibraryStore: ObservableObject {
         }
         if Date().timeIntervalSince(lastWrite) >= 2 { save() }
     }
-    func removeHistory(id: String) { guard !storageLocked else { return }; history.removeAll { $0.id == id }; save() }
+    func removeHistory(id: String) { guard !storageLocked else { return }; history.removeAll { $0.id == id }; previousEpisodes.removeValue(forKey: id); save() }
     func removeFavorite(id: String) { guard !storageLocked else { return }; favorites.removeAll { $0.id == id }; save() }
-    func clearHistory() { guard !storageLocked else { return }; history.removeAll(); save() }
+    func clearHistory() { guard !storageLocked else { return }; history.removeAll(); previousEpisodes.removeAll(); save() }
     func clearFavorites() { guard !storageLocked else { return }; favorites.removeAll(); save() }
     func flush() { save() }
 
@@ -100,7 +146,7 @@ final class LibraryStore: ObservableObject {
     private func save() {
         guard !storageLocked else { return }
         do {
-            let data = try JSONEncoder().encode(Snapshot(favorites: favorites, history: history))
+            let data = try JSONEncoder().encode(Snapshot(favorites: favorites, history: history, previousEpisodes: previousEpisodes))
             try data.write(to: fileURL, options: .atomic)
             lastWrite = Date()
             storageError = nil

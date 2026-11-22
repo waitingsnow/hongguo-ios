@@ -28,7 +28,9 @@ private func fixtureEpisode(_ number: Int = 1) -> Episode {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: root) }
             try persistenceAndRealProgress(root.appendingPathComponent("persistence"))
+            try episodeRevisits(root.appendingPathComponent("episode-revisits"))
             try listIndependenceAndLateCallbacks(root.appendingPathComponent("independence"))
+            try updateListMetadata(root.appendingPathComponent("metadata"))
             try boundedLists(root.appendingPathComponent("bounded"))
             try corruptFiles(root.appendingPathComponent("corrupt"))
             try cryptoVectorsAndRoundTrips()
@@ -37,6 +39,28 @@ private func fixtureEpisode(_ number: Int = 1) -> Episode {
             print("FAIL: \(error)")
             exit(1)
         }
+    }
+
+    @MainActor private static func updateListMetadata(_ root: URL) throws {
+        let store = LibraryStore(directory: root), saved = fixtureDrama(9), other = fixtureDrama(10)
+        store.toggleFavorite(saved)
+        store.record(drama: saved, episode: fixtureEpisode(3), position: 32)
+        store.toggleFavorite(other)
+        let favorite = store.favorites[1], history = store.history[0]
+        let detail = Drama(id: saved.id, title: "详情剧名", coverURL: "https://example.invalid/canonical.jpg", summary: "", episodeCount: 0)
+        store.updateDramaMetadata(detail)
+        var expectedFavorite = favorite, expectedHistory = history
+        let expected = Drama(id: saved.id, title: detail.title, coverURL: detail.coverURL, summary: saved.summary, episodeCount: saved.episodeCount)
+        expectedFavorite.drama = expected; expectedHistory.drama = expected
+        let reloaded = LibraryStore(directory: root)
+        try expect(reloaded.favorites.map(\.id) == [other.id, saved.id] && reloaded.favorites[0].drama == other
+                   && reloaded.favorites[1] == expectedFavorite && reloaded.history == [expectedHistory],
+                   "List metadata repair must persist without changing progress, order or unrelated rows")
+        try expect(saved.replacingMetadata(with: other) == saved, "Metadata for another ID must never replace a record")
+        store.removeHistory(id: saved.id); store.removeFavorite(id: saved.id)
+        store.updateDramaMetadata(detail)
+        try expect(store.history.isEmpty && store.favorites.map(\.id) == [other.id], "Late metadata must not restore removed entries")
+        print("PASS: existing local favorite and history summaries repaired without changing progress, order or deleted entries")
     }
 
     @MainActor private static func persistenceAndRealProgress(_ root: URL) throws {
@@ -77,6 +101,30 @@ private func fixtureEpisode(_ number: Int = 1) -> Episode {
         try expect(store.history[0].drama == drama && store.history[0].episodeID == episode.id && store.history[0].position == 47.25,
                    "Child must preserve IDs, metadata, episode and latest playback position")
         try expect(store.favorites[0] == store.history[0], "Favorite and history must carry matching persisted progress")
+    }
+
+    @MainActor private static func episodeRevisits(_ root: URL) throws {
+        let store = LibraryStore(directory: root), drama = fixtureDrama(1), other = fixtureDrama(2)
+        let first = fixtureEpisode(1), second = fixtureEpisode(2), third = fixtureEpisode(3)
+        store.record(drama: drama, episode: first, position: 12)
+        store.updatePosition(dramaID: drama.id, episodeID: first.id, position: 28)
+        store.record(drama: drama, episode: second, position: 9)
+        store.updatePosition(dramaID: drama.id, episodeID: first.id, position: 999)
+        store.record(drama: other, episode: first, position: 5)
+        store.flush()
+        let restarted = LibraryStore(directory: root)
+        try expect(restarted.position(for: drama.id, episodeID: first.id) == 28, "Previous episode must retain its own position after relaunch")
+        try expect(restarted.position(for: other.id, episodeID: first.id) == 5, "One drama must not take another's position")
+        try expect(restarted.position(for: drama.id, episodeID: third.id) == nil, "An unwatched episode must not inherit another episode's position")
+        restarted.record(drama: drama, episode: first, position: 28)
+        restarted.updatePosition(dramaID: drama.id, episodeID: first.id, position: 0)
+        restarted.record(drama: drama, episode: third, position: 1)
+        try expect(restarted.position(for: drama.id, episodeID: first.id) == 0, "A completed episode must restart instead of resuming the old position")
+        try expect(restarted.position(for: drama.id, episodeID: second.id) == 9, "Returning to episode 1 must preserve episode 2")
+        restarted.removeHistory(id: drama.id)
+        restarted.updatePosition(dramaID: drama.id, episodeID: first.id, position: 32)
+        try expect(LibraryStore(directory: root).position(for: drama.id, episodeID: first.id) == nil, "Deleted history must remove old episode positions")
+        print("PASS: per-episode revisit positions persist, remain isolated, respect completion and clear with history")
     }
 
     @MainActor private static func listIndependenceAndLateCallbacks(_ root: URL) throws {

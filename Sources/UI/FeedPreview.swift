@@ -37,11 +37,19 @@ final class FeedPreview: ObservableObject {
     @Published private(set) var speedLocked = false
     private var episode: OpenEpisode?
     var detail: DramaDetail? { episode?.detail }
+    private let library: LibraryStore
+    private var recentPositions: [(dramaID: String, episodeID: String, position: Double)] = []
+    private let recentFrames = NSCache<NSString, UIImage>()
+    private var restoringPosition = false
     private var quality: VideoQuality = .p1080
     private var speed: Float = 1
     private var following: [Drama] = []
     private var lookahead: PlaybackLookahead
-    init(lookahead: PlaybackLookahead? = nil) { self.lookahead = lookahead ?? PlaybackLookahead() }
+    init(lookahead: PlaybackLookahead? = nil, library: LibraryStore? = nil) {
+        self.lookahead = lookahead ?? PlaybackLookahead()
+        self.library = library ?? .shared
+        recentFrames.totalCostLimit = 16 * 1024 * 1024
+    }
     private var task: Task<Void, Never>?
     private var frameTask: Task<Void, Never>?
     private weak var layerHost: PlayerLayerHost?
@@ -58,12 +66,15 @@ final class FeedPreview: ObservableObject {
         self.speed = speed
         self.following = Array(following.prefix(2))
         if dramaID == drama.id, self.quality == quality, !failed {
-            if rateChanged && !paused && !ended { player?.defaultRate = playbackSpeed; player?.rate = playbackSpeed }
+            if rateChanged && !paused && !ended && !restoringPosition { player?.defaultRate = playbackSpeed; player?.rate = playbackSpeed }
             schedule()
             return
         }
         let target = PlaybackTarget(drama, quality: quality)
         let opening = lookahead.claim(target)
+        if rendered, !failed, let episode {
+            lookahead.rememberForRevisit(episode, target: PlaybackTarget(episode.detail, index: 0, quality: self.quality))
+        }
         resetPlayer()
         self.quality = quality
         dramaID = drama.id
@@ -74,7 +85,8 @@ final class FeedPreview: ObservableObject {
                 let episode = try await withTaskCancellationHandler(operation: { try await opening.value }, onCancel: { opening.cancel() })
                 guard let self, self.ticket == ticket, !Task.isCancelled else { return }
                 self.episode = episode
-                self.install(episode.item, ticket: ticket)
+                try await self.install(episode.item, startAt: self.savedPosition(for: episode.detail), ticket: ticket)
+                guard self.ticket == ticket, !Task.isCancelled else { return }
                 if let present = self.pendingPresentation, let request = self.handoff(index: 0) { present(request) }
             } catch {
                 guard let self, self.ticket == ticket, !Task.isCancelled else { return }
@@ -85,7 +97,13 @@ final class FeedPreview: ObservableObject {
         }
     }
 
-    private func install(_ item: AVPlayerItem, ticket: UUID) {
+    private func savedPosition(for detail: DramaDetail) -> Double {
+        guard let episodeID = detail.episodes.first?.id else { return 0 }
+        return recentPositions.first { $0.dramaID == detail.drama.id && $0.episodeID == episodeID }?.position
+            ?? library.position(for: detail.drama.id, episodeID: episodeID) ?? 0
+    }
+
+    private func install(_ item: AVPlayerItem, startAt: Double, ticket: UUID) async throws {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         try? AVAudioSession.sharedInstance().setActive(true)
         let player = AVQueuePlayer(items: [item])
@@ -103,7 +121,21 @@ final class FeedPreview: ObservableObject {
         endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
             Task { @MainActor in guard let self, self.ticket == ticket else { return }; self.holding = false; self.ended = true; self.paused = true }
         }
+        restoringPosition = startAt > 0.5
         self.player = player
+        if restoringPosition {
+            let duration = try await item.asset.load(.duration).seconds
+            try Task.checkCancellation()
+            guard self.ticket == ticket else { return }
+            if duration.isFinite && startAt < duration - 0.5 {
+                await player.seek(to: CMTime(seconds: startAt, preferredTimescale: 600),
+                                  toleranceBefore: CMTime(seconds: 0.5, preferredTimescale: 600), toleranceAfter: .zero)
+            }
+            try Task.checkCancellation()
+            guard self.ticket == ticket else { return }
+            restoringPosition = false
+            if let layerHost, layerHost.playerLayer.isReadyForDisplay { markRendered(player, host: layerHost) }
+        }
         player.defaultRate = playbackSpeed
         player.playImmediately(atRate: playbackSpeed)
     }
@@ -120,7 +152,7 @@ final class FeedPreview: ObservableObject {
 
     func markRendered(_ player: AVPlayer, host: PlayerLayerHost? = nil) {
         if self.player === player, let host { layerHost = host }
-        guard self.player === player, !rendered, let episode else { return }
+        guard self.player === player, !restoringPosition, !rendered, let episode else { return }
         rendered = true
         schedule()
         let target = PlaybackTarget(episode.detail, index: 0, quality: quality)
@@ -128,7 +160,8 @@ final class FeedPreview: ObservableObject {
     }
 
     func firstFrame(for drama: Drama, quality: VideoQuality) -> UIImage? {
-        PlaybackLookahead.frame(PlaybackTarget(drama, quality: quality))
+        let target = PlaybackTarget(drama, quality: quality)
+        return recentFrames.object(forKey: target.key as NSString) ?? PlaybackLookahead.frame(target)
     }
 
     func restoreFirstFrame(for drama: Drama, quality: VideoQuality) async {
@@ -138,7 +171,7 @@ final class FeedPreview: ObservableObject {
     }
 
     func handoff(index: Int) -> PlaybackRequest? {
-        guard let episode, episode.detail.episodes.indices.contains(index), let player else { return nil }
+        guard !restoringPosition, let episode, episode.detail.episodes.indices.contains(index), let player else { return nil }
         let live = index == 0 && !ended
         let handoff = FeedHandoff(lookahead: lookahead, live: live ? (player, episode) : nil, speedLocked: speedLocked)
         if live { handoff.displayedFrame = layerHost?.snapshotDisplayedFrame() }
@@ -179,13 +212,24 @@ final class FeedPreview: ObservableObject {
     }
     func toggle() {
         endHold()
-        guard let player, !ended else { return }
+        guard let player, !ended, !restoringPosition else { return }
         if paused { episode?.stream.resume(); player.playImmediately(atRate: playbackSpeed) }
         else { player.pause(); episode?.stream.pause(); lookahead.pause() }
         paused.toggle()
     }
 
     private func resetPlayer(keepPlaying: Bool = false) {
+        if rendered, let detail, let episodeID = detail.episodes.first?.id {
+            recentPositions.removeAll { $0.dramaID == detail.drama.id && $0.episodeID == episodeID }
+            recentPositions.insert((detail.drama.id, episodeID, ended ? 0 : position), at: 0)
+            if recentPositions.count > 32 { recentPositions.removeLast() }
+            let target = PlaybackTarget(detail, index: 0, quality: quality)
+            let key = target.key as NSString
+            if ended { recentFrames.removeObject(forKey: key) }
+            else if !keepPlaying, let frame = layerHost?.snapshotDisplayedFrame(), let image = frame.cgImage {
+                recentFrames.setObject(frame, forKey: key, cost: image.bytesPerRow * image.height)
+            }
+        }
         layerHost = nil
         pendingPresentation = nil; awaitingHandoff = false
         ticket = UUID(); task?.cancel(); task = nil; frameTask?.cancel(); frameTask = nil
@@ -194,7 +238,7 @@ final class FeedPreview: ObservableObject {
         if let periodic { player?.removeTimeObserver(periodic) }; periodic = nil
         if !keepPlaying { player?.pause(); player?.replaceCurrentItem(with: nil) }
         player = nil; episode = nil; dramaID = nil; rendered = false; paused = false
-        ended = false; failed = false; holding = false; speedLocked = false
+        ended = false; failed = false; holding = false; speedLocked = false; restoringPosition = false
     }
     func stop() { resetPlayer(); lookahead.clear() }
 }

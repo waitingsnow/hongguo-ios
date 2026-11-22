@@ -18,6 +18,7 @@ private actor FixtureServer {
         return MediaRangeReply(data: data.subdata(in: range.lowerBound..<min(range.upperBound, data.count)), total: data.count)
     }
     func requested() -> [Range<Int>] { requests }
+    func requestCount() -> Int { requests.count }
     func setDelay(_ value: UInt64) { delay = value }
 }
 
@@ -68,9 +69,9 @@ private func check(_ condition: Bool, _ label: String) throws {
 
         await source.setPaused(true)
         let cancelledRead = Task { try await source.read(at: fixture.offsets[120], count: 64) }
-        let beforePause = await server.requested().count
+        let beforePause = await server.requestCount()
         try await Task.sleep(nanoseconds: 50_000_000)
-        let afterPause = await server.requested().count
+        let afterPause = await server.requestCount()
         try check(beforePause == afterPause, "Pause continued requesting new ranges")
         cancelledRead.cancel()
         do { _ = try await cancelledRead.value; throw NSError(domain: "CancelledReadAccepted", code: 1) } catch is CancellationError { }
@@ -79,15 +80,16 @@ private func check(_ condition: Bool, _ label: String) throws {
         try check(resumed == fixture.clear.subdata(in: fixture.offsets[120]..<(fixture.offsets[120] + 64)), "Resume returned wrong data")
         playback.close(); await source.close()
 
+        try await sparseRevisit(fixture: fixture, track: track, cache: cache)
         try await playerChecks(fixture: fixture, track: track, cache: cache)
         try await progressiveReadAheadChecks(fixture: fixture, track: track, root: base.appendingPathComponent("read-ahead"))
 
         // A new owner must reuse verified disk blocks, without relying on the previous actor's memory.
         let server2 = FixtureServer(fixture.encrypted)
         let reopened = try await ProgressiveSource.open(track: track, episodeID: "test", cache: cache, fetch: { try await server2.fetch($0) }, readAhead: 0)
-        let countBefore = await server2.requested().count
+        let countBefore = await server2.requestCount()
         _ = try await reopened.read(at: fixture.offsets[90] + 7, count: 100)
-        let countAfter = await server2.requested().count
+        let countAfter = await server2.requestCount()
         try check(countBefore == countAfter, "Verified cached ranges were downloaded again")
         await reopened.close()
         print("PASS pause/resume, cancelled waiting read, new-owner disk cache reuse")
@@ -115,10 +117,10 @@ private func check(_ condition: Bool, _ label: String) throws {
         let slow = FixtureServer(fixture.encrypted)
         let closing = try await ProgressiveSource.open(track: track, episodeID: "cancel", cache: cache, fetch: { try await slow.fetch($0) })
         await slow.setDelay(30_000_000_000)
-        let previousRequests = await slow.requested().count
+        let previousRequests = await slow.requestCount()
         let inFlight = Task { try await closing.read(at: fixture.offsets[100], count: 100) }
         for _ in 0..<50 {
-            if await slow.requested().count > previousRequests { break }
+            if await slow.requestCount() > previousRequests { break }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         let cancelledAt = Date()
@@ -130,7 +132,7 @@ private func check(_ condition: Bool, _ label: String) throws {
         let slowIndex = FixtureServer(fixture.encrypted, delay: 30_000_000_000, delayAfterFirst: true)
         let opening = Task { try await ProgressiveSource.open(track: track, episodeID: "cancel-opening", cache: cache, fetch: { try await slowIndex.fetch($0) }) }
         for _ in 0..<50 {
-            if await slowIndex.requested().count > 1 { break }
+            if await slowIndex.requestCount() > 1 { break }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         let openingCancelledAt = Date(); opening.cancel()
@@ -145,6 +147,44 @@ private func check(_ condition: Bool, _ label: String) throws {
         let filesAfter = (FileManager.default.enumerator(at: base.appendingPathComponent("cache"), includingPropertiesForKeys: nil)?.allObjects as? [URL]) ?? []
         try check(!filesAfter.contains { $0.pathExtension == "chunk" }, "Closed cache could not be cleared")
         print("PASS 8/16-byte IVs, plain MP4, cache cleanup; no external network used")
+    }
+
+    private static func sparseRevisit(fixture: ProgressiveFixture, track: VideoTrack, cache: ProgressiveCache) async throws {
+        let size = ProgressiveCache.blockSize
+        let first = FixtureServer(fixture.encrypted)
+        let original = try await ProgressiveSource.open(track: track, episodeID: "sparse-revisit", cache: cache,
+                                                        fetch: { try await first.fetch($0) }, readAhead: 0)
+        let startup = await first.requested()
+        var samples: [Int: Int] = [:]
+        for (offset, count) in zip(fixture.offsets, fixture.sizes) where count >= 512 {
+            let block = offset / size
+            let range = block * size..<min((block + 1) * size, fixture.encrypted.count)
+            if offset + count <= range.upperBound, !startup.contains(where: { $0.overlaps(range) }) {
+                samples[block] = offset
+            }
+        }
+        let blocks = samples.keys.sorted()
+        guard let cachedBlock = blocks.first, let missingBlock = blocks.last, cachedBlock != missingBlock,
+              let cachedOffset = samples[cachedBlock], let missingOffset = samples[missingBlock] else {
+            throw NSError(domain: "FixtureNeedsTwoSparseMediaBlocks", code: 1)
+        }
+        _ = try await original.read(at: cachedOffset, count: 512)
+        await original.close()
+        let second = FixtureServer(fixture.encrypted)
+        let reopened = try await ProgressiveSource.open(track: track, episodeID: "sparse-revisit", cache: cache,
+                                                        fetch: { try await second.fetch($0) }, readAhead: 0)
+        let opening = await second.requested()
+        let available = try await reopened.read(at: cachedOffset, count: 512)
+        try check(available == fixture.clear.subdata(in: cachedOffset..<(cachedOffset + 512)), "Resume returned wrong bytes from the saved block")
+        let cachedRequests = await second.requested()
+        try check(cachedRequests == opening, "Revisit refetched the verified range")
+        let resumed = try await reopened.read(at: missingOffset, count: 512)
+        let extra = Array((await second.requested()).dropFirst(opening.count))
+        let expected = missingBlock * size..<min((missingBlock + 1) * size, fixture.encrypted.count)
+        try check(resumed == fixture.clear.subdata(in: missingOffset..<(missingOffset + 512)), "Missing range returned wrong bytes")
+        try check(extra == [expected], "Revisit expected \(expected), fetched \(extra)")
+        await reopened.close()
+        print("PASS range revisit: verified cached block has no network request, uncached block fetches only its own range")
     }
 
     @MainActor private static func playerChecks(fixture: ProgressiveFixture, track: VideoTrack, cache: ProgressiveCache) async throws {

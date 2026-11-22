@@ -16,8 +16,10 @@ xcodebuild -project Hongguo-QA.xcodeproj -scheme HongguoQA -configuration Debug 
 ffmpeg -v error -f lavfi -i testsrc2=size=320x180:rate=24 -t 14 -an -c:v libx264 \
     -pix_fmt yuv420p -movflags +faststart "$scratch/fixture.mp4"
 sdk="$(xcrun --sdk iphonesimulator --show-sdk-path)"
-xcrun --sdk iphonesimulator swiftc -parse-as-library -target "$(uname -m)-apple-ios17.0-simulator" \
-    -sdk "$sdk" -I "$products" -F "$products/PackageFrameworks" \
-    -Xlinker -rpath -Xlinker "$products/Hongguo.app" "$products/Hongguo.app/Hongguo.debug.dylib" \
-    Tests/PlaybackContinuityProbe.swift -o "$scratch/probe"
-xcrun simctl spawn "$1" "$scratch/probe" "$scratch/fixture.mp4"
+for probe in PlaybackContinuityProbe PlaybackRevisitProbe; do
+    xcrun --sdk iphonesimulator swiftc -parse-as-library -target "$(uname -m)-apple-ios17.0-simulator" \
+        -sdk "$sdk" -I "$products" -F "$products/PackageFrameworks" \
+        -Xlinker -rpath -Xlinker "$products/Hongguo.app" "$products/Hongguo.app/Hongguo.debug.dylib" \
+        "Tests/$probe.swift" -o "$scratch/probe"
+    xcrun simctl spawn "$1" "$scratch/probe" "$scratch/fixture.mp4"
+done

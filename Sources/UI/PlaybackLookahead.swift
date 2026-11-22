@@ -36,6 +36,10 @@ final class OpenEpisode {
         self.stream = stream
     }
 
+    func renewItemForRevisit() {
+        item = AVPlayerItem(asset: stream.asset, automaticallyLoadedAssetKeys: ["duration", "tracks"])
+    }
+
     deinit { stream.close() }
 }
 
@@ -68,6 +72,7 @@ final class PlaybackLookahead {
     private var worker: Task<Void, Never>?
     private var activeKey: String?
     private var generation = UUID()
+    private var previous: (key: String, episode: OpenEpisode)?
 
     init(openEpisode: @escaping @MainActor (PlaybackTarget) async throws -> OpenEpisode = PlaybackLookahead.openEpisodeStream) {
         self.openEpisode = openEpisode
@@ -141,8 +146,22 @@ final class PlaybackLookahead {
     func claim(_ target: PlaybackTarget) -> Task<OpenEpisode, Error> {
         let slot = slots.removeValue(forKey: target.key)
         pause()
+        if slot == nil, let recent = previous, recent.key == target.key {
+            previous = nil
+            recent.episode.renewItemForRevisit()
+            return Task {
+                try Task.checkCancellation()
+                await recent.episode.stream.source.setPaused(false)
+                return recent.episode
+            }
+        }
         if slot?.preparedEpisode?.item.status == .failed { return open(target, priority: .userInitiated) }
         return slot?.open ?? open(target, priority: .userInitiated)
+    }
+
+    func rememberForRevisit(_ episode: OpenEpisode, target: PlaybackTarget) {
+        guard episode.item.status == .readyToPlay else { return }
+        previous = (target.key, episode)
     }
 
     func pause() {
@@ -157,6 +176,7 @@ final class PlaybackLookahead {
 
     func clear() {
         pause()
+        previous = nil
         for slot in slots.values { slot.open.cancel() }
         slots.removeAll()
         failedAt.removeAll()

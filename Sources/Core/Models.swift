@@ -7,6 +7,15 @@ struct Drama: Identifiable, Codable, Hashable, Sendable {
     let coverURL: String
     let summary: String
     let episodeCount: Int
+
+    func replacingMetadata(with metadata: Drama?) -> Drama {
+        guard let metadata, metadata.id == id else { return self }
+        return Drama(id: id,
+                     title: metadata.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? title : metadata.title,
+                     coverURL: metadata.coverURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? coverURL : metadata.coverURL,
+                     summary: metadata.summary.isEmpty ? summary : metadata.summary,
+                     episodeCount: metadata.episodeCount > 0 ? metadata.episodeCount : episodeCount)
+    }
 }
 
 struct Episode: Identifiable, Codable, Hashable, Sendable {
@@ -64,7 +73,7 @@ enum HGError: LocalizedError {
 
 struct LibraryEntry: Identifiable, Codable, Hashable, Sendable {
     var id: String { drama.id }
-    let drama: Drama
+    var drama: Drama
     var episodeID: String
     var episodeIndex: Int
     var position: Double

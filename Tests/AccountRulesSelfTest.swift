@@ -44,10 +44,19 @@ struct AccountRulesSelfTest {
         try check(AccountRules.displayName(["name":"a\u{0}b", "user_info":["nickname":"备用"]]) == "备用", "name-control-skipped")
         try check(AccountRules.displayName(["screen_name":"", "name":123]) == nil, "name-missing")
         let liked = AccountRules.likes(["data":["mixed_data_list":[
-            ["video_data":["series_id":"701","title":"甲","cover":"https:\\/\\/p\\/1.jpg","episode_cnt":80,"user_digg_timestamp_ms":2000]],
+            ["video_data":["series_id":"701","series_title":"甲","title":"单集简介","cover":"https:\\/\\/p\\/1.jpg","episode_cnt":80,"user_digg_timestamp_ms":2000]],
             ["video_data":["series_id":"702","title":"乙","create_time":3]],
             ["video_data":["series_id":"bad","title":"无效"]], ["other":1]]]])
         try check(liked.map(\.id) == ["702","701"] && liked[1].episodeCount == 80 && liked[1].coverURL == "https://p/1.jpg", "likes-parsed")
+        try check(liked.map(\.title) == ["剧集 702", "甲"], "likes-do-not-display-episode-title-as-series-title")
+        let details = try ProtocolJSON.object(Data(#"{"code":0,"data":[{"book_id":"701","series_id":"702","book_name":"正式剧名","title":"单集简介","thumb_url":"//p.example/series.jpg?width=640&amp;height=900","cover":"https://p.example/episode.jpg"},{"book_id":"702","series_title":"  ","series_cover":{"url_list":["file:///tmp/invalid","http://p.example/series2.jpg"]}},{"book_id":"703","book_name":"无关作品"}]}"#.utf8))
+        let metadata = AccountRules.detailMetadata(details, requested: Set(liked.map(\.id)))
+        let enriched = liked.map { $0.replacingMetadata(with: metadata[$0.id]) }
+        try check(enriched.map(\.id) == ["702", "701"] && metadata["703"] == nil, "batch-metadata-uses-book-id-and-ignores-unrequested-rows")
+        try check(enriched[1].title == "正式剧名" && enriched[1].coverURL == "https://p.example/series.jpg?width=640&height=900" && enriched[1].episodeCount == 80,
+                  "batch-preferences-and-missing-count-fallback")
+        try check(enriched[0].title == "剧集 702" && enriched[0].coverURL == "https://p.example/series2.jpg", "partial-batch-metadata-updates-cover-without-erasing-title")
+        try check(AccountRules.detailMetadata(["data": NSNull()], requested: ["701"]).isEmpty, "missing-batch-keeps-the-original-list")
         let records = try AccountRules.readHistory(["data":["data_list":[
             ["book_id":"701","vid":"801","vid_index":3,"series_title":"甲","current_play_position":5000,"read_timestamp_ms":1700000000000,"episode_cnt":80],
             ["book_id":"701","vid":"800","vid_index":2,"series_title":"甲","read_timestamp_ms":1600000000000],
@@ -55,10 +64,16 @@ struct AccountRulesSelfTest {
             ["book_id":"703","vid":"803","is_delete":true], ["book_id":"bad","vid":"804"]]]])
         try check(records.map(\.id) == ["702","701"] && records[1].episodeID == "801" && records[1].episodeIndex == 3 && records[1].position == 5, "read-history-newest-per-work")
         try check(records[0].updatedAt.timeIntervalSince1970 == 1700000001 && records[0].drama.title == "剧集", "read-history-seconds-and-fallback-title")
+        let progress = LibraryEntry(drama: Drama(id: "701", title: "剧集", coverURL: "", summary: "", episodeCount: 0),
+                                    episodeID: "901", episodeIndex: 7, position: 12.5, updatedAt: Date(timeIntervalSince1970: 1700000010))
+        let merged = AccountRules.mergeHistory(progress: [progress], records: records)
+        try check(merged.map(\.id) == ["701", "702"] && merged[0].drama.title == "甲" && merged[0].episodeID == "901"
+                  && merged[0].episodeIndex == 7 && merged[0].position == 12.5 && merged[0].updatedAt == progress.updatedAt,
+                  "history-takes-older-record-metadata-without-rewinding-progress")
         try check((try? AccountRules.readHistory([:])) == nil, "read-history-format-rejected")
         let accountStats = AccountRules.stats(["data":["follow_user_num":1,"fans_num":2,"recv_digg_num":3]])
         try check(accountStats.follows == 1 && accountStats.fans == 2 && accountStats.likes == 3, "stats-parsed")
         try check(AccountRules.stats(["data":[:]]).follows == nil, "stats-missing")
-        print("PASS account identity, website authentication, cookie scope, avatar URLs and names: 34 cases")
+        print("PASS account identity, website authentication, cookie scope, profile, and list metadata")
     }
 }

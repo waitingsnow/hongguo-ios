@@ -105,12 +105,14 @@ struct HomeView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
                     ForEach(Array(library.history.prefix(8))) { entry in
-                        Button { model.play(entry.drama) { playbackRequest = $0 } } label: {
-                            HStack(spacing: 11) {
-                                PosterView(drama: entry.drama, ratio: 0.8).frame(width: 57)
-                                VStack(alignment: .leading, spacing: 7) { Text(entry.drama.title).font(.subheadline.weight(.semibold)).foregroundStyle(model.appearance.ink).lineLimit(2); Text("第 \(entry.episodeIndex) 集 · \(timeLabel(entry.position))").font(.caption).foregroundStyle(model.appearance.muted); Label("接着看", systemImage: "play.fill").font(.caption.weight(.semibold)).foregroundStyle(model.appearance.accent) }.frame(maxWidth: .infinity, alignment: .leading)
-                            }.padding(12).frame(width: 264).background(model.appearance.surface, in: RoundedRectangle(cornerRadius: 16))
-                        }.buttonStyle(.plain)
+                        LibraryDramaCard(drama: entry.drama, onResolved: library.updateDramaMetadata) { drama in
+                            Button { model.play(drama) { playbackRequest = $0 } } label: {
+                                HStack(spacing: 11) {
+                                    PosterView(drama: drama, ratio: 0.8).frame(width: 57)
+                                    VStack(alignment: .leading, spacing: 7) { Text(drama.title).font(.subheadline.weight(.semibold)).foregroundStyle(model.appearance.ink).lineLimit(2); Text("第 \(entry.episodeIndex) 集 · \(timeLabel(entry.position))").font(.caption).foregroundStyle(model.appearance.muted); Label("接着看", systemImage: "play.fill").font(.caption.weight(.semibold)).foregroundStyle(model.appearance.accent) }.frame(maxWidth: .infinity, alignment: .leading)
+                                }.padding(12).frame(width: 264).background(model.appearance.surface, in: RoundedRectangle(cornerRadius: 16))
+                            }.buttonStyle(.plain)
+                        }
                     }
                 }
             }
@@ -657,7 +659,7 @@ struct SearchView: View {
                 }
             }.padding(20)
         }.navigationTitle("搜索").navigationBarTitleDisplayMode(.inline).appBackground(model.appearance).onDisappear { focused = false }
-            .background(InteractiveBackSwipe(enabled: true))
+            .secondaryPage()
             // Optional help while typing: a failure simply shows no suggestions.
             .task(id: query) {
                 let value = query.trimmingCharacters(in: .whitespacesAndNewlines)

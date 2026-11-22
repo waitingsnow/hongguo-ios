@@ -2,6 +2,7 @@
 import Foundation
 import AVFoundation
 import UniformTypeIdentifiers
+import os
 
 /// Player-scoped resource loader; the owner retains this object for the lifetime of AVPlayerItem.
 final class ProgressivePlayback: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
@@ -9,7 +10,7 @@ final class ProgressivePlayback: NSObject, AVAssetResourceLoaderDelegate, @unche
     let source: ProgressiveSource
     private let length: Int
     private let queue = DispatchQueue(label: "com.ooiua.hongguo.progressive-loader")
-    private var requests: [ObjectIdentifier: (AVAssetResourceLoadingRequest, Task<Void, Never>)] = [:]
+    private let requests = OSAllocatedUnfairLock(uncheckedState: [ObjectIdentifier: (AVAssetResourceLoadingRequest, Task<Void, Never>)]())
     private var closed = false
 
     private init(source: ProgressiveSource, length: Int) {
@@ -70,13 +71,13 @@ final class ProgressivePlayback: NSObject, AVAssetResourceLoaderDelegate, @unche
                              error: error is CancellationError ? CancellationError() : ((error as? MediaError) ?? .transport))
             }
         }
-        requests[identifier] = (request, task)
+        requests.withLockUnchecked { $0[identifier] = (request, task) }
         return true
     }
     private func deliver(_ bytes: Data, to request: AVAssetResourceLoadingRequest, identifier: ObjectIdentifier) async -> Bool {
         await withCheckedContinuation { continuation in
             queue.async { [self] in
-                guard !closed, requests[identifier] != nil, !request.isCancelled, !request.isFinished else {
+                guard !closed, requests.withLockUnchecked({ $0[identifier] != nil }), !request.isCancelled, !request.isFinished else {
                     continuation.resume(returning: false); return
                 }
                 request.dataRequest?.respond(with: bytes)
@@ -86,23 +87,27 @@ final class ProgressivePlayback: NSObject, AVAssetResourceLoaderDelegate, @unche
     }
     private func finish(_ request: AVAssetResourceLoadingRequest, identifier: ObjectIdentifier, error: Error?) {
         queue.async { [self] in
-            guard requests.removeValue(forKey: identifier) != nil, !request.isCancelled, !request.isFinished else { return }
+            guard requests.withLockUnchecked({ $0.removeValue(forKey: identifier) }) != nil, !request.isCancelled, !request.isFinished else { return }
             if let error { request.finishLoading(with: error) } else { request.finishLoading() }
         }
     }
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader, didCancel request: AVAssetResourceLoadingRequest) {
-        requests.removeValue(forKey: ObjectIdentifier(request))?.1.cancel()
+        requests.withLockUnchecked { $0.removeValue(forKey: ObjectIdentifier(request)) }?.1.cancel()
     }
     func pause() { Task { await source.setPaused(true) } }
     func resume() { Task { await source.setPaused(false) } }
     func close() {
         queue.async { [self] in
             guard !closed else { return }; closed = true
-            for (request, task) in requests.values {
+            let active = requests.withLockUnchecked { pending in
+                let active = pending
+                pending.removeAll()
+                return active
+            }
+            for (request, task) in active.values {
                 task.cancel()
                 if !request.isFinished && !request.isCancelled { request.finishLoading(with: CancellationError()) }
             }
-            requests.removeAll()
             Task { await source.close() }
         }
     }

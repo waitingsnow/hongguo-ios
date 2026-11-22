@@ -121,6 +121,95 @@ final class HongguoQATests: XCTestCase {
         capture("16-update-sources")
     }
 
+    func testTabBarVisibilityAcrossTabRoots() {
+        continueAfterFailure = false
+        let device = XCUIDevice.shared
+        let previousOrientation = device.orientation
+        device.orientation = .portrait
+        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        defer {
+            app.terminate()
+            device.orientation = previousOrientation
+        }
+
+        for theme in ["warm", "cards", "immersive"] {
+            XCTContext.runActivity(named: "Tab roots in \(theme)") { _ in
+                let immersive = theme == "immersive"
+                app.launchArguments = ["-theme", theme, "-home.feedMode", "NO", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO"]
+                app.launch()
+                defer { app.terminate() }
+
+                let home = app.tabBars.buttons["首页"]
+                let discover = app.tabBars.buttons[immersive ? "剧场" : "发现"]
+                let library = app.tabBars.buttons[immersive ? "追剧" : "片单"]
+                let my = app.tabBars.buttons["我的"]
+                let homeSearch = app.buttons[immersive ? "搜索" : "搜索短剧"]
+                let discoverSearch = app.buttons["搜索短剧"]
+
+                @MainActor func openAndReturn(_ entry: XCUIElement, title: String, tab: XCUIElement) {
+                    XCTAssertTrue(tab.wait(for: \.isHittable, toEqual: true, timeout: 5))
+                    XCTAssertTrue(entry.wait(for: \.isHittable, toEqual: true, timeout: 5))
+                    entry.tap()
+                    let back = app.navigationBars[title].buttons.firstMatch
+                    XCTAssertTrue(back.wait(for: \.isHittable, toEqual: true, timeout: 5))
+                    assertTabBarHidden(in: app, on: title)
+                    back.tap()
+                    XCTAssertTrue(tab.wait(for: \.isHittable, toEqual: true, timeout: 5))
+                    XCTAssertTrue(tab.isSelected)
+                }
+
+                openAndReturn(homeSearch, title: "搜索", tab: home)
+                discover.tap()
+                openAndReturn(discoverSearch, title: "搜索", tab: discover)
+                openAndReturn(app.buttons["榜单"], title: "榜单", tab: discover)
+                library.tap()
+                openAndReturn(app.buttons["红果账号"], title: "我的账号", tab: library)
+                my.tap()
+                openAndReturn(app.buttons["my.settings"], title: "设置", tab: my)
+            }
+        }
+    }
+
+    func testTabBarHidesInDetailAcrossHomeLayouts() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["HONGGUO_QA_MODE"] == "--live")
+        continueAfterFailure = false
+        let device = XCUIDevice.shared
+        let previousOrientation = device.orientation
+        device.orientation = .portrait
+        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        defer {
+            app.terminate()
+            device.orientation = previousOrientation
+        }
+
+        for (theme, prefix) in [("warm", "home.featured."), ("cards", "home.ranking."), ("immersive", "immersive_title_0")] {
+            XCTContext.runActivity(named: "Home detail in \(theme)") { _ in
+                app.launchArguments = ["-theme", theme, "-home.feedMode", "NO", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO", "-autoNext", "NO"]
+                app.launch()
+                defer { app.terminate() }
+
+                let home = app.tabBars.buttons["首页"]
+                XCTAssertTrue(home.wait(for: \.isHittable, toEqual: true, timeout: 10))
+                let drama = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", prefix)).firstMatch
+                XCTAssertTrue(drama.waitForExistence(timeout: 60))
+                if !drama.isHittable { app.swipeUp() }
+                XCTAssertTrue(drama.wait(for: \.isHittable, toEqual: true, timeout: 5))
+                drama.tap()
+                let back = app.navigationBars["剧集详情"].buttons.firstMatch
+                XCTAssertTrue(back.wait(for: \.isHittable, toEqual: true, timeout: 5))
+                assertTabBarHidden(in: app, on: "剧集详情")
+                back.tap()
+                XCTAssertTrue(home.wait(for: \.isHittable, toEqual: true, timeout: 5))
+                XCTAssertTrue(home.isSelected)
+            }
+        }
+    }
+
+    private func assertTabBarHidden(in app: XCUIApplication, on page: String, line: UInt = #line) {
+        XCTAssertTrue(app.tabBars.firstMatch.wait(for: \.exists, toEqual: false, timeout: 5),
+                      "The tab bar must be absent on \(page)", line: line)
+    }
+
     func testNavigationSwipeReturnsOneLevel() {
         checkNavigationSwipes(nativePopDeclines: false)
     }
@@ -148,12 +237,14 @@ final class HongguoQATests: XCTestCase {
         myTab.tap()
         let settings = app.buttons["my.settings"]
         settings.tap()
+        assertTabBarHidden(in: app, on: "设置")
         let theme = app.staticTexts["主题样式"]
         XCTAssertTrue(theme.wait(for: \.isHittable, toEqual: true, timeout: 5))
         theme.tap()
         let themeBar = app.navigationBars["主题样式"]
         let themeBack = themeBar.buttons.firstMatch
         XCTAssertTrue(themeBack.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        assertTabBarHidden(in: app, on: "主题样式")
         let settingsBar = app.navigationBars["设置"]
         let settingsBack = settingsBar.buttons.firstMatch
 
@@ -170,10 +261,12 @@ final class HongguoQATests: XCTestCase {
         XCTAssertTrue(settingsBack.wait(for: \.isHittable, toEqual: true, timeout: 5))
         XCTAssertFalse(themeBar.exists)
         XCTAssertFalse(settings.isHittable)
+        assertTabBarHidden(in: app, on: "设置")
 
         swipeRight(in: app, from: 0)
         XCTAssertTrue(settings.wait(for: \.isHittable, toEqual: true, timeout: 5))
         XCTAssertFalse(settingsBar.exists)
+        XCTAssertTrue(myTab.wait(for: \.isHittable, toEqual: true, timeout: 5))
     }
 
     func testPlayerNavigationPushCancelAndRestore() throws {
@@ -194,7 +287,7 @@ final class HongguoQATests: XCTestCase {
         let video = app.buttons["视频画面"]
         let title = app.buttons["player.dramaTitle"]
         let detailBar = app.navigationBars["剧集详情"]
-        XCTAssertFalse(app.tabBars.buttons["首页"].isHittable)
+        assertTabBarHidden(in: app, on: "播放器")
         XCTAssertFalse(detailBar.isHittable)
 
         let edge = app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5))
@@ -208,11 +301,13 @@ final class HongguoQATests: XCTestCase {
         title.tap()
         XCTAssertTrue(detailBar.buttons.firstMatch.wait(for: \.isHittable, toEqual: true, timeout: 5))
         XCTAssertFalse(detailBar.buttons["完成"].exists)
+        assertTabBarHidden(in: app, on: "播放器推入的剧集详情")
         openEpisodeFromDetail(2, in: app)
         assertPlayback("播放中", in: app)
 
         swipeRight(in: app, from: 0.50, to: 0.95)
         XCTAssertTrue(detailBar.buttons.firstMatch.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        assertTabBarHidden(in: app, on: "返回到播放器推入的剧集详情")
         swipeRight(in: app, from: 0)
         assertEpisode(1, in: app)
         assertPlayback("播放中", in: app, timeout: 10)
@@ -232,8 +327,12 @@ final class HongguoQATests: XCTestCase {
 
         swipeRight(in: app, from: 0)
         XCTAssertTrue(detailBar.buttons.firstMatch.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        assertTabBarHidden(in: app, on: "返回到搜索结果的剧集详情")
         swipeRight(in: app, from: 0)
         XCTAssertTrue(app.textFields["搜索剧名或关键词"].wait(for: \.isHittable, toEqual: true, timeout: 5))
+        assertTabBarHidden(in: app, on: "返回到搜索结果")
+        swipeRight(in: app, from: 0)
+        XCTAssertTrue(app.tabBars.buttons["剧场"].wait(for: \.isHittable, toEqual: true, timeout: 5))
     }
 
     func testRealNavigationAndPlayback() throws {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import Foundation
+import os
 
 private actor CountingServer {
     let data: Data
@@ -32,6 +33,7 @@ private actor CountingServer {
         peak = active
     }
     func requested() -> [Range<Int>] { requests }
+    func requestCount() -> Int { requests.count }
 }
 
 private actor TransportLog {
@@ -43,6 +45,41 @@ private actor TransportLog {
 
 private func expect(_ condition: Bool, _ label: String) throws {
     if !condition { throw NSError(domain: "ProgressiveReadAhead", code: 1, userInfo: [NSLocalizedDescriptionKey: label]) }
+}
+
+private final class RangeHold: Sendable {
+    let arrivals: AsyncStream<Range<Int>>
+    private let signal: AsyncStream<Range<Int>>.Continuation
+    private let state = OSAllocatedUnfairLock(initialState: Phase.idle)
+
+    private enum Phase {
+        case idle, armed, held(CheckedContinuation<Bool, Never>), released
+    }
+
+    init() { (arrivals, signal) = AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1)) }
+
+    func arm() { state.withLock { $0 = .armed } }
+
+    func intercept(_ range: Range<Int>) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let held = state.withLock { state in
+                guard case .armed = state else { return false }
+                state = .held(continuation)
+                return true
+            }
+            if held { signal.yield(range) } else { continuation.resume(returning: false) }
+        }
+    }
+
+    func release() {
+        let continuation = state.withLock { state -> CheckedContinuation<Bool, Never>? in
+            defer { state = .released }
+            if case .held(let continuation) = state { return continuation }
+            return nil
+        }
+        signal.finish()
+        continuation?.resume(returning: true)
+    }
 }
 
 func progressiveReadAheadChecks(fixture: ProgressiveFixture, track: VideoTrack, root: URL) async throws {
@@ -72,6 +109,8 @@ func progressiveReadAheadChecks(fixture: ProgressiveFixture, track: VideoTrack, 
     print("PASS read-ahead downloads neighbouring blocks in combined ranges and serves later reads from them")
 
     try await progressiveWarmChecks(fixture: fixture, track: track, root: root)
+    try await progressiveTeardownChecks(fixture: fixture, track: track, root: root)
+    try await progressiveOverlapChecks(fixture: fixture, track: track, root: root)
 
     let expired = URL(string: "https://v1.qznovelvod.com/expired.mp4")!, fresh = URL(string: "https://v1.qznovelvod.com/fresh.mp4")!
     let edge = URL(string: "https://edge.vegslb.com/fresh.mp4")!
@@ -205,9 +244,98 @@ private func progressiveWarmChecks(fixture: ProgressiveFixture, track: VideoTrac
     print("PASS foreground reads retain and reuse the same warm range after its caller cancels")
 }
 
+private func progressiveOverlapChecks(fixture: ProgressiveFixture, track: VideoTrack, root: URL) async throws {
+    let cache = ProgressiveCache(root: root.appendingPathComponent("overlap"))
+    let blockSize = ProgressiveCache.blockSize
+    let blocks = fixture.clear.count / blockSize
+    for cycle in 0..<24 {
+        let source = try await ProgressiveSource.open(track: track, episodeID: "overlap-\(cycle)", cache: cache, fetch: { range in
+            await Task.yield()
+            return MediaRangeReply(data: fixture.encrypted.subdata(in: range.clamped(to: 0..<fixture.encrypted.count)), total: fixture.encrypted.count)
+        })
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            let warm = Task { await source.warm(bytes: 8 * blockSize) }
+            for reader in 0..<8 {
+                group.addTask {
+                    for step in 0..<8 {
+                        let offset = ((reader * 3 + step + cycle) % blocks) * blockSize + 12
+                        let bytes = try await source.read(at: offset, count: 128)
+                        try expect(bytes == fixture.clear.subdata(in: offset..<(offset + 128)), "Overlapping reads returned incorrect bytes")
+                    }
+                }
+            }
+            _ = try await group.next()
+            warm.cancel()
+            try await group.waitForAll()
+            await source.close()
+            _ = await warm.value
+        }
+    }
+    print("PASS 24 overlapping warm/read/cancel/close cycles, 1536 verified reads")
+}
+
+private func progressiveTeardownChecks(fixture: ProgressiveFixture, track: VideoTrack, root: URL) async throws {
+    let size = ProgressiveCache.blockSize
+    let media = nodes(fixture.encrypted, 0, fixture.encrypted.count).first { $0.type == "mdat" }!
+    let mediaStart = media.start + (u32(fixture.encrypted, media.start) == 1 ? 16 : 8)
+    for closeFirst in [false, true] {
+        let hold = RangeHold()
+        defer { hold.release() }
+        let server = CountingServer(fixture.encrypted)
+        await server.configure(delay: 0)
+        let name = closeFirst ? "held-close" : "held-cancel"
+        let cache = ProgressiveCache(root: root.appendingPathComponent(name))
+        let source = try await ProgressiveSource.open(track: track, episodeID: name, cache: cache, fetch: { range in
+            if await hold.intercept(range) {
+                return MediaRangeReply(data: fixture.encrypted.subdata(in: range), total: fixture.encrypted.count)
+            }
+            return try await server.fetch(range)
+        }, readAhead: 0)
+        let opened = await server.requested()
+        var sampleByBlock: [Int: Int] = [:]
+        for (offset, count) in zip(fixture.offsets, fixture.sizes) where count >= 128 {
+            let block = offset / size
+            let range = (block * size)..<((block + 1) * size)
+            if range.lowerBound >= mediaStart, range.upperBound <= fixture.encrypted.count,
+               offset + count <= range.upperBound, !opened.contains(where: { $0.overlaps(range) }) {
+                sampleByBlock[block] = offset
+            }
+        }
+        let blocks = sampleByBlock.keys.sorted()
+        guard let first = blocks.first, let second = blocks.last, first != second, let offset = sampleByBlock[first] else {
+            throw NSError(domain: "FixtureNeedsTwoSparseMediaBlocks", code: 1)
+        }
+        let before = await source.metrics()
+        hold.arm()
+        let warm = Task { await source.warm(bytes: (first + 1) * size - mediaStart, from: first * size - mediaStart) }
+        var arrivals = hold.arrivals.makeAsyncIterator()
+        try expect(await arrivals.next() == (first * size)..<((first + 1) * size), "Warm did not reach the held range")
+        if closeFirst {
+            await source.setPaused(true)
+            let read = Task { try await source.read(at: offset, count: 128) }
+            await source.close()
+            try expect(await warm.value == false, "Close did not release the held warm caller")
+            do { _ = try await read.value; try expect(false, "A paused read succeeded after close") } catch is CancellationError { }
+            hold.release()
+            try expect(await source.metrics().networkBytes == before.networkBytes, "Close published an in-flight range")
+        } else {
+            warm.cancel()
+            try expect(await warm.value == false, "Cancellation did not release the held warm caller")
+            let replacement = try await source.read(at: offset, count: 128)
+            try expect(replacement == fixture.clear.subdata(in: offset..<(offset + 128)), "Replacement read returned incorrect bytes")
+            hold.release()
+            try expect(await source.warm(bytes: (second + 1) * size - mediaStart, from: second * size - mediaStart),
+                       "Late cancellation prevented a new warm range")
+            try expect(await source.metrics().networkBytes == before.networkBytes + 2 * size, "The cancelled range was published alongside its replacement")
+            await source.close()
+        }
+    }
+    print("PASS gated teardown: close releases callers; a late cancelled range cannot replace the retry")
+}
+
 private func waitForRequests(_ count: Int, on server: CountingServer) async throws {
     for _ in 0..<200 {
-        if await server.requested().count >= count { return }
+        if await server.requestCount() >= count { return }
         try await Task.sleep(nanoseconds: 5_000_000)
     }
     try expect(false, "Timed out waiting for \(count) requests")

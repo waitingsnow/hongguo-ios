@@ -563,17 +563,9 @@ final class AccountService: ObservableObject {
             catch { return [] }
         }
         let shown = Array(ids.prefix(200))
-        var mapped = [String:Drama]()
-        for start in stride(from: 0, to: shown.count, by: 50) {
-            let batch = shown[start..<min(start + 50, shown.count)]
-            do {
-                let (metadata,_) = try await appJSON(candidate, path: "/reading/bookapi/multi-detail/v1/", params: ["book_id":batch.joined(separator: ","),"book_type":"2"])
-                for row in ProtocolJSON.array(metadata["data"]).map({ ProtocolJSON.dictionary($0) }) { if let item = drama(row: row, video: row) { mapped[item.id] = item } }
-            } catch let failure as AccountFailure where failure.expired { throw failure }
-            catch is CancellationError { throw CancellationError() }
-            catch { }
-        }
-        return shown.map { mapped[$0] ?? Drama(id: $0, title: "剧集 \($0)", coverURL: "", summary: "", episodeCount: 0) }
+        return try await completeListMetadata(shown.map { id in
+            favorites.first { $0.id == id } ?? Drama(id: id, title: "剧集 \(id)", coverURL: "", summary: "", episodeCount: 0)
+        }, candidate: candidate)
     }
 
     private func fetchLegacyFavorites(_ candidate: AccountCredentials) async throws -> [Drama] {
@@ -586,7 +578,7 @@ final class AccountService: ObservableObject {
             return drama(row: row, video: video)
         }
         guard rows.isEmpty || !result.isEmpty else { throw HGError.message("账户收藏条目格式发生变化") }
-        return unique(result)
+        return try await completeListMetadata(unique(result), candidate: candidate)
     }
     /// The endpoint intermittently answers with an empty body, so one read is repeated once.
     private func fetchLikes(_ candidate: AccountCredentials) async throws -> [Drama] {
@@ -596,16 +588,22 @@ final class AccountService: ObservableObject {
         catch let failure as AccountFailure where failure.expired { throw failure }
         catch is CancellationError { throw CancellationError() }
         catch { liked = AccountRules.likes(try await appJSON(candidate, path: "/reading/ugc/action/mget/v1/", params: params).0) }
-        guard !liked.isEmpty else { return liked }
-        // The like list's video title is often the synopsis, so names come from the detail batch; a failure keeps the list.
+        return try await completeListMetadata(liked, candidate: candidate)
+    }
+
+    private func completeListMetadata(_ items: [Drama], candidate: AccountCredentials) async throws -> [Drama] {
+        let ids = items.map(\.id)
         var mapped = [String:Drama]()
-        do {
-            let (metadata,_) = try await appJSON(candidate, path: "/reading/bookapi/multi-detail/v1/", params: ["book_id":liked.map(\.id).joined(separator: ","),"book_type":"2"])
-            for row in ProtocolJSON.array(metadata["data"]).map({ ProtocolJSON.dictionary($0) }) { if let item = drama(row: row, video: row) { mapped[item.id] = item } }
-        } catch let failure as AccountFailure where failure.expired { throw failure }
-        catch is CancellationError { throw CancellationError() }
-        catch { }
-        return liked.map { mapped[$0.id] ?? $0 }
+        for start in stride(from: 0, to: ids.count, by: 50) {
+            let batch = ids[start..<min(start + 50, ids.count)]
+            do {
+                let (metadata,_) = try await appJSON(candidate, path: "/reading/bookapi/multi-detail/v1/", params: ["book_id":batch.joined(separator: ","),"book_type":"2"])
+                mapped.merge(AccountRules.detailMetadata(metadata, requested: Set(batch))) { _, new in new }
+            } catch let failure as AccountFailure where failure.expired { throw failure }
+            catch is CancellationError { throw CancellationError() }
+            catch { }
+        }
+        return items.map { $0.replacingMetadata(with: mapped[$0.id]) }
     }
 
     /// Watch records add works the progress list leaves out; a failure there keeps the progress list.
@@ -633,20 +631,13 @@ final class AccountService: ObservableObject {
 
     private func fetchHistory(_ candidate: AccountCredentials) async throws -> [LibraryEntry] {
         var result = try await fetchProgressRows(candidate)
-        for record in await fetchRecords(candidate) {
-            if let index = result.firstIndex(where: { $0.id == record.id }) { if record.updatedAt > result[index].updatedAt { result[index] = record } }
-            else { result.append(record) }
+        result = AccountRules.mergeHistory(progress: result, records: await fetchRecords(candidate))
+        let metadata = try await completeListMetadata(result.map(\.drama), candidate: candidate)
+        return zip(result, metadata).map { item, drama in
+            var entry = item
+            entry.drama = drama
+            return entry
         }
-        if !result.isEmpty {
-            let (metadata,_) = try await appJSON(candidate, path: "/reading/bookapi/multi-detail/v1/", params: ["book_id":result.map { $0.id }.joined(separator: ","),"book_type":"2"])
-            let items = ProtocolJSON.array(metadata["data"]).map { ProtocolJSON.dictionary($0) }
-            var mapped = [String:Drama]()
-            for row in items { if let item = drama(row: row, video: row) { mapped[item.id] = item } }
-            result = result.map { item in
-                LibraryEntry(drama: mapped[item.id] ?? item.drama, episodeID: item.episodeID, episodeIndex: item.episodeIndex, position: item.position, updatedAt: item.updatedAt)
-            }
-        }
-        return Array(result.sorted { $0.updatedAt > $1.updatedAt }.prefix(200))
     }
     private func fetchReservations(_ candidate: AccountCredentials, online: Bool) async throws -> [CloudReservation] {
         let (raw,_) = try await appJSON(candidate, path: "/reading/user/subscribe/list/v0/", params: ["offset":"0","limit":"20","is_online":String(online),"tab_type":"13","subscribe_order_type":"0","swipe_type":"0","need_calendar_schema":"false","subscribe_offset":"0"])
@@ -658,7 +649,7 @@ final class AccountService: ObservableObject {
             var item = drama(row: row, video: video)
             if item == nil, !online, let id = ProtocolJSON.identifier(row["item_id"]) {
                 let title = ProtocolJSON.text(row["name"])
-                item = Drama(id: "reservation:" + id, title: title, coverURL: ProtocolJSON.text(row["thumb_url"]), summary: ProtocolJSON.text(row["item_desc"]), episodeCount: 0)
+                item = Drama(id: "reservation:" + id, title: title, coverURL: AccountRules.posterURL(row["thumb_url"]), summary: ProtocolJSON.text(row["item_desc"]), episodeCount: 0)
             }
             guard let item, !item.title.isEmpty else { return nil }
             return CloudReservation(drama: item, online: online, publishText: ProtocolJSON.text(row["expected_rec_text"]),
@@ -669,9 +660,9 @@ final class AccountService: ObservableObject {
     private func drama(row: [String:Any], video: [String:Any]) -> Drama? {
         func first(_ values: [Any?]) -> String { values.map { ProtocolJSON.text($0) }.first { !$0.isEmpty } ?? "" }
         let id = first([video["series_id"],row["series_id"],row["book_id"]])
-        let title = first([row["series_title"],video["title"],row["book_name"],video["book_name"]])
+        let title = first([row["series_title"],video["series_title"],row["book_name"],video["book_name"],row["name"],video["title"]])
         guard ProtocolJSON.identifier(id) != nil, !title.isEmpty else { return nil }
-        let cover = first([row["series_cover_url"],video["cover"],video["cover_url"],video["thumb_url"],row["thumb_url"]]).replacingOccurrences(of: "http://", with: "https://")
+        let cover = AccountRules.posterURL(row["series_cover_url"], row["series_cover"], video["series_cover"], video["cover"], video["cover_url"], video["thumb_url"], row["thumb_url"])
         return Drama(id: id, title: title, coverURL: cover, summary: first([row["series_intro"],video["video_desc"],row["abstract"]]), episodeCount: max(ProtocolJSON.integer(video["episode_cnt"]),ProtocolJSON.integer(video["episode_count"]),ProtocolJSON.integer(row["episode_cnt"])))
     }
     private func unique(_ values: [Drama]) -> [Drama] {
