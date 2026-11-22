@@ -1,8 +1,13 @@
 import SwiftUI
 
 struct DetailView: View {
+    private static let pageTitle = "剧集详情"
     let drama: Drama
-    var resume: LibraryEntry? = nil
+    let resume: LibraryEntry?
+    private let transitionPreview: Bool
+    private let initialEpisodeID: String?
+    private let loadsContent: Bool
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var library: LibraryStore
     @ObservedObject private var account = AccountService.shared
@@ -15,7 +20,47 @@ struct DetailView: View {
     @State private var reserving: RelatedWork?
     @State private var playbackRequest: PlaybackRequest?
 
+    init(drama: Drama, resume: LibraryEntry? = nil) {
+        self.drama = drama
+        self.resume = resume
+        transitionPreview = false
+        initialEpisodeID = nil
+        loadsContent = true
+    }
+
+    init(detail: DramaDetail, selected: Int, transitionPreview: Bool = false, loadsContent: Bool = true) {
+        drama = detail.drama
+        resume = nil
+        self.transitionPreview = transitionPreview
+        initialEpisodeID = detail.episodes.indices.contains(selected) ? detail.episodes[selected].id : nil
+        self.loadsContent = loadsContent && !transitionPreview
+        _detail = State(initialValue: detail)
+        _selected = State(initialValue: selected)
+    }
+
     var body: some View {
+        if transitionPreview {
+            pageContent
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    Text(Self.pageTitle).font(.headline)
+                        .foregroundStyle(model.appearance.ink)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: verticalSizeClass == .compact ? 32 : 44)
+                        .overlay(alignment: .leading) {
+                            Label("返回", systemImage: "chevron.left").labelStyle(.titleAndIcon)
+                                .foregroundStyle(model.appearance.accent).padding(.leading, 8)
+                        }
+                        .background(model.appearance.background)
+                }
+                .background(model.appearance.background.ignoresSafeArea())
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        } else {
+            destination
+        }
+    }
+
+    private var pageContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 HStack(alignment: .top, spacing: 18) {
@@ -52,19 +97,25 @@ struct DetailView: View {
                     }
                 }
             }.padding(20).padding(.bottom, 12)
-        }.appBackground(model.appearance).navigationTitle("剧集详情").navigationBarTitleDisplayMode(.inline)
+        }.safeAreaInset(edge: .bottom) {
+            if let detail, !detail.episodes.isEmpty {
+                Button { play(detail, index: selected) } label: { Label("播放第 \(detail.episodes[min(selected, detail.episodes.count - 1)].index) 集", systemImage: "play.fill").font(.headline).frame(maxWidth: .infinity).frame(height: 52) }.buttonStyle(.borderedProminent).tint(model.appearance.accent).padding(.horizontal, 20).padding(.vertical, 12).background(model.appearance.background)
+            }
+        }
+    }
+
+    private var destination: some View {
+        pageContent.appBackground(model.appearance).navigationTitle(Self.pageTitle).navigationBarTitleDisplayMode(.inline)
             .toolbar(.visible, for: .navigationBar)
             .secondaryPage()
             .playbackDestination($playbackRequest)
-            .safeAreaInset(edge: .bottom) {
-                if let detail, !detail.episodes.isEmpty {
-                    Button { play(detail, index: selected) } label: { Label("播放第 \(detail.episodes[min(selected, detail.episodes.count - 1)].index) 集", systemImage: "play.fill").font(.headline).frame(maxWidth: .infinity).frame(height: 52) }.buttonStyle(.borderedProminent).tint(model.appearance.accent).padding(.horizontal, 20).padding(.vertical, 12).background(model.appearance.background)
-                }
-            }
-            .task(id: drama.id) { await load() }
+            .task(id: loadsContent) { if loadsContent { await load() } }
             // Secondary content: a failure leaves the section out without affecting the drama itself.
-            .task(id: drama.id) {
-                related = (try? await DramaAPI.shared.related(id: drama.id)) ?? []
+            .task(id: loadsContent) {
+                guard loadsContent else { return }
+                let works = (try? await DramaAPI.shared.related(id: drama.id)) ?? []
+                guard !Task.isCancelled else { return }
+                withAnimation(initialEpisodeID == nil ? nil : .easeInOut(duration: 0.24)) { related = works }
                 // The related plan carries no release date; look up the few upcoming works one by one.
                 for work in related.filter(\.upcoming).prefix(3) {
                     guard let text = try? await DramaAPI.shared.upcomingRelease(id: work.id, title: work.drama.title), !text.isEmpty,
@@ -93,6 +144,8 @@ struct DetailView: View {
                     favoriteChip(symbol: account.isFavorite(drama) ? "checkmark.icloud" : "icloud", title: account.pendingFavorites.contains(drama.id) ? "核对账号收藏" : account.isFavorite(drama) ? "账号已收藏" : "账号收藏",
                                  caption: "同步红果账号", selected: account.isFavorite(drama))
                 }.buttonStyle(.plain).disabled(account.busy)
+            } else if transitionPreview {
+                favoriteChip(symbol: "icloud", title: "账号收藏", caption: "登录后同步", selected: false)
             } else {
                 NavigationLink { AccountView() } label: { favoriteChip(symbol: "icloud", title: "账号收藏", caption: "登录后同步", selected: false) }.buttonStyle(.plain)
             }
@@ -165,6 +218,10 @@ struct DetailView: View {
 
     private func show(_ loaded: DramaDetail) {
         detail = loaded
-        if let entry = resume ?? model.latestProgress(for: drama.id) { selected = loaded.episodes.firstIndex { $0.id == entry.episodeID } ?? loaded.episodes.firstIndex { $0.index == entry.episodeIndex } ?? 0 }
+        if let initialEpisodeID, let index = loaded.episodes.firstIndex(where: { $0.id == initialEpisodeID }) {
+            selected = index
+        } else if let entry = resume ?? model.latestProgress(for: drama.id) {
+            selected = loaded.episodes.firstIndex { $0.id == entry.episodeID } ?? loaded.episodes.firstIndex { $0.index == entry.episodeIndex } ?? 0
+        }
     }
 }

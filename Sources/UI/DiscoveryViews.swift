@@ -657,6 +657,7 @@ struct SearchView: View {
     @State private var query = ""
     @State private var submitted = ""
     @State private var suggestions: [String] = []
+    @State private var didFocusOnEntry = false
     @FocusState private var focused: Bool
     var body: some View {
         ScrollView {
@@ -688,6 +689,11 @@ struct SearchView: View {
             }.padding(20)
         }.navigationTitle("搜索").navigationBarTitleDisplayMode(.inline).appBackground(model.appearance).onDisappear { focused = false }
             .secondaryPage()
+            .onAppear {
+                guard !didFocusOnEntry else { return }
+                didFocusOnEntry = true
+                focused = true
+            }
             // Optional help while typing: a failure simply shows no suggestions.
             .task(id: query) {
                 let value = query.trimmingCharacters(in: .whitespacesAndNewlines)

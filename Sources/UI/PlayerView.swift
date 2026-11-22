@@ -9,6 +9,7 @@ struct PlayerScreen: View {
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @EnvironmentObject private var library: LibraryStore
     @StateObject private var session: PlayerSession
     @StateObject private var surface = PlayerSurface()
@@ -25,6 +26,17 @@ struct PlayerScreen: View {
     @State private var started = false
     @State private var detailVisible = false
     @State private var resumeAfterDetail = false
+    @State private var detailSelectedIndex = 0
+    @State private var detailSwipe: DetailSwipe?
+    @State private var detailReveal: CGFloat = 0
+    @State private var detailHandoffCover: UIView?
+    @State private var pageWidth: CGFloat = 1
+    private struct DetailSwipe {
+        let token = UUID()
+        let playID: UUID
+        let item: AVPlayerItem?
+        var settling = false
+    }
     // Page drag: the current picture follows the finger and the neighbouring episode number slides in.
     @State private var pageHeight: CGFloat = 1
     @State private var dragOffset: CGFloat = 0
@@ -51,6 +63,14 @@ struct PlayerScreen: View {
         scenePhase == .background && !detailVisible && !surface.pipInProgress && backgroundPlayback != .suspended
     }
     private var sheetVisible: Bool { episodesVisible || moreVisible || detailVisible || commentsVisible }
+    private var canSwipeDetail: Bool {
+        inlineForeground && !locked && !sheetVisible && !dragging && !sliding && !session.scrubbing && !session.holding
+    }
+    private var approachingEpisodeEnd: Bool {
+        guard let player = session.player, player.rate > 0, let item = player.currentItem else { return false }
+        let remaining = item.duration.seconds - player.currentTime().seconds
+        return remaining.isFinite && remaining <= max(1, Double(player.rate))
+    }
     /// Just under a picture wider than tall, as in the official app.
     private var fullScreenOffered: Bool {
         !landscape && !chromeHidden && session.rendered && session.error == nil && !dragging && !sliding
@@ -77,9 +97,10 @@ struct PlayerScreen: View {
                                      lockSpeed: { if session.holding && !sliding && !sheetVisible { session.lockSpeed() } },
                                      dragChanged: dragChanged, dragEnded: dragEnded, dragCancelled: dragCancelled,
                                      allowsRightSwipe: landscape,
-                                     navigate: videoSwiped,
+                                     detailDragBegan: detailDragBegan, detailDragChanged: detailDragChanged, detailDragEnded: detailDragEnded,
+                                     detailDragCancelled: cancelDetailSwipe, exitFullScreen: videoSwipedRight,
                                      seekChanged: seekDragChanged, seekEnded: seekDragEnded, seekCancelled: seekDragCancelled,
-                                     pinched: { enabled in if !landscape { setCleanScreen(enabled) } })
+                                     pinched: { enabled in if !landscape && detailSwipe == nil { setCleanScreen(enabled) } })
                         .overlay {
                             if inlineForeground && session.holding && !sheetVisible && !sliding, let speedLockZone {
                                 SpeedLockTarget(zone: speedLockZone)
@@ -90,7 +111,10 @@ struct PlayerScreen: View {
                         .accessibilityValue(session.pausedBySleepTimer ? "已暂停" : session.speedLocked ? "已锁定 2 倍速" : session.isPlaying ? "播放中" : session.player == nil ? "准备中" : "已暂停")
                         .accessibilityHint(videoAccessibilityHint)
                         .accessibilityAddTraits(.isButton)
-                        .accessibilityAction { if locked { lockButtonVisible = true } else { session.toggle() } }
+                        .accessibilityAction {
+                            guard detailSwipe == nil else { return }
+                            if locked { lockButtonVisible = true } else { session.toggle() }
+                        }
                         .accessibilityActions {
                             if !locked {
                                 Button(cleanScreen ? "退出清屏" : "清屏播放") { setCleanScreen(!cleanScreen) }
@@ -100,10 +124,10 @@ struct PlayerScreen: View {
                                 if session.speedLocked { Button("解锁倍速", action: session.unlockSpeed) }
                             }
                         }
-                        .accessibilityHidden(!inlineForeground)
+                        .accessibilityHidden(!inlineForeground || detailSwipe != nil)
                     Color.clear.frame(height: cleanScreen || locked ? 0 : (geometry.size.height < 420 ? 76 : 92)).allowsHitTesting(false)
                 }.ignoresSafeArea(edges: cleanScreen || locked ? .all : []).zIndex(1)
-                if inlineForeground && landscape && (locked ? lockButtonVisible : !chromeHidden) {
+                if inlineForeground && landscape && detailSwipe == nil && (locked ? lockButtonVisible : !chromeHidden) {
                     lockButton.padding(.trailing, 10).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
                         .transition(.opacity).zIndex(3)
                 }
@@ -119,7 +143,7 @@ struct PlayerScreen: View {
                                 .padding(.horizontal, 13).padding(.vertical, 8).background(.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
                         }.buttonStyle(.plain).accessibilityIdentifier("player.fullScreen")
                         .position(x: full.size.width / 2, y: (full.size.height + pictureHeight) / 2 + 30)
-                    }.ignoresSafeArea().zIndex(1.5).transition(.opacity)
+                    }.ignoresSafeArea().zIndex(1.5).transition(.opacity).allowsHitTesting(detailSwipe == nil)
                 }
                 LinearGradient(colors: [.black.opacity(0.55), .clear], startPoint: .top, endPoint: .bottom).frame(height: 150).frame(maxHeight: .infinity, alignment: .top).ignoresSafeArea().opacity(chromeHidden ? 0 : 1).allowsHitTesting(false)
                 LinearGradient(colors: [.clear, .black.opacity(0.9)], startPoint: .top, endPoint: .bottom).frame(height: min(geometry.size.height * 0.45, 300)).frame(maxHeight: .infinity, alignment: .bottom).ignoresSafeArea().opacity(chromeHidden ? 0 : 1).allowsHitTesting(false)
@@ -146,26 +170,29 @@ struct PlayerScreen: View {
                     else if !chromeHidden && !session.isPlaying && session.rendered && session.player != nil {
                         resumeButton
                     }
-                }.zIndex(2)
+                }.zIndex(2).allowsHitTesting(detailSwipe == nil)
                 VStack(spacing: 0) {
                     chrome { topBar }
                     Spacer(minLength: 0)
                     if let end = session.endMessage { chrome { Text(end).font(.caption).foregroundStyle(.white.opacity(0.8)).padding(.bottom, 12) } }
                     chrome { bottomBar(compact: geometry.size.height < 420) }
-                }.padding(.horizontal, landscape ? 18 : 16).padding(.top, 2).padding(.bottom, landscape ? 0 : 8).zIndex(2).allowsHitTesting(!sliding)
+                }.padding(.horizontal, landscape ? 18 : 16).padding(.top, 2).padding(.bottom, landscape ? 0 : 8).zIndex(2).allowsHitTesting(!sliding && detailSwipe == nil)
                 if !landscape && !chromeHidden && !dragging && !sliding {
                     sideActions
                         .padding(.trailing, 10)
                         .padding(.bottom, 118)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                         .zIndex(2.5)
+                        .allowsHitTesting(detailSwipe == nil)
                 }
             }.foregroundStyle(.white)
+            .opacity(detailSwipe == nil ? 1 : 1 - 0.18 * detailReveal)
             .overlay(alignment: .topTrailing) {
                 if inlineForeground && !locked && !explicitCleanScreen {
                     SpeedLockStatus(locked: session.speedLocked, restoredSpeed: speedLabel,
                                     identifier: "player.speedUnlock", unlock: session.unlockSpeed)
                         .padding(.trailing, 20).padding(.top, 58)
+                        .allowsHitTesting(detailSwipe == nil)
                 }
             }
             .animation(.easeOut(duration: 0.18), value: chromeHidden)
@@ -176,8 +203,8 @@ struct PlayerScreen: View {
         .background {
             GeometryReader { full in
                 pages(height: full.size.height)
-                    .onAppear { pageHeight = max(full.size.height, 1); landscape = full.size.width > full.size.height }
-                    .onChange(of: full.size) { _, size in pageHeight = max(size.height, 1); landscape = size.width > size.height }
+                    .onAppear { updatePlayerGeometry(full.size) }
+                    .onChange(of: full.size) { _, size in updatePlayerGeometry(size) }
             }.background(.black).ignoresSafeArea().allowsHitTesting(false)
         }
         .environment(\.colorScheme, .dark).statusBarHidden(landscape).persistentSystemOverlays(landscape && inlineForeground && chromeHidden ? .hidden : .automatic)
@@ -199,10 +226,12 @@ struct PlayerScreen: View {
                                player: session.player,
                                foreground: inlineForeground, hideDanmaku: explicitCleanScreen,
                                presented: $commentsVisible)
+            .overlay { detailSwipeOverlay }
             .background(InteractiveBackSwipe(enabled: inlineForeground && !landscape && !locked && !sheetVisible
-                                             && !dragging && !sliding && !session.scrubbing && !session.holding))
+                                             && !dragging && !sliding && !session.scrubbing && !session.holding && detailSwipe == nil))
             .navigationDestination(isPresented: $detailVisible) {
-                DetailView(drama: session.detail.drama)
+                DetailView(detail: session.detail, selected: detailSelectedIndex, loadsContent: detailHandoffCover == nil)
+                    .background(PlayerDetailArrival(arrived: finishDetailHandoff))
             }
             .onChange(of: detailVisible) { _, shown in if !shown { detailClosed() } }
             .onAppear { if !detailVisible { session.app.showPlayback(request) } }
@@ -215,6 +244,7 @@ struct PlayerScreen: View {
                 session.onSlide = { target in slide(to: target) }; session.start()
             }
             .onDisappear {
+                resetDetailSwipe()
                 session.app.hidePlayback(request.id)
                 if !detailVisible { unlock(); session.stop(); surface.unbind() }
             }
@@ -229,6 +259,7 @@ struct PlayerScreen: View {
             // Only a real move to the background pauses: an episode that is playing then goes on in the small window
             // (the system starts it as the app leaves), and anything else stops as before.
             .onChange(of: scenePhase) { _, phase in
+                if phase != .active { finishDetailHandoff() }
                 if phase == .background && backgroundPlayback == .foreground { backgroundPlayback = .waiting }
                 if phase == .active { restoreFromBackground() }
             }
@@ -239,6 +270,7 @@ struct PlayerScreen: View {
             .onChange(of: session.pausedBySleepTimer) { _, paused in
                 if paused {
                     resumeAfterDetail = false
+                    resetDetailSwipe()
                     dragCancelled()
                     if surface.pipActive { surface.stopPictureInPicture() }
                 }
@@ -251,9 +283,14 @@ struct PlayerScreen: View {
             // An episode that changes mid-drag (autoplay at the end of a 2× hold, for example) ends that drag. The
             // gesture view's own cancellation can arrive during a view update, where its state change is dropped.
             .onChange(of: session.playID) { _, _ in
+                resetDetailSwipe()
                 if dragOrigin != nil { dragOffset = 0 }
                 seekDragCancelled()
                 seekDragAbandoned = true
+            }
+            .onChange(of: canSwipeDetail) { _, allowed in if !allowed { resetDetailSwipe() } }
+            .onChange(of: session.position) { _, _ in
+                if detailSwipe != nil && approachingEpisodeEnd { resetDetailSwipe() }
             }
             // In full screen the controls step aside after a few seconds of playback.
             .task(id: shouldAutoHideChrome) {
@@ -310,15 +347,15 @@ struct PlayerScreen: View {
     }
 
     private func videoTapped(at fraction: CGFloat) {
+        guard detailSwipe == nil else { return }
         if locked { lockButtonVisible.toggle() }
         else if cleanScreen { setCleanScreen(false) }
         else { cleanScreen = true }
     }
 
-    private func videoSwiped(_ direction: HorizontalSwipeDirection) {
-        guard inlineForeground, !locked, !sheetVisible, !dragging, !sliding, !session.scrubbing else { return }
-        if direction == .left { openDetail() }
-        else if landscape { exitFullScreen() }
+    private func videoSwipedRight() {
+        guard canSwipeDetail, detailSwipe == nil, landscape else { return }
+        exitFullScreen()
     }
 
     private func goBack() {
@@ -350,6 +387,7 @@ struct PlayerScreen: View {
     }
 
     private func videoDoubleTapped(at fraction: CGFloat) {
+        guard detailSwipe == nil else { return }
         if session.player != nil || session.pausedBySleepTimer { session.toggle() }
     }
 
@@ -361,6 +399,7 @@ struct PlayerScreen: View {
     }
 
     private func speedHoldBegan(_ zone: SpeedLockZone) -> Bool {
+        guard detailSwipe == nil else { return false }
         seekDragAbandoned = false
         session.beginHold()
         guard session.holding else { return false }
@@ -396,14 +435,104 @@ struct PlayerScreen: View {
         session.endDragSeek(from: start, commit: false)
     }
 
+    private func updatePlayerGeometry(_ size: CGSize) {
+        if pageWidth != size.width || pageHeight != size.height { resetDetailSwipe() }
+        pageWidth = max(size.width, 1)
+        pageHeight = max(size.height, 1)
+        landscape = size.width > size.height
+    }
+
+    private func detailDragBegan(_ distance: CGFloat) {
+        guard canSwipeDetail, detailSwipe == nil, !approachingEpisodeEnd else { return }
+        detailSwipe = DetailSwipe(playID: session.playID, item: session.player?.currentItem)
+        detailDragChanged(distance)
+    }
+
+    private func detailDragChanged(_ distance: CGFloat) {
+        guard let swipe = detailSwipe, !swipe.settling else { return }
+        guard canContinueDetailSwipe(swipe) else { resetDetailSwipe(); return }
+        detailReveal = min(max(distance / pageWidth, 0), 1)
+    }
+
+    private func detailDragEnded(_ distance: CGFloat, _ velocity: CGFloat) {
+        guard let swipe = detailSwipe, !swipe.settling else { return }
+        let projected = distance + velocity * 0.18
+        let commit = canContinueDetailSwipe(swipe) && distance >= min(64, pageWidth * 0.15)
+            && (distance >= pageWidth * 0.38 || projected >= pageWidth * 0.32)
+            && velocity > -250
+        settleDetailSwipe(commit: commit)
+    }
+
+    private func canContinueDetailSwipe(_ swipe: DetailSwipe) -> Bool {
+        canSwipeDetail && swipe.playID == session.playID && !approachingEpisodeEnd
+            && (swipe.item == nil || swipe.item === session.player?.currentItem)
+    }
+
+    private func cancelDetailSwipe() {
+        guard detailSwipe?.settling == false else { return }
+        settleDetailSwipe(commit: false)
+    }
+
+    private func settleDetailSwipe(commit: Bool) {
+        guard let swipe = detailSwipe else { return }
+        detailSwipe?.settling = true
+        withAnimation(.easeOut(duration: reduceMotion ? 0 : (commit ? 0.22 : 0.20)), completionCriteria: .removed) {
+            detailReveal = commit ? 1 : 0
+        } completion: {
+            guard detailSwipe?.token == swipe.token else { return }
+            if commit && canContinueDetailSwipe(swipe) {
+                coverDetailHandoff()
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) { openDetail() }
+            } else { resetDetailSwipe() }
+        }
+    }
+
+    private func resetDetailSwipe() {
+        detailSwipe = nil
+        detailReveal = 0
+    }
+
+    private func coverDetailHandoff() {
+        guard let window = surface.view.window, let cover = window.snapshotView(afterScreenUpdates: true) else { return }
+        cover.frame = window.bounds
+        cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        cover.accessibilityElementsHidden = true
+        window.addSubview(cover)
+        detailHandoffCover = cover
+        Task { @MainActor [weak cover] in
+            try? await Task.sleep(for: .seconds(1))
+            if let cover, detailHandoffCover === cover { finishDetailHandoff() }
+        }
+    }
+
+    private func finishDetailHandoff() {
+        detailHandoffCover?.removeFromSuperview()
+        detailHandoffCover = nil
+    }
+
+    private var detailSwipeOverlay: some View {
+        GeometryReader { geometry in
+            if detailSwipe != nil {
+                DetailView(detail: session.detail, selected: session.index, transitionPreview: true)
+                    .shadow(color: .black.opacity(0.25), radius: 12)
+                    .offset(x: geometry.size.width * (1 - detailReveal))
+                    .transition(.identity)
+            }
+        }.allowsHitTesting(false).accessibilityHidden(true)
+    }
+
     private func openDetail() {
         guard !detailVisible else { return }
+        detailSelectedIndex = session.index
         resumeAfterDetail = session.preparing || session.isPlaying || session.player?.timeControlStatus == .waitingToPlayAtSpecifiedRate
         if resumeAfterDetail { session.pause() }
         detailVisible = true
     }
 
     private func detailClosed() {
+        finishDetailHandoff()
         session.app.showPlayback(request)
         if resumeAfterDetail, !session.isPlaying, !session.pausedBySleepTimer {
             try? AVAudioSession.sharedInstance().setActive(true)
@@ -413,7 +542,7 @@ struct PlayerScreen: View {
     }
 
     private var shouldAutoHideChrome: Bool {
-        landscape && !chromeHidden && session.isPlaying && !session.scrubbing && !sheetVisible
+        landscape && !chromeHidden && session.isPlaying && !session.scrubbing && !sheetVisible && detailSwipe == nil
     }
 
     private func enterFullScreen() { requestOrientation(.landscape) }
@@ -477,7 +606,7 @@ struct PlayerScreen: View {
     }
 
     private func dragChanged(_ translation: CGFloat) {
-        guard !sliding, !locked, !sheetVisible, inlineForeground else { return }
+        guard detailSwipe == nil, !sliding, !locked, !sheetVisible, inlineForeground else { return }
         if dragOrigin == nil { dragOrigin = session.playID }
         guard dragging else { return }
         let atFirst = session.index == 0 && translation > 0
@@ -514,7 +643,7 @@ struct PlayerScreen: View {
 
     /// Autoplay, buttons and the episode sheet slide the same way a swipe does. Touches are off until the slide ends.
     private func slide(to target: Int) {
-        guard !sliding, !dragging, target != session.index, session.detail.episodes.indices.contains(target) else { return }
+        guard detailSwipe == nil, !sliding, !dragging, target != session.index, session.detail.episodes.indices.contains(target) else { return }
         if landscape || !inlineForeground { session.load(index: target); return }
         commitSlide(to: target)
     }
@@ -623,6 +752,27 @@ struct PlayerScreen: View {
 
     private var speedLabel: String { String(format: "%g×", session.app.speed) }
 
+}
+
+private struct PlayerDetailArrival: UIViewControllerRepresentable {
+    let arrived: () -> Void
+
+    func makeUIViewController(context: Context) -> Controller { Controller() }
+    func updateUIViewController(_ controller: Controller, context: Context) { controller.arrived = arrived }
+
+    final class Controller: UIViewController {
+        var arrived: (() -> Void)?
+
+        override func loadView() {
+            view = UIView()
+            view.isUserInteractionEnabled = false
+        }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            arrived?()
+        }
+    }
 }
 
 struct DelayedPlaybackLoading<Content: View, Fallback: View>: View {

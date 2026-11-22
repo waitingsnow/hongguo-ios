@@ -265,7 +265,7 @@ extension View {
     func appBackground(_ theme: ThemeColors) -> some View { self.background(theme.background.ignoresSafeArea()).toolbarBackground(theme.background, for: .navigationBar).toolbarBackground(.visible, for: .navigationBar) }
     /// Pages pushed from 我的 (settings, account) cover the tab bar, like Android's full-screen settings.
     func secondaryPage() -> some View {
-        toolbar(.hidden, for: .tabBar).background(InteractiveBackSwipe(enabled: true))
+        background(NavigationTabBar(hidden: true)).background(InteractiveBackSwipe(enabled: true))
     }
     /// Tab roots draw their own header; a zero-height inset keeps scrolled content from showing under the status bar.
     func tabRoot(_ theme: ThemeColors) -> some View {

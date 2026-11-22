@@ -66,6 +66,7 @@ struct RootView: View {
         NavigationStack {
             content()
                 .navigationDestination(for: Drama.self) { DetailView(drama: $0) }
+                .background(NavigationTabBar(hidden: false))
         }
     }
 
@@ -104,7 +105,100 @@ private struct PlaybackDestination: View {
     var body: some View {
         PlayerScreen(request: request, model: model) { request = $0 }
             .id(request.id)
-            .toolbar(.hidden, for: .navigationBar, .tabBar)
+            .toolbar(.hidden, for: .navigationBar)
+            .background(NavigationTabBar(hidden: true))
+    }
+}
+
+struct NavigationTabBar: UIViewControllerRepresentable {
+    let hidden: Bool
+
+    func makeUIViewController(context: Context) -> Controller { Controller(hidden: hidden) }
+    func updateUIViewController(_ controller: Controller, context: Context) {}
+
+    final class Controller: UIViewController {
+        let hidden: Bool
+
+        init(hidden: Bool) {
+            self.hidden = hidden
+            super.init(nibName: nil, bundle: nil)
+        }
+
+        required init?(coder: NSCoder) { fatalError() }
+
+        override func loadView() {
+            view = UIView()
+            view.isUserInteractionEnabled = false
+        }
+
+        override func viewWillAppear(_ animated: Bool) {
+            super.viewWillAppear(animated)
+            updateTabBar()
+        }
+
+        private func updateTabBar() {
+            guard let navigationController, let tabs = tabBarController else { return }
+            var page = parent
+            while let ancestor = page, ancestor.parent !== navigationController { page = ancestor.parent }
+            guard let page else { return }
+
+            let bar = tabs.tabBar
+            let wasHidden: Bool
+            if #available(iOS 18.0, *) { wasHidden = tabs.isTabBarHidden }
+            else { wasHidden = bar.isHidden }
+            guard wasHidden != hidden else { return }
+
+            guard let transition = navigationController.transitionCoordinator,
+                  let source = transition.viewController(forKey: .from),
+                  let destination = transition.viewController(forKey: .to), source !== destination,
+                  destination === page, navigationController.viewControllers.contains(destination) else {
+                if navigationController.transitionCoordinator == nil && navigationController.topViewController === page {
+                    Self.setHidden(hidden, in: tabs)
+                }
+                return
+            }
+
+            guard let container = tabs.viewIfLoaded, bar.bounds.width > 0, bar.bounds.height > 0 else {
+                Self.setHidden(hidden, in: tabs)
+                return
+            }
+            if wasHidden {
+                Self.setHidden(false, in: tabs)
+                let offset = bar.bounds.height + container.safeAreaInsets.bottom
+                bar.transform = CGAffineTransform(translationX: 0, y: offset)
+                let accepted = transition.animateAlongsideTransition(in: bar, animation: { _ in
+                    bar.transform = .identity
+                }, completion: { context in
+                    Self.setHidden(context.isCancelled, in: tabs)
+                    bar.transform = .identity
+                })
+                if !accepted { bar.transform = .identity }
+                return
+            }
+            let frame = bar.convert(bar.bounds, to: container)
+            let image = UIGraphicsImageRenderer(size: frame.size).image { _ in
+                container.drawHierarchy(in: container.bounds.offsetBy(dx: -frame.minX, dy: -frame.minY), afterScreenUpdates: false)
+            }
+            let snapshot = UIImageView(image: image)
+            let offscreen = frame.offsetBy(dx: 0, dy: container.bounds.maxY - frame.minY)
+            snapshot.frame = frame
+            snapshot.isUserInteractionEnabled = false
+            snapshot.accessibilityElementsHidden = true
+            container.addSubview(snapshot)
+            Self.setHidden(true, in: tabs)
+            let accepted = transition.animateAlongsideTransition(in: container, animation: { _ in
+                snapshot.frame = offscreen
+            }, completion: { context in
+                if context.isCancelled { Self.setHidden(false, in: tabs) }
+                snapshot.removeFromSuperview()
+            })
+            if !accepted { snapshot.removeFromSuperview() }
+        }
+
+        private static func setHidden(_ hidden: Bool, in tabs: UITabBarController) {
+            if #available(iOS 18.0, *) { tabs.setTabBarHidden(hidden, animated: false) }
+            else { tabs.tabBar.isHidden = hidden }
+        }
     }
 }
 

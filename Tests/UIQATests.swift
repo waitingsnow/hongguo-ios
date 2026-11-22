@@ -75,6 +75,21 @@ final class HongguoQATests: XCTestCase {
         XCTAssertTrue(app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH %@", "home.featured.")).firstMatch.waitForExistence(timeout: 3))
     }
 
+    func testSearchAcceptsTypingOnEntry() {
+        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        app.launchArguments = ["-theme", "warm", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO"]
+        app.launch()
+        let entry = app.buttons["搜索短剧"]
+        let field = app.textFields["搜索剧名或关键词"]
+        for _ in 0..<2 {
+            entry.tap()
+            XCTAssertTrue(field.waitForExistence(timeout: 5))
+            app.typeText(" ")
+            XCTAssertEqual(field.value as? String, " ")
+            app.navigationBars.buttons.firstMatch.tap()
+        }
+    }
+
     /// Anonymous live catalogue only, using a task-specific simulator with no personal account.
     func testHomeSectionsDoNotRepeat() throws {
         continueAfterFailure = false
@@ -295,6 +310,20 @@ final class HongguoQATests: XCTestCase {
         edge.press(forDuration: 0, thenDragTo: shortDrag, withVelocity: .slow, thenHoldForDuration: 0.5)
         XCTAssertTrue(video.wait(for: \.isHittable, toEqual: true, timeout: 5))
         XCTAssertFalse(detailBar.isHittable)
+        assertEpisode(1, in: app)
+        assertPlayback("播放中", in: app, timeout: 5)
+
+        let start = video.coordinate(withNormalizedOffset: CGVector(dx: 0.70, dy: 0.55))
+        let partial = video.coordinate(withNormalizedOffset: CGVector(dx: 0.46, dy: 0.55))
+        start.press(forDuration: 0, thenDragTo: partial, withVelocity: .slow, thenHoldForDuration: 0.4)
+        XCTAssertFalse(detailBar.isHittable, "A partial left drag must cancel without opening details")
+        assertEpisode(1, in: app)
+        assertPlayback("播放中", in: app, timeout: 5)
+
+        let finish = video.coordinate(withNormalizedOffset: CGVector(dx: 0.12, dy: 0.55))
+        start.press(forDuration: 0, thenDragTo: finish, withVelocity: .slow, thenHoldForDuration: 0.2)
+        XCTAssertTrue(detailBar.buttons.firstMatch.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        swipeRight(in: app, from: 0)
         assertEpisode(1, in: app)
         assertPlayback("播放中", in: app, timeout: 5)
 

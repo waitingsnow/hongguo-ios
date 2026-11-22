@@ -256,7 +256,11 @@ struct VideoGestureView: UIViewRepresentable {
     let dragEnded: (CGFloat, CGFloat) -> Void
     let dragCancelled: () -> Void
     let allowsRightSwipe: Bool
-    let navigate: (HorizontalSwipeDirection) -> Void
+    let detailDragBegan: (CGFloat) -> Void
+    let detailDragChanged: (CGFloat) -> Void
+    let detailDragEnded: (CGFloat, CGFloat) -> Void
+    let detailDragCancelled: () -> Void
+    let exitFullScreen: () -> Void
     let seekChanged: (CGFloat) -> Void
     let seekEnded: (CGFloat) -> Void
     let seekCancelled: () -> Void
@@ -301,6 +305,7 @@ struct VideoGestureView: UIViewRepresentable {
         init(_ parent: VideoGestureView) { self.parent = parent }
 
         @objc func pinchChanged(_ gesture: UIPinchGestureRecognizer) {
+            guard navigationDirection == nil else { return }
             if gesture.state == .began { pinchDecided = false }
             guard gesture.state == .changed, !pinchDecided, gesture.scale >= 1.18 || gesture.scale <= 0.85 else { return }
             pinchDecided = true
@@ -352,8 +357,26 @@ struct VideoGestureView: UIViewRepresentable {
         @objc func panned(_ gesture: UIPanGestureRecognizer) {
             guard let view = gesture.view else { return }
             if let direction = navigationDirection {
-                if gesture.state == .ended, direction.completes(gesture.translation(in: view)) {
-                    parent.navigate(direction)
+                let translation = gesture.translation(in: view.window ?? view)
+                switch gesture.state {
+                case .began:
+                    if direction == .left { parent.detailDragBegan(-translation.x) }
+                case .changed:
+                    if direction == .left { parent.detailDragChanged(-translation.x) }
+                case .ended:
+                    navigationDirection = nil
+                    if direction == .left {
+                        parent.detailDragEnded(-translation.x, -gesture.velocity(in: view.window ?? view).x)
+                    } else if direction.completes(translation) {
+                        parent.exitFullScreen()
+                    }
+                case .cancelled, .failed:
+                    navigationDirection = nil
+                    if direction == .left {
+                        let cancel = parent.detailDragCancelled
+                        Task { @MainActor in cancel() }
+                    }
+                default: break
                 }
                 return
             }
