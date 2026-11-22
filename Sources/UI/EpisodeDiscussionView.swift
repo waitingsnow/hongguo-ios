@@ -33,10 +33,11 @@ struct DiscussionControls: View {
     @Environment(\.episodeCommentPreview) private var preview
     @Environment(\.episodeDanmakuSource) private var danmakuSource
     var vertical = false
+    var spacing: CGFloat?
     let showComments: () -> Void
 
     var body: some View {
-        let layout = vertical ? AnyLayout(VStackLayout(spacing: 4)) : AnyLayout(HStackLayout(spacing: 2))
+        let layout = vertical ? AnyLayout(VStackLayout(spacing: spacing ?? 4)) : AnyLayout(HStackLayout(spacing: spacing ?? 2))
         let available = danmakuSource.isAvailable(preview)
         let danmakuCount = danmakuSource.count(preview)
         let commentCount = preview?.displayCount

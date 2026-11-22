@@ -82,6 +82,42 @@ final class HongguoQATests: XCTestCase {
         XCTAssertTrue(app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH %@", "home.featured.")).firstMatch.waitForExistence(timeout: 3))
     }
 
+    func testImmersiveFeedHeaderAndActionSpacing() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["HONGGUO_QA_MODE"] == "--live")
+        continueAfterFailure = false
+        let app = testApplication()
+        app.launchArguments = ["-theme", "warm", "-hasChosenTheme", "YES",
+                               "-autoNext", "NO", "-updates.checkOnLaunch", "NO"]
+        app.launch()
+        let exit = app.buttons["immersive_exit"]
+        let enter = app.buttons["home.feedMode"]
+        if enter.exists { enter.tap() }
+        let search = app.buttons["搜索"]
+        let first = app.buttons["推荐"]
+        let last = app.buttons["漫剧"]
+        XCTAssertTrue(exit.waitForExistence(timeout: 10))
+        XCTAssertEqual((first.frame.minX + last.frame.maxX) / 2, app.frame.midX, accuracy: 1)
+        XCTAssertEqual(first.frame.midY, exit.frame.midY, accuracy: 1)
+        XCTAssertEqual(last.frame.midY, search.frame.midY, accuracy: 1)
+        XCTAssertFalse(app.buttons["刷新推荐"].exists)
+        app.buttons["热度"].tap()
+        let favorite = app.buttons["immersive_favorite_0"]
+        let danmaku = app.buttons["discussion.toggle"].firstMatch
+        let comments = app.buttons["discussion.comments"].firstMatch
+        XCTAssertTrue(comments.waitForExistence(timeout: 45))
+        if comments.frame.midY > favorite.frame.maxY {
+            XCTAssertGreaterThanOrEqual(danmaku.frame.minY - favorite.frame.maxY, 15)
+            XCTAssertGreaterThanOrEqual(comments.frame.minY - danmaku.frame.maxY, 15)
+        } else {
+            XCTAssertGreaterThanOrEqual(danmaku.frame.minX - favorite.frame.maxX, 7)
+            XCTAssertGreaterThanOrEqual(comments.frame.minX - danmaku.frame.maxX, 7)
+        }
+        capture("immersive-feed-header-and-actions")
+        exit.tap()
+        XCTAssertTrue(enter.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["刷新首页"].exists)
+    }
+
     func testSearchAcceptsTypingOnEntry() {
         let app = testApplication()
         app.launchArguments = ["-theme", "warm", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO"]

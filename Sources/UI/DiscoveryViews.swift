@@ -41,12 +41,6 @@ struct HomeView: View {
         .onChange(of: account.guessFeedAccess) { _, _ in if feed == "guess" { revalidate() } }
     }
 
-    private var refreshButton: some View {
-        CatalogRefreshButton(title: "刷新首页", busy: loader.isRefreshing, enabled: canRequestFeed, action: refresh) {
-            HeaderIcon(symbol: "arrow.clockwise")
-        }
-    }
-
     private var feedModeButton: some View {
         Button { feedMode = true } label: { HeaderIcon(symbol: "play.rectangle.on.rectangle") }.buttonStyle(.plain)
             .accessibilityLabel("全屏刷剧").accessibilityIdentifier("home.feedMode")
@@ -60,7 +54,6 @@ struct HomeView: View {
                     VStack(alignment: .leading, spacing: 2) { Text("红果剧场").font(.title2.bold()).foregroundStyle(model.appearance.ink); Text("好故事，随时接着看").font(.caption).foregroundStyle(model.appearance.muted) }
                     Spacer()
                     feedModeButton
-                    refreshButton
                 }
                 SearchEntry()
                 if let first = loader.dramas.first, model.appearance == .warm { featured(first) }
@@ -349,28 +342,32 @@ private struct ImmersiveFeed: View {
 
     private var topBar: some View {
         HStack(spacing: 0) {
-            if let exit {
-                Button(action: exit) { AppControlIcon(name: "square.grid.2x2") }
-                    .accessibilityLabel("返回卡片首页").accessibilityIdentifier("immersive_exit")
-            }
-            CatalogRefreshButton(title: "刷新推荐", busy: loader.isRefreshing, enabled: canRefresh, indicatorColor: .white, action: refresh) {
-                AppControlIcon(name: "arrow.clockwise")
-            }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 16) {
-                    ForEach(feeds, id: \.0) { value, name in
-                        let selected = feed == value
-                        Button { feed = value } label: {
-                            VStack(spacing: 4) {
+            ZStack {
+                if let exit {
+                    Button(action: exit) { AppControlIcon(name: "square.grid.2x2") }
+                        .accessibilityLabel("返回卡片首页").accessibilityIdentifier("immersive_exit")
+                }
+            }.frame(width: 44, height: 44)
+            GeometryReader { region in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        ForEach(feeds, id: \.0) { value, name in
+                            let selected = feed == value
+                            Button { feed = value } label: {
                                 Text(name).font(.system(size: selected ? 17 : 16, weight: selected ? .bold : .medium))
                                     .foregroundStyle(.white.opacity(selected ? 1 : 0.7)).fixedSize()
-                                Capsule().fill(selected ? Color.white : .clear).frame(width: 18, height: 3)
-                            }.frame(minHeight: 44)
-                        }.buttonStyle(.plain).accessibilityAddTraits(selected ? .isSelected : [])
-                    }
+                                    .frame(minWidth: 44, minHeight: 44)
+                                    .overlay(alignment: .bottom) {
+                                        if selected { Capsule().fill(.white).frame(width: 18, height: 3).padding(.bottom, 2) }
+                                    }
+                                    .contentShape(Rectangle())
+                            }.buttonStyle(.plain).accessibilityAddTraits(selected ? .isSelected : [])
+                        }
+                    }.frame(minWidth: region.size.width)
                 }
             }.frame(height: 44)
             NavigationLink { SearchView() } label: { AppControlIcon(name: "magnifyingglass") }
+                .frame(width: 44, height: 44)
                 .accessibilityLabel("搜索")
         }.foregroundStyle(.white).padding(.horizontal, 8).padding(.top, 2)
             .shadow(color: .black.opacity(0.85), radius: 3, y: 1)
@@ -394,7 +391,7 @@ private struct ImmersiveFeed: View {
         if loader.dramas.isEmpty || loader.isRefreshing { return nil }
         if let error = loader.error { return (error, "重试", loadMore) }
         if loader.isLoading { return ("正在加载更多…", nil, {}) }
-        if !loader.hasMore && canRefresh { return ("已经看到最后一部了", "刷新", { Task { await refresh() } }) }
+        if !loader.hasMore && canRefresh { return ("已经看到最后一部了", nil, {}) }
         return nil
     }
 
@@ -411,14 +408,13 @@ private struct CatalogRefreshButton<Icon: View>: View {
     let title: String
     let busy: Bool
     var enabled = true
-    var indicatorColor = Color.primary
     let action: () async -> Void
     @ViewBuilder let icon: () -> Icon
 
     var body: some View {
         Button { Task { await action() } } label: {
             icon().opacity(busy ? 0 : 1)
-                .overlay { if busy { ProgressView().tint(indicatorColor) } }
+                .overlay { if busy { ProgressView().tint(.primary) } }
         }
         .buttonStyle(.plain)
         .disabled(busy || !enabled)
@@ -524,10 +520,11 @@ private struct ImmersivePage: View {
                             Text(drama.summary).font(.footnote).foregroundStyle(.white.opacity(0.8)).lineLimit(2)
                         }
                     }.frame(maxWidth: .infinity, alignment: .leading)
-                    let actions = dockInteractions ? AnyLayout(HStackLayout(spacing: 4)) : AnyLayout(VStackLayout(spacing: 4))
+                    let spacing: CGFloat = dockInteractions ? 8 : layout.context.interactionSpacing
+                    let actions = dockInteractions ? AnyLayout(HStackLayout(spacing: spacing)) : AnyLayout(VStackLayout(spacing: spacing))
                     actions {
                         favoriteButton
-                        if activeDetail != nil { DiscussionControls(vertical: !dockInteractions, showComments: openComments) }
+                        if activeDetail != nil { DiscussionControls(vertical: !dockInteractions, spacing: spacing, showComments: openComments) }
                     }.shadow(color: .black.opacity(0.8), radius: 2, y: 1)
                 }
                 episodeStrip

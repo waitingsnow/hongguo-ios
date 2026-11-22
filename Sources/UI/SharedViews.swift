@@ -32,6 +32,7 @@ struct PlaybackPictureLayout {
         var footer: CGFloat { self == .player ? 124 : 142 }
         var accessoryRoom: CGFloat { 44 }
         var interactionColumnBottom: CGFloat { self == .player ? 118 : 66 }
+        var interactionSpacing: CGFloat { self == .player ? 4 : 16 }
     }
 
     let canvas: CGSize
@@ -71,7 +72,7 @@ struct PlaybackPictureLayout {
     }
 
     private var interactionColumnTop: CGFloat {
-        canvas.height - insets.bottom - context.interactionColumnBottom - 140
+        canvas.height - insets.bottom - context.interactionColumnBottom - (3 * 44 + 2 * context.interactionSpacing)
     }
 
     func danmakuInsets(around picture: CGRect?) -> EdgeInsets {
