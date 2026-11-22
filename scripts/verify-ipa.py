@@ -25,6 +25,19 @@ PEM = re.compile(rb"(?:^|\n)-----BEGIN (?:[A-Z0-9 ]*PRIVATE KEY|CERTIFICATE(?: R
 MACHO_MAGICS = {bytes.fromhex(magic) for magic in (
     "feedface", "cefaedfe", "feedfacf", "cffaedfe", "cafebabe", "bebafeca", "cafebabf", "bfbafeca",
 )}
+SCAN_CHUNK_BYTES = 64 * 1024
+SCAN_CONTEXT_BYTES = 512
+OPENHONGGUO_GO_REPLACEMENTS = tuple(
+    re.compile(
+        re.escape(b"\ndep\tgithub.com/beilunyang/openhongguo" + suffix + b"\t" + version + b"\n=>\t")
+        + b"(" + re.escape(b"/Users/runner/work/openhongguo/openhongguo" + suffix) + b")"
+        + re.escape(b"\t(devel)\t\n")
+    )
+    for suffix, version in (
+        (b"", b"v0.0.0"),
+        (b"/bindings/mobile/core", b"v0.0.0-00010101000000-000000000000"),
+    )
+)
 
 
 def version_tuple(text):
@@ -45,19 +58,28 @@ def check_new_build(archive, executable, info, config):
         if entry.is_dir():
             continue
         with archive.open(entry) as stream:
-            chunk = stream.read(65536)
-            require(entry.filename == executable or chunk[:4] not in MACHO_MAGICS,
+            is_executable = entry.filename == executable
+            chunk = stream.read(SCAN_CHUNK_BYTES)
+            require(is_executable or chunk[:4] not in MACHO_MAGICS,
                     "Unexpected embedded Mach-O in unsigned IPA")
             tail = b""
             while chunk:
-                window = tail + chunk
-                chunk = stream.read(65536)
+                following = stream.read(SCAN_CHUNK_BYTES)
+                start = len(tail)
+                end = start + len(chunk)
+                window = tail + chunk + following[:SCAN_CONTEXT_BYTES]
+                public_paths = {
+                    record.start(1)
+                    for replacement in OPENHONGGUO_GO_REPLACEMENTS
+                    for record in replacement.finditer(window)
+                } if is_executable else set()
                 for kind, pattern in HOME_PATHS.items():
-                    match = pattern.search(window)
-                    require(match is None or (chunk and match.end() == len(window)),
+                    require(not any(match.start() < end and match.start() not in public_paths
+                                    for match in pattern.finditer(window, start)),
                             f"Private absolute home path detected ({kind})")
                 require(PEM.search(window) is None, "PEM signing material detected in IPA")
-                tail = window[-512:]
+                tail = chunk[-SCAN_CONTEXT_BYTES:]
+                chunk = following
 
 
 def main():

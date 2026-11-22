@@ -1,7 +1,103 @@
 import SwiftUI
 
+enum PortraitVideoPosition: String, CaseIterable, Identifiable {
+    static let key = "playback.portraitVideoPosition"
+    case top, center, bottom
+
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .top: "顶部"
+        case .center: "中间"
+        case .bottom: "底部"
+        }
+    }
+}
+
+struct PortraitVideoPositionPicker: View {
+    @AppStorage(PortraitVideoPosition.key) private var position: PortraitVideoPosition = .center
+
+    var body: some View {
+        Picker("竖屏横片位置", selection: $position) {
+            ForEach(PortraitVideoPosition.allCases) { Text($0.title).tag($0) }
+        }.accessibilityIdentifier("playback.portraitVideoPosition")
+    }
+}
+
+struct PlaybackPictureLayout {
+    enum Context {
+        case player, feed
+
+        var header: CGFloat { self == .player ? 54 : 64 }
+        var footer: CGFloat { self == .player ? 124 : 142 }
+        var accessoryRoom: CGFloat { 44 }
+        var interactionColumnBottom: CGFloat { self == .player ? 118 : 66 }
+    }
+
+    let canvas: CGSize
+    let insets: EdgeInsets
+    let position: PortraitVideoPosition
+    let context: Context
+
+    func portraitWideFrame(for video: CGSize) -> CGRect? {
+        guard canvas.height > canvas.width, video.width > video.height, video.height > 0 else { return nil }
+        let top = insets.top + context.header
+        let bottom = canvas.height - insets.bottom - context.footer - context.accessoryRoom
+        let safeWidth = canvas.width - insets.leading - insets.trailing
+        guard bottom > top, safeWidth > 0 else { return nil }
+        let aspect = video.width / video.height
+        let availableHeight = bottom - top
+        let height = min(safeWidth / aspect, availableHeight - min(64, availableHeight * 0.18))
+        let width = height * aspect
+        let lastY = bottom - height
+        let y: CGFloat
+        switch position {
+        case .top: y = top
+        case .center:
+            let margin = min(24, (lastY - top) / 2)
+            y = min(max(top + margin, (canvas.height - height) / 2), lastY - margin)
+        case .bottom: y = lastY
+        }
+        return CGRect(x: insets.leading + (safeWidth - width) / 2, y: y, width: width, height: height)
+    }
+
+    func frame(for video: CGSize) -> CGRect {
+        portraitWideFrame(for: video) ?? CGRect(origin: .zero, size: canvas)
+    }
+
+    func overlapsInteractionColumn(_ picture: CGRect?) -> Bool {
+        guard let picture else { return false }
+        return picture.maxY > interactionColumnTop
+    }
+
+    private var interactionColumnTop: CGFloat {
+        canvas.height - insets.bottom - context.interactionColumnBottom - 140
+    }
+
+    func danmakuInsets(around picture: CGRect?) -> EdgeInsets {
+        let defaultTop: CGFloat = 68
+        guard let picture else { return EdgeInsets(top: defaultTop, leading: 0, bottom: 0, trailing: 0) }
+        let laneSpace: CGFloat = 92
+        let below = picture.maxY + context.accessoryRoom
+        let top: CGFloat
+        if picture.minY - (insets.top + defaultTop) >= laneSpace { top = defaultTop }
+        else if canvas.height - insets.bottom - context.footer - below >= laneSpace { top = below - insets.top }
+        else { top = max(defaultTop, picture.minY - insets.top + 8) }
+        let overlapsColumn = !overlapsInteractionColumn(picture) && insets.top + top + laneSpace > interactionColumnTop
+        return EdgeInsets(top: top, leading: 0, bottom: 0, trailing: overlapsColumn ? 64 : 0)
+    }
+}
+
+extension View {
+    func playbackPictureFrame(_ frame: CGRect) -> some View {
+        self.frame(width: frame.width, height: frame.height)
+            .position(x: frame.midX, y: frame.midY)
+    }
+}
+
 enum AppSymbol {
     static func favorite(_ selected: Bool = false) -> String { selected ? "star.fill" : "star" }
+    static func danmaku(_ enabled: Bool) -> String { enabled ? "list.bullet.rectangle.fill" : "list.bullet.rectangle" }
     static let history = "clock.arrow.circlepath"
     static let settings = "gearshape"
 }
@@ -19,7 +115,7 @@ struct FollowDramaButton: View {
     var body: some View {
         let count = seriesFavoriteCount?.seriesID == seriesID ? seriesFavoriteCount?.count : nil
         Button(action: action) {
-            InteractionButtonIcon(glyph: .symbol(AppSymbol.favorite(selected)), count: count)
+            InteractionButtonIcon(symbol: AppSymbol.favorite(selected), count: count)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(selected ? "已追" : "追剧")
@@ -30,17 +126,14 @@ struct FollowDramaButton: View {
 }
 
 struct InteractionButtonIcon: View {
-    enum Glyph {
-        case symbol(String)
-        case danmaku(enabled: Bool)
-    }
-
-    let glyph: Glyph
+    let symbol: String
     let count: Int?
 
     var body: some View {
         VStack(spacing: 2) {
-            icon
+            Image(systemName: symbol)
+                .font(.system(size: 20, weight: .semibold))
+                .symbolRenderingMode(.monochrome)
                 .frame(height: 23)
                 .accessibilityHidden(true)
             Text(verbatim: count.map(Self.countLabel) ?? "")
@@ -51,26 +144,6 @@ struct InteractionButtonIcon: View {
         .foregroundStyle(.white)
         .frame(width: 44, height: 44)
         .contentShape(Rectangle())
-    }
-
-    @ViewBuilder private var icon: some View {
-        switch glyph {
-        case .symbol(let name):
-            Image(systemName: name)
-                .font(.system(size: 20, weight: .semibold))
-                .symbolRenderingMode(.monochrome)
-        case .danmaku(let enabled):
-            Text(verbatim: "弹")
-                .font(.system(size: 17, weight: .semibold))
-                .opacity(enabled ? 1 : 0.55)
-                .overlay {
-                    if !enabled {
-                        Capsule().fill(.white)
-                            .frame(width: 22, height: 1.5)
-                            .rotationEffect(.degrees(45))
-                    }
-                }
-        }
     }
 
     private static func countLabel(_ count: Int) -> String {

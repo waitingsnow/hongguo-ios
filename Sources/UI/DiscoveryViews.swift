@@ -5,14 +5,16 @@ struct HomeView: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var library: LibraryStore
     @ObservedObject private var account = AccountService.shared
-    @StateObject private var loader = CatalogLoader()
+    @StateObject private var loader = CatalogLoader(
+        initialCacheKey: AccountService.shared.guessFeedAccess.historyKey.map { "home.guess." + $0 }
+    )
     @State private var feed = "guess"
     @State private var guessPager: GuessPager?
     @State private var playbackRequest: PlaybackRequest?
+    @Environment(\.scenePhase) private var scenePhase
     /// 刷剧: the full-screen feed of the same list in the card layouts, kept across launches.
     @AppStorage("home.feedMode") private var feedMode = false
-    // 推荐 is the default channel and sits at the far right; the row opens scrolled to it.
-    private let feeds = [("recommend", "热度精选"), ("latest", "最新短剧"), ("comic", "漫剧榜单"), ("guess", "推荐")]
+    private let feeds = [("guess", "推荐"), ("recommend", "热度精选"), ("latest", "最新短剧"), ("comic", "漫剧榜单")]
     private var gridDramas: [Drama] {
         let featuredCount = model.theme == .warm ? 1 : model.theme == .cards ? 3 : 0
         return Array(loader.dramas.dropFirst(featuredCount))
@@ -21,25 +23,28 @@ struct HomeView: View {
     var body: some View {
         Group {
             if model.appearance == .immersive || feedMode {
-                ImmersiveFeed(loader: loader, feed: $feed, feeds: [("recommend", "热度"), ("latest", "最新"), ("comic", "漫剧"), ("guess", "推荐")],
-                              load: { more in if more { load() } else { refresh() } },
+                ImmersiveFeed(loader: loader, feed: $feed, feeds: [("guess", "推荐"), ("recommend", "热度"), ("latest", "最新"), ("comic", "漫剧")],
+                              loadMore: { load() }, refresh: refresh, canRefresh: canRequestFeed,
                               exit: model.appearance == .immersive ? nil : { feedMode = false }).toolbar(.hidden, for: .navigationBar)
             } else {
                 classicHome.appBackground(model.appearance).tabRoot(model.appearance)
-                    .onAppear { loader.setCoverPrefetchEnabled(true) }
+                    .onAppear { loader.anchorID = nil; loader.setCoverPrefetchEnabled(true) }
                     .playbackDestination($playbackRequest)
             }
         }
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
-        .task { if loader.dramas.isEmpty && !loader.isLoading { start() } }
+        .task { revalidate() }
+        .onChange(of: scenePhase) { _, phase in if phase == .active { revalidate() } }
         .onChange(of: feed) { _, _ in start() }
         // Login, logout or switching account changes whose feed 猜你喜欢 shows.
-        .onChange(of: account.guessOwner) { _, _ in if feed == "guess" { start() } }
+        .onChange(of: account.guessFeedAccess) { _, _ in if feed == "guess" { revalidate() } }
     }
 
     private var refreshButton: some View {
-        Button { refresh() } label: { HeaderIcon(symbol: "arrow.clockwise") }.buttonStyle(.plain).accessibilityLabel("刷新首页")
+        CatalogRefreshButton(title: "刷新首页", busy: loader.isRefreshing, enabled: canRequestFeed, action: refresh) {
+            HeaderIcon(symbol: "arrow.clockwise")
+        }
     }
 
     private var feedModeButton: some View {
@@ -65,16 +70,22 @@ struct HomeView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: model.appearance == .warm ? 104 : 145), spacing: 12)], alignment: .leading, spacing: 20) {
                     ForEach(gridDramas) { drama in NavigationLink { DetailView(drama: drama) } label: { DramaPoster(drama: drama) }.buttonStyle(.plain).accessibilityIdentifier("home.grid.\(drama.id)").onAppear { loader.itemAppeared(drama) { load() } } }
                 }
-                if loader.dramas.isEmpty && !loader.isLoading && loader.error == nil { EmptyStateView(symbol: "sparkles.tv", title: "这一页暂时没有剧集", message: "可以刷新，或切换上方的内容类型。") }
-                LoadMoreView(loader: loader) { load(reset: loader.dramas.isEmpty) }
+                if loader.dramas.isEmpty && !loader.isLoading && loader.error == nil {
+                    EmptyStateView(symbol: "sparkles.tv", title: canRequestFeed ? "这一页暂时没有剧集" : "账号待验证",
+                                   message: canRequestFeed ? "可以刷新，或切换上方的内容类型。" : "账号验证后可加载推荐，也可先浏览其他分类。")
+                }
+                if canRequestFeed { LoadMoreView(loader: loader) { load(reset: loader.dramas.isEmpty) } }
             }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 24)
-        }.refreshable { refresh() }
+        }
+        .scrollBounceBehavior(.always, axes: .vertical)
+        .refreshable { await refresh() }
+        .overlay(alignment: .top) { CatalogRefreshError(message: loader.refreshError) }
     }
 
     private var feedSelector: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 9) { ForEach(feeds, id: \.0) { value, name in ChoiceChip(title: name, selected: feed == value) { feed = value } } }
-        }.defaultScrollAnchor(.trailing)
+        }
     }
 
     /// The card opens the detail page and 立即播放 plays; the two are siblings so neither swallows the other's taps,
@@ -129,29 +140,62 @@ struct HomeView: View {
         }.padding(16).background(model.appearance.surface, in: RoundedRectangle(cornerRadius: 18))
     }
 
-    /// The saved copy of this feed shows at once; it is refreshed behind it when older than half an hour.
+    private var cacheKey: String? {
+        if feed != "guess" { return "home." + feed }
+        return account.guessFeedAccess.historyKey.map { "home.guess." + $0 }
+    }
+
+    private var canRequestFeed: Bool { feed != "guess" || account.guessFeedAccess.canRequest }
+
+    private func revalidate() {
+        if loader.cacheKey != cacheKey { start() }
+        else if !canRequestFeed { if loader.isLoading { loader.cancel() } }
+        else if loader.needsRevalidation { load(inPlace: true) }
+    }
+
     private func start() {
-        let key = feed == "guess" ? "home.guess." + account.guessHistoryKey : "home." + feed
-        switch loader.restore(key: key) {
+        switch loader.restore(key: cacheKey) {
         case .fresh: break
         case .stale: load(inPlace: true)
         case .none: load(reset: true)
         }
     }
 
-    /// Refresh keeps what is on screen until the new first page arrives.
-    private func refresh() { if loader.dramas.isEmpty { load(reset: true) } else { load(inPlace: true) } }
+    private func refresh() async {
+        guard canRequestFeed else { return }
+        if loader.cacheKey != cacheKey { loader.restore(key: cacheKey) }
+        await load(inPlace: true, refreshing: true)?.value
+    }
 
-    private func load(reset: Bool = false, inPlace: Bool = false) {
+    @discardableResult
+    private func load(reset: Bool = false, inPlace: Bool = false, refreshing: Bool = false) -> Task<Void, Never>? {
+        guard canRequestFeed, loader.cacheKey == cacheKey else { return nil }
+        if let pending = loader.pendingRefresh, refreshing { return pending }
         let selected = feed
-        guard selected == "guess" else { loader.load(reset: reset, inPlace: inPlace) { try await DramaAPI.shared.home(feed: selected, offset: $0) }; return }
-        // Signed in: the account's own feed; otherwise the anonymous one. A changed owner restarts the round. A list
-        // restored from disk has no round yet: the next page starts one and adds to the list.
-        let owner = account.guessOwner
-        let restart = reset || inPlace || guessPager == nil || guessPager?.owner != owner
-        if restart { guessPager = GuessPager(owner: owner, previous: guessPager, history: .shared, historyKey: account.guessHistoryKey) { cursor in try await AccountService.shared.guessBatch(owner: owner, cursor: cursor) } }
-        guard let pager = guessPager else { return }
-        loader.load(reset: reset, inPlace: inPlace) { _ in try await pager.next() }
+        guard selected == "guess" else {
+            let cachedPrefix = loader.restoredSnapshot?.dramas
+            return loader.load(reset: reset, inPlace: inPlace, refreshing: refreshing) {
+                try await DramaAPI.shared.home(feed: selected, offset: $0, cachedPrefix: cachedPrefix)
+            }
+        }
+        let access = account.guessFeedAccess
+        guard let historyKey = access.historyKey else { return nil }
+        let owner = access.owner
+        let pager: GuessPager
+        if !reset, !inPlace, let guessPager, guessPager.owner == owner {
+            pager = guessPager
+        } else {
+            pager = GuessPager(owner: owner, previous: guessPager, history: .shared, historyKey: historyKey) {
+                try await AccountService.shared.guessBatch(owner: owner, cursor: $0)
+            }
+        }
+        return loader.load(reset: reset, inPlace: inPlace, refreshing: refreshing) { offset in
+            let page = try await pager.next()
+            try Task.checkCancellation()
+            guard account.guessFeedAccess == access else { throw CancellationError() }
+            guessPager = pager
+            return DramaPage(dramas: page.dramas, hasMore: page.hasMore, nextOffset: offset + 1)
+        }
     }
 }
 
@@ -160,8 +204,9 @@ private struct ImmersiveFeed: View {
     @ObservedObject var loader: CatalogLoader
     @Binding var feed: String
     let feeds: [(String, String)]
-    /// true for the next page, false to refresh.
-    let load: (Bool) -> Void
+    let loadMore: () -> Void
+    let refresh: () async -> Void
+    let canRefresh: Bool
     /// Back to the card layout, for themes whose home is not this feed.
     var exit: (() -> Void)? = nil
     @EnvironmentObject private var model: AppModel
@@ -171,6 +216,7 @@ private struct ImmersiveFeed: View {
     @State private var detailDrama: Drama?
     @State private var playbackRequest: PlaybackRequest?
     @State private var commentsVisible = false
+    @AppStorage(PortraitVideoPosition.key) private var portraitVideoPosition: PortraitVideoPosition = .center
     @StateObject private var preview = FeedPreview()
     @State private var visible = false
     @Environment(\.scenePhase) private var scenePhase
@@ -178,57 +224,64 @@ private struct ImmersiveFeed: View {
     var body: some View {
         GeometryReader { outer in
             let insets = outer.safeAreaInsets
+            let canvas = CGSize(width: outer.size.width + insets.leading + insets.trailing,
+                                height: outer.size.height + insets.top + insets.bottom)
+            let layout = PlaybackPictureLayout(canvas: canvas, insets: insets, position: portraitVideoPosition, context: .feed)
             ZStack(alignment: .top) {
                 Color.black
-                if loader.dramas.isEmpty {
-                    placeholder.frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ScrollView(.vertical) {
-                        LazyVStack(spacing: 0) {
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 0) {
+                        if loader.dramas.isEmpty {
+                            placeholder.frame(width: outer.size.width, height: outer.size.height + insets.top + insets.bottom)
+                        } else {
                             ForEach(Array(loader.dramas.enumerated()), id: \.element.id) { index, drama in
-                                ImmersivePage(drama: drama, index: index, insets: insets,
-                                              roomy: outer.size.height + insets.top + insets.bottom >= 640, preview: preview,
+                                ImmersivePage(drama: drama, index: index, layout: layout, preview: preview,
                                               openDetails: { detailDrama = drama }, openComments: { commentsVisible = true },
                                               presentPlayback: presentPlayback,
                                               retryPreview: { if preview.dramaID == drama.id { syncPreview() } })
-                                    .frame(width: outer.size.width + insets.leading + insets.trailing,
-                                           height: outer.size.height + insets.top + insets.bottom)
+                                    .frame(width: canvas.width, height: canvas.height)
                                     .id(drama.id)
                             }
                         }
-                        .scrollTargetLayout()
-                        .background {
-                            FeedNavigationSwipe(canNavigate: canNavigate) { direction in
-                                guard canNavigate(direction) else { return }
-                                if direction == .left { detailDrama = loader.dramas[index] }
-                                else { exit?() }
-                            }
+                    }
+                    .scrollTargetLayout()
+                    .background {
+                        FeedNavigationSwipe(canNavigate: canNavigate) { direction in
+                            guard canNavigate(direction) else { return }
+                            if direction == .left { detailDrama = loader.dramas[index] }
+                            else { exit?() }
                         }
                     }
-                    .scrollTargetBehavior(.paging)
-                    .scrollIndicators(.hidden)
-                    // Anchored at the top so folding or unfolding iPhone Duo keeps the current page whole after the resize.
-                    .scrollPosition(id: $current, anchor: .top)
-                    .feedScrollActivity { moving in
-                        preview.setScrolling(moving)
-                        if !moving { syncPreview(); if preview.ended { continueAfterPreview() } }
-                    }
-                    .ignoresSafeArea()
-                    .accessibilityIdentifier("immersive_feed")
-                    if isLast, let banner { endBanner(banner).padding(.top, insets.top + 64) }
                 }
+                .scrollTargetBehavior(.paging)
+                .scrollBounceBehavior(.always, axes: .vertical)
+                .scrollIndicators(.hidden)
+                // Anchored at the top so folding or unfolding iPhone Duo keeps the current page whole after the resize.
+                .scrollPosition(id: $current, anchor: .top)
+                .feedScrollActivity { moving in
+                    preview.setScrolling(moving)
+                    if !moving { syncPreview(); if preview.ended { continueAfterPreview() } }
+                }
+                .refreshable { await refresh() }
+                .ignoresSafeArea()
+                .accessibilityIdentifier("immersive_feed")
+                if isLast, let banner, loader.refreshError == nil { endBanner(banner).padding(.top, insets.top + 64) }
                 // Side insets too: the iPhone Duo cover screen puts the status bar and camera along the trailing edge.
-                topBar.padding(.top, insets.top).padding(.leading, insets.leading).padding(.trailing, insets.trailing)
+                VStack(spacing: 4) {
+                    topBar
+                    CatalogRefreshError(message: loader.refreshError, overVideo: true)
+                }.padding(.top, insets.top).padding(.leading, insets.leading).padding(.trailing, insets.trailing)
             }.ignoresSafeArea()
+            .episodeDiscussion(preview.detail.flatMap { detail in
+                detail.episodes.first.map { DiscussionEpisode(seriesID: detail.drama.id, episodeID: $0.id, number: $0.index) }
+            }, player: preview.player,
+               foreground: visible && scenePhase == .active && model.playback == nil && detailDrama == nil,
+               hideDanmaku: preview.isScrolling || (current != nil && preview.dramaID != current),
+               danmakuInsets: layout.danmakuInsets(around: layout.portraitWideFrame(for: preview.videoSize)),
+               presented: $commentsVisible)
         }
         .navigationDestination(item: $detailDrama) { DetailView(drama: $0) }
         .playbackDestination($playbackRequest)
-        .episodeDiscussion(preview.detail.flatMap { detail in
-            detail.episodes.first.map { DiscussionEpisode(seriesID: detail.drama.id, episodeID: $0.id, number: $0.index) }
-        }, player: preview.player,
-           foreground: visible && scenePhase == .active && model.playback == nil && detailDrama == nil,
-           hideDanmaku: current != nil && preview.dramaID != current,
-           presented: $commentsVisible)
         .onChange(of: commentsVisible) { _, shown in if !shown && preview.ended { continueAfterPreview() } }
         .onChange(of: current) { old, id in
             guard let id else { return }
@@ -291,7 +344,7 @@ private struct ImmersiveFeed: View {
     }
 
     private func prefetch() {
-        if index >= loader.dramas.count - 3 && loader.hasMore && loader.error == nil && !loader.isLoading { load(true) }
+        if index >= loader.dramas.count - 3 && loader.hasMore && loader.error == nil && !loader.isLoading { loadMore() }
     }
 
     private var topBar: some View {
@@ -300,20 +353,23 @@ private struct ImmersiveFeed: View {
                 Button(action: exit) { AppControlIcon(name: "square.grid.2x2") }
                     .accessibilityLabel("返回卡片首页").accessibilityIdentifier("immersive_exit")
             }
-            Button { load(false) } label: { AppControlIcon(name: "arrow.clockwise") }
-                .accessibilityLabel("刷新推荐")
-            HStack(spacing: 16) {
-                ForEach(feeds, id: \.0) { value, name in
-                    let selected = feed == value
-                    Button { feed = value } label: {
-                        VStack(spacing: 4) {
-                            Text(name).font(.system(size: selected ? 17 : 16, weight: selected ? .bold : .medium))
-                                .foregroundStyle(.white.opacity(selected ? 1 : 0.7)).fixedSize()
-                            Capsule().fill(selected ? Color.white : .clear).frame(width: 18, height: 3)
-                        }.frame(minHeight: 44)
-                    }.buttonStyle(.plain).accessibilityAddTraits(selected ? .isSelected : [])
+            CatalogRefreshButton(title: "刷新推荐", busy: loader.isRefreshing, enabled: canRefresh, indicatorColor: .white, action: refresh) {
+                AppControlIcon(name: "arrow.clockwise")
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 16) {
+                    ForEach(feeds, id: \.0) { value, name in
+                        let selected = feed == value
+                        Button { feed = value } label: {
+                            VStack(spacing: 4) {
+                                Text(name).font(.system(size: selected ? 17 : 16, weight: selected ? .bold : .medium))
+                                    .foregroundStyle(.white.opacity(selected ? 1 : 0.7)).fixedSize()
+                                Capsule().fill(selected ? Color.white : .clear).frame(width: 18, height: 3)
+                            }.frame(minHeight: 44)
+                        }.buttonStyle(.plain).accessibilityAddTraits(selected ? .isSelected : [])
+                    }
                 }
-            }.frame(maxWidth: .infinity)
+            }.frame(height: 44)
             NavigationLink { SearchView() } label: { AppControlIcon(name: "magnifyingglass") }
                 .accessibilityLabel("搜索")
         }.foregroundStyle(.white).padding(.horizontal, 8).padding(.top, 2)
@@ -325,16 +381,20 @@ private struct ImmersiveFeed: View {
             HStack(spacing: 12) { ProgressView().tint(.white); Text("正在准备推荐…").font(.subheadline).foregroundStyle(.white.opacity(0.8)) }
         } else {
             VStack(spacing: 12) {
-                Text(loader.error ?? "这一组暂时没有剧集").font(.subheadline).foregroundStyle(.white).multilineTextAlignment(.center)
-                Button("重新加载") { load(false) }.buttonStyle(.bordered).tint(.white)
+                Text(canRefresh ? loader.error ?? "这一组暂时没有剧集" : "账号验证后可加载推荐")
+                    .font(.subheadline).foregroundStyle(.white).multilineTextAlignment(.center)
+                if canRefresh {
+                    Button("重新加载") { Task { await refresh() } }.buttonStyle(.bordered).tint(.white)
+                }
             }.padding(24)
         }
     }
 
     private var banner: (String, String?, () -> Void)? {
-        if let error = loader.error { return (error, "重试", { load(true) }) }
+        if loader.dramas.isEmpty || loader.isRefreshing { return nil }
+        if let error = loader.error { return (error, "重试", loadMore) }
         if loader.isLoading { return ("正在加载更多…", nil, {}) }
-        if !loader.hasMore { return ("已经看到最后一部了", "刷新", { load(false) }) }
+        if !loader.hasMore && canRefresh { return ("已经看到最后一部了", "刷新", { Task { await refresh() } }) }
         return nil
     }
 
@@ -344,6 +404,46 @@ private struct ImmersiveFeed: View {
             if let action = banner.1 { Button(action, action: banner.2).font(.footnote.weight(.semibold)).foregroundStyle(Color(hex: 0xFFC56B)) }
         }.padding(.leading, 16).padding(.trailing, banner.1 == nil ? 16 : 8).frame(minHeight: 40)
             .background(.black.opacity(0.62), in: RoundedRectangle(cornerRadius: 20)).padding(.horizontal, 24)
+    }
+}
+
+private struct CatalogRefreshButton<Icon: View>: View {
+    let title: String
+    let busy: Bool
+    var enabled = true
+    var indicatorColor = Color.primary
+    let action: () async -> Void
+    @ViewBuilder let icon: () -> Icon
+
+    var body: some View {
+        Button { Task { await action() } } label: {
+            icon().opacity(busy ? 0 : 1)
+                .overlay { if busy { ProgressView().tint(indicatorColor) } }
+        }
+        .buttonStyle(.plain)
+        .disabled(busy || !enabled)
+        .accessibilityLabel(title)
+        .accessibilityValue(busy ? "正在刷新" : "")
+    }
+}
+
+private struct CatalogRefreshError: View {
+    @EnvironmentObject private var model: AppModel
+    let message: String?
+    var overVideo = false
+
+    var body: some View {
+        if let message {
+            Text(message)
+                .font(.footnote)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(overVideo ? .white : model.appearance.ink)
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(overVideo ? .black.opacity(0.8) : model.appearance.surface, in: RoundedRectangle(cornerRadius: 12))
+                .padding(.horizontal, 20)
+                .allowsHitTesting(false)
+                .accessibilityAddTraits(.updatesFrequently)
+        }
     }
 }
 
@@ -360,8 +460,7 @@ private extension View {
 private struct ImmersivePage: View {
     let drama: Drama
     let index: Int
-    let insets: EdgeInsets
-    let roomy: Bool
+    let layout: PlaybackPictureLayout
     @ObservedObject var preview: FeedPreview
     let openDetails: () -> Void
     let openComments: () -> Void
@@ -369,42 +468,54 @@ private struct ImmersivePage: View {
     let retryPreview: () -> Void
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var library: LibraryStore
+    private var insets: EdgeInsets { layout.insets }
+    private var roomy: Bool { layout.canvas.height >= 640 }
 
     var body: some View {
+        let frame = active && preview.rendered ? nil : preview.firstFrame(for: drama, quality: model.quality)
+        let videoSize = active && preview.videoSize != .zero ? preview.videoSize : frame?.size ?? .zero
+        let picture = layout.portraitWideFrame(for: videoSize)
+        let dockInteractions = layout.overlapsInteractionColumn(picture)
+        let pictureCenter = CGPoint(x: picture?.midX ?? layout.canvas.width / 2,
+                                    y: picture?.midY ?? layout.canvas.height / 2)
         ZStack(alignment: .bottomLeading) {
-            Color.black.overlay {
-                if !active || !preview.rendered, let frame = preview.firstFrame(for: drama, quality: model.quality) {
-                    Image(uiImage: frame).resizable().scaledToFit()
-                }
-            }.clipped().task(id: PlaybackTarget(drama, quality: model.quality).key) {
+            Color.black.task(id: PlaybackTarget(drama, quality: model.quality).key) {
                 await preview.restoreFirstFrame(for: drama, quality: model.quality)
             }
+            if let frame {
+                VideoFrameView(image: frame).playbackPictureFrame(layout.frame(for: frame.size))
+            }
             if active, let player = preview.player {
-                PlayerLayerView(player: player) { host in preview.markRendered(player, host: host) }.opacity(preview.rendered ? 1 : 0)
+                PlayerLayerView(player: player) { host in preview.markRendered(player, host: host) }
+                    .playbackPictureFrame(layout.frame(for: videoSize))
+                    .opacity(preview.rendered ? 1 : 0)
             }
             if active && preview.failed {
                 FeedGestureView(tap: retryPreview).overlay {
                     Label("重试播放", systemImage: "arrow.clockwise").foregroundStyle(.white)
+                        .position(pictureCenter)
                         .allowsHitTesting(false).accessibilityHidden(true)
                 }
             } else if active, let player = preview.player {
-                FeedGestureView(preview: preview, player: player, statusTopInset: insets.top + 64,
+                FeedGestureView(preview: preview, player: player, picture: picture, statusTopInset: insets.top + 64,
                                 statusTrailingInset: insets.trailing + 20, restoredSpeed: String(format: "%g×", model.speed))
                     .id(ObjectIdentifier(player))
             }
             if active && preview.paused && !preview.ended {
                 Image(systemName: "play.fill").font(.system(size: 54)).foregroundStyle(.white.opacity(0.8))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)
+                    .position(pictureCenter).allowsHitTesting(false)
             }
-            GeometryReader { page in
-                VStack(spacing: 0) {
-                    LinearGradient(colors: [.black.opacity(0.6), .clear], startPoint: .top, endPoint: .bottom)
-                        .frame(height: min(180, page.size.height * 0.32))
-                    Spacer(minLength: 0)
-                    LinearGradient(colors: [.clear, .black.opacity(0.88)], startPoint: .top, endPoint: .bottom)
-                        .frame(height: min(380, page.size.height * 0.68))
-                }
-            }.allowsHitTesting(false)
+            if picture == nil {
+                GeometryReader { page in
+                    VStack(spacing: 0) {
+                        LinearGradient(colors: [.black.opacity(0.6), .clear], startPoint: .top, endPoint: .bottom)
+                            .frame(height: min(180, page.size.height * 0.32))
+                        Spacer(minLength: 0)
+                        LinearGradient(colors: [.clear, .black.opacity(0.88)], startPoint: .top, endPoint: .bottom)
+                            .frame(height: min(380, page.size.height * 0.68))
+                    }
+                }.allowsHitTesting(false)
+            }
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .bottom, spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -413,9 +524,10 @@ private struct ImmersivePage: View {
                             Text(drama.summary).font(.footnote).foregroundStyle(.white.opacity(0.8)).lineLimit(2)
                         }
                     }.frame(maxWidth: .infinity, alignment: .leading)
-                    VStack(spacing: 4) {
+                    let actions = dockInteractions ? AnyLayout(HStackLayout(spacing: 4)) : AnyLayout(VStackLayout(spacing: 4))
+                    actions {
                         favoriteButton
-                        if activeDetail != nil { DiscussionControls(vertical: true, showComments: openComments) }
+                        if activeDetail != nil { DiscussionControls(vertical: !dockInteractions, showComments: openComments) }
                     }.shadow(color: .black.opacity(0.8), radius: 2, y: 1)
                 }
                 episodeStrip
@@ -564,6 +676,7 @@ private struct FeedNavigationSwipe: UIViewRepresentable {
 
 struct DiscoverView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var loader = CatalogLoader()
     @State private var genre = "short_play"
     @State private var groups: [FilterGroup] = []
@@ -572,6 +685,7 @@ struct DiscoverView: View {
     @State private var filtersVisible = false
     @State private var filtersError: String?
     @State private var filtersLoading = false
+    @State private var filtersRequestID = UUID()
     /// The genre whose list and filters are loaded; coming back from a detail page keeps them as they were.
     @State private var loadedGenre: String?
     private let genres = [("short_play", "短剧"), ("comic_series", "漫剧"), ("ai_series", "AI 剧")]
@@ -579,7 +693,11 @@ struct DiscoverView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                TabHeader(title: model.appearance == .immersive ? "剧场" : "发现")
+                TabHeader(title: model.appearance == .immersive ? "剧场" : "发现") {
+                    CatalogRefreshButton(title: "刷新发现", busy: loader.isRefreshing, action: refresh) {
+                        HeaderIcon(symbol: "arrow.clockwise")
+                    }
+                }
                 HStack(spacing: 10) {
                     SearchEntry(title: "搜索剧名或关键词")
                     NavigationLink { RankView() } label: {
@@ -599,13 +717,20 @@ struct DiscoverView: View {
                 if loader.dramas.isEmpty && !loader.isLoading && loader.error == nil { EmptyStateView(symbol: "line.3.horizontal.decrease.circle", title: "没有符合条件的剧集", message: "试试减少筛选条件，或切换内容类型。") }
                 LoadMoreView(loader: loader) { load(reset: loader.dramas.isEmpty) }
             }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 20)
-        }.navigationTitle(model.appearance == .immersive ? "剧场" : "发现")
+        }
+            .scrollBounceBehavior(.always, axes: .vertical)
+            .refreshable { await refresh() }
+            .overlay(alignment: .top) { CatalogRefreshError(message: loader.refreshError) }
+            .navigationTitle(model.appearance == .immersive ? "剧场" : "发现")
             .appBackground(model.appearance).tabRoot(model.appearance)
-            .refreshable { if loader.dramas.isEmpty { load(reset: true) } else { load(inPlace: true) } }
             .task(id: genre) {
-                guard loadedGenre != genre else { return }
-                loadedGenre = genre; selection = [:]; draft = [:]; start(); await loadFilters()
+                if loadedGenre != genre {
+                    loadedGenre = genre; selection = [:]; draft = [:]; groups = []; start(); await loadFilters()
+                } else {
+                    revalidate()
+                }
             }
+            .onChange(of: scenePhase) { _, phase in if phase == .active { revalidate() } }
             .sheet(isPresented: $filtersVisible) { filterSheet }
     }
 
@@ -628,8 +753,18 @@ struct DiscoverView: View {
                     }
                     if groups.isEmpty && !filtersLoading && filtersError == nil { Text("当前类型暂无更多筛选条件。").foregroundStyle(model.appearance.muted) }
                 }.padding(20)
-            }.appBackground(model.appearance).navigationTitle("筛选").navigationBarTitleDisplayMode(.inline)
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { filtersVisible = false } } }
+            }.scrollBounceBehavior(.always, axes: .vertical)
+                .refreshable { await loadFilters(forceRefresh: true) }
+                .appBackground(model.appearance).navigationTitle("筛选").navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("取消") { filtersVisible = false } }
+                    ToolbarItem(placement: .primaryAction) {
+                        CatalogRefreshButton(title: "刷新筛选条件", busy: filtersLoading,
+                                             action: { await loadFilters(forceRefresh: true) }) {
+                            HeaderIcon(symbol: "arrow.clockwise")
+                        }
+                    }
+                }
                 .safeAreaInset(edge: .bottom) { HStack(spacing: 12) { Button("重置") { draft = [:] }.buttonStyle(.bordered).frame(maxWidth: .infinity); Button("查看结果") { selection = draft; filtersVisible = false; start() }.buttonStyle(.borderedProminent).frame(maxWidth: .infinity) }.tint(model.appearance.accent).controlSize(.large).padding().background(model.appearance.surface) }
         }.presentationDetents([.medium, .large]).presentationDragIndicator(.visible)
     }
@@ -642,12 +777,33 @@ struct DiscoverView: View {
         case .none: load(reset: true)
         }
     }
-    private func load(reset: Bool = false, inPlace: Bool = false) { let kind = genre, filters = selection; loader.load(reset: reset, inPlace: inPlace) { try await DramaAPI.shared.browse(genre: kind, filters: filters, offset: $0) } }
-    private func loadFilters() async {
+    private func revalidate() {
+        if loadedGenre == genre && selection.isEmpty && loader.needsRevalidation { load(inPlace: true) }
+    }
+    private func refresh() async { await load(inPlace: true, refreshing: true)?.value }
+
+    @discardableResult
+    private func load(reset: Bool = false, inPlace: Bool = false, refreshing: Bool = false) -> Task<Void, Never>? {
+        let kind = genre, filters = selection
+        let cachedPrefix = loader.restoredSnapshot?.dramas
+        return loader.load(reset: reset, inPlace: inPlace, refreshing: refreshing) {
+            try await DramaAPI.shared.browse(genre: kind, filters: filters, offset: $0, cachedPrefix: cachedPrefix)
+        }
+    }
+
+    private func loadFilters(forceRefresh: Bool = false) async {
+        let ticket = UUID(); filtersRequestID = ticket
         filtersLoading = true; filtersError = nil
         let selected = genre
-        do { let result = try await DramaAPI.shared.filters(genre: selected); guard !Task.isCancelled, selected == genre else { return }; groups = result; filtersLoading = false }
-        catch { guard !Task.isCancelled, selected == genre else { return }; filtersError = friendlyError(error); groups = []; filtersLoading = false }
+        defer { if ticket == filtersRequestID { filtersLoading = false } }
+        do {
+            let result = try await DramaAPI.shared.filters(genre: selected, forceRefresh: forceRefresh)
+            guard !Task.isCancelled, ticket == filtersRequestID, selected == genre else { return }
+            groups = result
+        } catch {
+            guard !Task.isCancelled, ticket == filtersRequestID, selected == genre else { return }
+            filtersError = friendlyError(error)
+        }
     }
 }
 
@@ -687,8 +843,20 @@ struct SearchView: View {
                     LoadMoreView(loader: loader) { load(reset: loader.dramas.isEmpty) }
                 }
             }.padding(20)
-        }.navigationTitle("搜索").navigationBarTitleDisplayMode(.inline).appBackground(model.appearance).onDisappear { focused = false }
+        }.scrollBounceBehavior(.always, axes: .vertical)
+            .refreshable { await refresh() }
+            .overlay(alignment: .top) { CatalogRefreshError(message: loader.refreshError) }
+            .navigationTitle("搜索").navigationBarTitleDisplayMode(.inline).appBackground(model.appearance).onDisappear { focused = false }
             .secondaryPage()
+            .toolbar {
+                if !submitted.isEmpty {
+                    ToolbarItem(placement: .primaryAction) {
+                        CatalogRefreshButton(title: "刷新搜索结果", busy: loader.isRefreshing, action: refresh) {
+                            HeaderIcon(symbol: "arrow.clockwise")
+                        }
+                    }
+                }
+            }
             .onAppear {
                 guard !didFocusOnEntry else { return }
                 didFocusOnEntry = true
@@ -705,7 +873,18 @@ struct SearchView: View {
             }
     }
     private func submit() { let value = query.trimmingCharacters(in: .whitespacesAndNewlines); guard !value.isEmpty else { return }; suggestions = []; focused = false; submitted = value; load(reset: true) }
-    private func load(reset: Bool = false) { let value = submitted; loader.load(reset: reset) { try await DramaAPI.shared.search(query: value, offset: $0) } }
+    private func refresh() async {
+        guard !submitted.isEmpty else { return }
+        await load(refreshing: true)?.value
+    }
+
+    @discardableResult
+    private func load(reset: Bool = false, refreshing: Bool = false) -> Task<Void, Never>? {
+        let value = submitted
+        return loader.load(reset: reset, inPlace: refreshing, refreshing: refreshing) {
+            try await DramaAPI.shared.search(query: value, offset: $0, forceRefresh: refreshing)
+        }
+    }
 }
 
 struct DramaListRow: View {

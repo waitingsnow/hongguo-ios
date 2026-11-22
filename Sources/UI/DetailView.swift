@@ -13,6 +13,8 @@ struct DetailView: View {
     @ObservedObject private var account = AccountService.shared
     @State private var detail: DramaDetail?
     @State private var loading = false
+    @State private var loadID = UUID()
+    @State private var relatedID = UUID()
     @State private var error: String?
     @State private var selected = 0
     @State private var showFullSummary = false
@@ -79,7 +81,7 @@ struct DetailView: View {
                 }
                 if loading { ProgressView("正在获取完整选集…").frame(maxWidth: .infinity).padding(30) }
                 if let message = account.message { Text(message).font(.caption).foregroundStyle(model.appearance.muted) }
-                if let error { FailureView(message: error) { Task { await load() } } }
+                if let error { FailureView(message: error) { Task { await load(forceRefresh: true) } } }
                 if !related.isEmpty { relatedSection }
                 if let detail {
                     VStack(alignment: .leading, spacing: 16) {
@@ -109,19 +111,17 @@ struct DetailView: View {
             .toolbar(.visible, for: .navigationBar)
             .secondaryPage()
             .playbackDestination($playbackRequest)
+            .scrollBounceBehavior(.always, axes: .vertical)
+            .refreshable {
+                async let works: Void = loadRelated(forceRefresh: true)
+                await load(forceRefresh: true)
+                await works
+            }
             .task(id: loadsContent) { if loadsContent { await load() } }
             // Secondary content: a failure leaves the section out without affecting the drama itself.
             .task(id: loadsContent) {
                 guard loadsContent else { return }
-                let works = (try? await DramaAPI.shared.related(id: drama.id)) ?? []
-                guard !Task.isCancelled else { return }
-                withAnimation(initialEpisodeID == nil ? nil : .easeInOut(duration: 0.24)) { related = works }
-                // The related plan carries no release date; look up the few upcoming works one by one.
-                for work in related.filter(\.upcoming).prefix(3) {
-                    guard let text = try? await DramaAPI.shared.upcomingRelease(id: work.id, title: work.drama.title), !text.isEmpty,
-                          !Task.isCancelled, let index = related.firstIndex(where: { $0.id == work.id }) else { continue }
-                    related[index].releaseText = text
-                }
+                await loadRelated()
             }
             .alert("预约这部作品？", isPresented: Binding(get: { reserving != nil }, set: { if !$0 { reserving = nil } }), presenting: reserving) { work in
                 Button("预约") { Task { await account.reserve(work) } }
@@ -202,18 +202,44 @@ struct DetailView: View {
         else { NavigationLink { AccountView() } label: { Text("登录后预约").font(.caption.weight(.semibold)).foregroundStyle(model.appearance.accent).frame(minHeight: 32) } }
     }
 
-    private func load() async {
+    private func loadRelated(forceRefresh: Bool = false) async {
+        let ticket = UUID()
+        relatedID = ticket
+        guard let works = try? await DramaAPI.shared.related(id: drama.id, forceRefresh: forceRefresh),
+              !Task.isCancelled, relatedID == ticket else { return }
+        withAnimation(initialEpisodeID == nil ? nil : .easeInOut(duration: 0.24)) { related = works }
+        for work in works.filter(\.upcoming).prefix(3) {
+            guard !Task.isCancelled, relatedID == ticket else { return }
+            guard let text = try? await DramaAPI.shared.upcomingRelease(id: work.id, title: work.drama.title), !text.isEmpty,
+                  !Task.isCancelled, relatedID == ticket, let index = related.firstIndex(where: { $0.id == work.id }) else { continue }
+            related[index].releaseText = text
+        }
+    }
+
+    private func load(forceRefresh: Bool = false) async {
+        let ticket = UUID()
+        loadID = ticket
         error = nil
         // A saved copy shows the episodes at once; the network then replaces it.
         if detail == nil, let saved = DramaDetails.cached(drama.id) { show(saved.detail) }
         loading = detail == nil
         do {
-            let loaded = try await DramaDetails.load(drama, maxAge: 0)
-            try Task.checkCancellation()
+            let loaded: DramaDetail
+            if forceRefresh {
+                loaded = try await DramaAPI.shared.detail(drama: drama, forceRefresh: true)
+            } else {
+                loaded = try await DramaDetails.load(drama)
+            }
+            guard !Task.isCancelled, loadID == ticket else { return }
+            if forceRefresh { DramaDetails.remember(loaded) }
             show(loaded)
             loading = false
         } catch is CancellationError { }
-        catch { loading = false; if detail == nil { self.error = friendlyError(error) } }
+        catch {
+            guard !Task.isCancelled, loadID == ticket else { return }
+            loading = false
+            self.error = friendlyError(error)
+        }
     }
 
     private func show(_ loaded: DramaDetail) {
@@ -222,6 +248,8 @@ struct DetailView: View {
             selected = index
         } else if let entry = resume ?? model.latestProgress(for: drama.id) {
             selected = loaded.episodes.firstIndex { $0.id == entry.episodeID } ?? loaded.episodes.firstIndex { $0.index == entry.episodeIndex } ?? 0
+        } else {
+            selected = min(selected, max(0, loaded.episodes.count - 1))
         }
     }
 }

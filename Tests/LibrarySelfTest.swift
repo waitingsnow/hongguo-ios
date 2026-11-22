@@ -70,7 +70,7 @@ private func fixtureEpisode(_ number: Int = 1) -> Episode {
         try expect(store.isFavorite(drama) && store.history.isEmpty, "Favoriting must not invent playback history")
         store.record(drama: drama, episode: episode, position: 1.5)
         store.updatePosition(dramaID: drama.id, episodeID: episode.id, position: 47.25)
-        store.flush()
+        store.reload()
         try expect(store.history.count == 1 && store.favorites.count == 1, "Record updates both existing favorite and history")
         try expect(store.history[0].position == 47.25 && store.favorites[0].position == 47.25, "Latest real playback position must reach both lists")
         try expect(store.history[0].episodeID == episode.id && store.history[0].episodeIndex == 3, "Episode ID/index must be exact")

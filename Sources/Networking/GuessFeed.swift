@@ -7,6 +7,24 @@
 // hongguoTV TV 0.1.26, commits 3d319a6 and 62910e0 (2026-11-06), GPL-3.0-only — RecommendationFeed.kt.
 import Foundation
 
+struct GuessFeedAccess: Equatable {
+    let historyKey: String?
+    let owner: UUID?
+    let canRequest: Bool
+
+    init(hasCredentials: Bool, profileID: String, verifiedOwner: UUID?) {
+        if hasCredentials {
+            historyKey = profileID.isEmpty ? nil : "account:" + profileID
+            owner = historyKey == nil ? nil : verifiedOwner
+            canRequest = owner != nil
+        } else {
+            historyKey = "anonymous"
+            owner = nil
+            canRequest = true
+        }
+    }
+}
+
 /// The single-column continuation the entry declared; protocol identifiers only, never credentials.
 struct GuessFlow: Sendable, Equatable {
     let cellID: String

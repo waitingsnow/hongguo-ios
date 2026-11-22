@@ -102,3 +102,10 @@ Image loading and caches (iOS 0.1.29)
 - Added as a Swift Package (exact version) for cover/avatar memory and disk caches, prefetching, and the
   size-limited DataCache that also stores the last home lists and drama details. The MIT notice is included
   as Nuke-MIT.txt.
+
+Timed danmaku
+
+- beilunyang/openhongguo 0.4.0, Apache-2.0.
+  https://github.com/beilunyang/openhongguo/tree/v0.4.0
+- The Openhongguo Swift package reads timed danmaku with its anonymous client. The upstream
+  license is included as Openhongguo-Apache-2.0.txt.

@@ -22,6 +22,13 @@ release_spec = importlib.util.spec_from_file_location("release_common", Path(__f
 release = importlib.util.module_from_spec(release_spec)
 release_spec.loader.exec_module(release)
 verify_path = Path(__file__).with_name("verify-ipa.py")
+OPENHONGGUO_WORKSPACE = b"/Users/runner/work/openhongguo/openhongguo"
+OPENHONGGUO_MODULE_RECORDS = (
+    b"\ndep\tgithub.com/beilunyang/openhongguo\tv0.0.0\n=>\t"
+    + OPENHONGGUO_WORKSPACE + b"\t(devel)\t\n",
+    b"\ndep\tgithub.com/beilunyang/openhongguo/bindings/mobile/core\tv0.0.0-00010101000000-000000000000\n=>\t"
+    + OPENHONGGUO_WORKSPACE + b"/bindings/mobile/core\t(devel)\t\n",
+)
 
 
 class FeedTests(unittest.TestCase):
@@ -67,6 +74,10 @@ class FeedTests(unittest.TestCase):
 
     def generate(self, **options):
         return feeds.generate(self.config_path, self.ipa, self.output, tag="v0.1.1", published_at="2026-10-28T12:00:00Z", use_codesign=False, **options)
+
+    def verify_new_build(self):
+        return subprocess.run([sys.executable, verify_path, self.ipa, "--config", self.config_path],
+                              capture_output=True, text=True)
 
     def test_consistent_actual_metadata_and_urls(self):
         self.package()
@@ -132,18 +143,55 @@ class FeedTests(unittest.TestCase):
                 self.generate(check=True)
 
     def test_new_build_resource_scan_accepts_public_paths_and_rejects_renamed_material(self):
-        def verify():
-            return subprocess.run([sys.executable, verify_path, self.ipa, "--config", self.config_path],
-                                  capture_output=True, text=True)
-
         self.package(binary_data=b"\0/Users/Shared/work\0docs/Users/example\0")
-        self.assertEqual(verify().returncode, 0)
+        self.assertEqual(self.verify_new_build().returncode, 0)
         for contents, message in [(b"-----BEGIN PRIVATE KEY-----\nZml4dHVyZQ==\n", "PEM signing material"),
                                   (bytes.fromhex("cffaedfe"), "Unexpected embedded Mach-O")]:
             self.package(extra=[("Payload/Hongguo.app/resources.bin", contents)])
-            result = verify()
+            result = self.verify_new_build()
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(message, result.stderr)
+
+    def test_openhongguo_module_records_are_accepted_across_scan_boundaries(self):
+        for record in OPENHONGGUO_MODULE_RECORDS:
+            path_offset = record.index(OPENHONGGUO_WORKSPACE)
+            for boundary in (1, path_offset, path_offset + 8, len(record) - 1):
+                with self.subTest(record=record, boundary=boundary):
+                    self.package(binary_data=b"\0" * (65536 - 56 - boundary) + record)
+                    result = self.verify_new_build()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_openhongguo_module_exception_is_limited_to_complete_executable_records(self):
+        record, mobile_record = OPENHONGGUO_MODULE_RECORDS
+        private_path = b"/Users/fixture-person/source.swift"
+        for content in (
+            OPENHONGGUO_WORKSPACE,
+            record[:-1],
+            record.replace(b"\ndep\t", b"\nother dep\t"),
+            record.replace(b"github.com/beilunyang/openhongguo", b"github.com/another/openhongguo"),
+            record.replace(b"v0.0.0", b"v0.4.0"),
+            mobile_record.replace(b"00010101000000", b"20261122000000"),
+            record.replace(b"(devel)\t\n", b"(devel)\tmodified\n"),
+            record.replace(OPENHONGGUO_WORKSPACE, OPENHONGGUO_WORKSPACE + b"/go.mod"),
+            record + OPENHONGGUO_WORKSPACE + b"\0",
+            record + private_path + b"\0",
+            private_path + b"\0" + record,
+        ):
+            with self.subTest(content=content):
+                self.package(binary_data=b"\0" + content)
+                result = self.verify_new_build()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Private absolute home path detected (macOS home)", result.stderr)
+                self.assertNotIn(private_path.decode(), result.stdout + result.stderr)
+        self.package(binary_data=record, extra=[("Payload/Hongguo.app/Resources/Hongguo", record)])
+        result = self.verify_new_build()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Private absolute home path detected (macOS home)", result.stderr)
+
+        self.package(binary_data=mobile_record + b"\n-----BEGIN PRIVATE KEY-----\nZml4dHVyZQ==\n")
+        result = self.verify_new_build()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PEM signing material", result.stderr)
 
     def test_new_build_rejects_uid_gid_extra_fields_in_both_zip_headers(self):
         entry = zipfile.ZipInfo("Payload/Hongguo.app/metadata.txt")

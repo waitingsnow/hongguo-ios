@@ -17,6 +17,12 @@ struct MyView: View {
                 }.background(model.appearance.surface, in: RoundedRectangle(cornerRadius: 21)).buttonStyle(.plain)
             }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 20)
         }.navigationTitle("我的").appBackground(model.appearance).tabRoot(model.appearance)
+        .scrollBounceBehavior(.always, axes: .vertical)
+        .refreshable {
+            library.reload()
+            if account.authenticated { await account.refresh() }
+            else if account.hasCredentials { await account.verify() }
+        }
     }
     private var accountCard: some View {
         let signedIn = !account.nickname.isEmpty
@@ -42,7 +48,13 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section("外观") { NavigationLink { ThemeSettingsView() } label: { HStack { Text("主题样式"); Spacer(); Text(model.theme.name).foregroundStyle(.secondary) } }; appearancePicker }
-            Section { Toggle("自动连播下一集", isOn: $model.autoNext); Toggle("下一集整集预加载", isOn: $model.preloadNext); Picker("默认清晰度", selection: $model.quality) { ForEach(VideoQuality.allCases.reversed()) { Text($0.label).tag($0) } }; Picker("默认播放速度", selection: $model.speed) { ForEach([Float(0.5), 0.75, 1, 1.25, 1.5, 2], id: \.self) { Text(String(format: "%g×", $0)).tag($0) } } } header: { Text("播放偏好") } footer: { Text("当前剧集缓冲充足时，会提前准备后续剧集的首帧和开头。开启整集预加载后会下载完整下一集，流量和存储占用更多，默认关闭。片源没有所选清晰度时使用最接近的一档。离开应用时正在播放的剧集会转为小窗并继续连播，回到应用后自动回到全屏；可在系统设置的“画中画”中关闭自动开启。") }
+            Section {
+                Toggle("自动连播下一集", isOn: $model.autoNext)
+                Toggle("下一集整集预加载", isOn: $model.preloadNext)
+                Picker("默认清晰度", selection: $model.quality) { ForEach(VideoQuality.allCases.reversed()) { Text($0.label).tag($0) } }
+                Picker("默认播放速度", selection: $model.speed) { ForEach([Float(0.5), 0.75, 1, 1.25, 1.5, 2], id: \.self) { Text(String(format: "%g×", $0)).tag($0) } }
+                PortraitVideoPositionPicker()
+            } header: { Text("播放偏好") } footer: { Text("竖屏横片位置同时用于播放器和推荐页预览。当前剧集缓冲充足时，会提前准备后续剧集的首帧和开头。开启整集预加载后会下载完整下一集，流量和存储占用更多，默认关闭。片源没有所选清晰度时使用最接近的一档。离开应用时正在播放的剧集会转为小窗并继续连播，回到应用后自动回到全屏；可在系统设置的“画中画”中关闭自动开启。") }
             Section { Button { confirmCache = true } label: { HStack { Text(cacheBytes.map { "清理播放缓存（\(ByteCountFormatter.string(fromByteCount: $0, countStyle: .file))）" } ?? "清理播放缓存"); Spacer(); if clearing { ProgressView() } } }.disabled(clearing) } header: { Text("存储空间") } footer: { Text("播放缓存用于加速观看，不是永久离线保存。清理缓存不会删除收藏和历史。") }
             Section("通用") { LabeledContent("当前版本", value: appVersionText); NavigationLink("关于红果独立版") { AboutView() } }
         }.scrollContentBackground(.hidden).appBackground(model.appearance).tint(model.appearance.accent).navigationTitle("设置").navigationBarTitleDisplayMode(.inline).secondaryPage().task { await refreshCacheSize() }

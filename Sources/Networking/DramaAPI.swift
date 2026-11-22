@@ -43,23 +43,19 @@ actor DramaAPI {
         deviceID = String(1_000_000_000_000_000 + value % 9_000_000_000_000_000)
     }
 
-    func home(feed: String, offset: Int) async throws -> DramaPage {
+    func home(feed: String, offset: Int, cachedPrefix: [Drama]? = nil) async throws -> DramaPage {
         switch feed {
-        case "comic": return try await rank(offset: offset)
-        case "latest": return try await browse(genre: "short_play", filters: ["sort":"online_time"], offset: offset)
-        default: return try await browse(genre: "short_play", filters: ["sort":"hot_score"], offset: offset)
+        case "comic": return try await rank(offset: offset, cachedPrefix: cachedPrefix)
+        case "latest": return try await browse(genre: "short_play", filters: ["sort":"online_time"], offset: offset, cachedPrefix: cachedPrefix)
+        default: return try await browse(genre: "short_play", filters: ["sort":"hot_score"], offset: offset, cachedPrefix: cachedPrefix)
         }
     }
 
-    func browse(genre: String, filters: [String: String], offset: Int) async throws -> DramaPage {
+    func browse(genre: String, filters: [String: String], offset: Int, cachedPrefix: [Drama]? = nil) async throws -> DramaPage {
         let genre = ["short_play", "comic_series", "ai_series"].contains(genre) ? genre : "short_play"
         let start = max(0, offset)
         let key = genre + "|" + filters.keys.sorted().map { "\($0)=\(filters[$0] ?? "")" }.joined(separator: "&")
-        if start == 0 {
-            if seenByDiscovery[key] == nil, seenByDiscovery.count >= 32, let oldest = seenByDiscovery.keys.first { seenByDiscovery.removeValue(forKey: oldest) }
-            seenByDiscovery[key] = []
-        }
-        var seen = seenByDiscovery[key] ?? []
+        var seen = start == 0 ? [] : cachedPrefix?.suffix(180).map(\.id) ?? seenByDiscovery[key] ?? []
         var cursor = start, dramas = [Drama](), more = false
         let selected = selection(genre: genre, filters: filters)
         // A bounded continuation fills sparse pages without turning a single gesture into an unbounded crawl.
@@ -80,13 +76,15 @@ actor DramaAPI {
             cursor = next
             if !more || dramas.count >= 18 { break }
         }
+        try Task.checkCancellation()
+        if seenByDiscovery[key] == nil, seenByDiscovery.count >= 32, let oldest = seenByDiscovery.keys.first { seenByDiscovery.removeValue(forKey: oldest) }
         seenByDiscovery[key] = Array(seen.suffix(180))
         return DramaPage(dramas: dramas, hasMore: more && !dramas.isEmpty, nextOffset: cursor)
     }
 
-    func filters(genre: String) async throws -> [FilterGroup] {
+    func filters(genre: String, forceRefresh: Bool = false) async throws -> [FilterGroup] {
         let genre = ["short_play", "comic_series", "ai_series"].contains(genre) ? genre : "short_play"
-        if let cached = filterCache[genre] { return cached }
+        if !forceRefresh, let cached = filterCache[genre] { return cached }
         let body: [String: Any] = ["filter_ids":"", "req_scene":genre == "short_play" ? "default" : genre, "offset":0, "limit":1,
             "need_selector_panel":true, "req_type":"default", "client_req_type":3, "select_items":selection(genre: genre, filters: [:]), "session_id":""]
         let response = try await api(path: "/reading/distribution/category/landpage/v", body: body)
@@ -100,7 +98,7 @@ actor DramaAPI {
             }
             return options.isEmpty ? nil : FilterGroup(id: id, name: ProtocolJSON.text(row["row_name"]), options: options)
         }
-        if !groups.isEmpty { filterCache[genre] = groups }
+        if !groups.isEmpty || forceRefresh { filterCache[genre] = groups }
         return groups
     }
 
@@ -142,14 +140,13 @@ actor DramaAPI {
         return raw > 0 && raw <= 9_999_999_999 ? raw * 1000 : raw
     }
 
-    func search(query: String, offset: Int) async throws -> DramaPage {
+    func search(query: String, offset: Int, forceRefresh: Bool = false) async throws -> DramaPage {
         let keyword = String(query.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200)), start = max(0, offset)
         guard !keyword.isEmpty else { return DramaPage(dramas: [], hasMore: false, nextOffset: start) }
         do {
             searchCursors = searchCursors.filter { Date().timeIntervalSince($0.value.fetchedAt) <= 600 }
             if searchCursors[keyword] == nil, searchCursors.count >= 16, let oldest = searchCursors.min(by: { $0.value.fetchedAt < $1.value.fetchedAt })?.key { searchCursors.removeValue(forKey: oldest) }
-            var cursor = searchCursors[keyword] ?? SearchCursor()
-            if Date().timeIntervalSince(cursor.fetchedAt) > 600 { cursor = SearchCursor() }
+            var cursor = forceRefresh ? SearchCursor() : searchCursors[keyword] ?? SearchCursor()
             var known = Set(cursor.results.map(\.id))
             for _ in 0..<8 {
                 if cursor.results.count >= start + 20 || !cursor.hasMore { break }
@@ -167,6 +164,7 @@ actor DramaAPI {
                 let passback = ProtocolJSON.text(tab["passback"]), searchID = ProtocolJSON.text(tab["search_id"])
                 if !passback.isEmpty { cursor.passback = passback }; if !searchID.isEmpty { cursor.searchID = searchID }
             }
+            try Task.checkCancellation()
             searchCursors[keyword] = cursor
             let page = Array(cursor.results.dropFirst(start).prefix(20))
             if !page.isEmpty { return DramaPage(dramas: page, hasMore: start + page.count < cursor.results.count || cursor.hasMore, nextOffset: start + page.count) }
@@ -179,9 +177,9 @@ actor DramaAPI {
         }
     }
 
-    func detail(drama: Drama) async throws -> DramaDetail {
+    func detail(drama: Drama, forceRefresh: Bool = false) async throws -> DramaDetail {
         guard ProtocolJSON.identifier(drama.id) != nil else { throw HGError.message("剧集编号无效") }
-        if let cached = detailCache[drama.id], (detailExpiry[drama.id] ?? .distantPast) > Date() { return cached }
+        if !forceRefresh, let cached = detailCache[drama.id], (detailExpiry[drama.id] ?? .distantPast) > Date() { return cached }
         do {
             let biz: [String: Any] = ["detail_page_version":0, "disable_digg_stat":false,
                 "image_shrink_datas_str":"W3siaW1hZ2VfdHlwZSI6MywiaW1hZ2Vfd2lkdGgiOjkwMCwic2hyaW5rX3R5cGUiOjN9LHsiaW1hZ2VfdHlwZSI6NCwiaW1hZ2Vfd2lkdGgiOjU0LCJzaHJpbmtfdHlwZSI6NH1d",
@@ -219,9 +217,9 @@ actor DramaAPI {
         return WebsiteCatalog.parseSuggestions(try await request(url: url, body: nil, headers: ["User-Agent":WebsiteCatalog.userAgent, "Accept":"application/json"]))
     }
 
-    func related(id: String) async throws -> [RelatedWork] {
+    func related(id: String, forceRefresh: Bool = false) async throws -> [RelatedWork] {
         guard ProtocolJSON.identifier(id) != nil else { throw HGError.message("作品编号无效") }
-        if let cached = relatedCache[id] { return cached }
+        if !forceRefresh, let cached = relatedCache[id] { return cached }
         var failure: Error = HGError.message("相关作品暂不可用")
         for host in RelatedWorks.hosts {
             try Task.checkCancellation()
@@ -741,15 +739,18 @@ actor DramaAPI {
         return ProtocolJSON.array(model["video_list"]).isEmpty ? nil : model
     }
 
-    private func rank(offset: Int) async throws -> DramaPage {
-        if offset == 0 || comicRankPager == nil {
-            comicRankPager = ComicRankPager { [weak self] ids in
-                guard let self else { throw CancellationError() }
-                return try await self.comicRankBatch(filterIDs: ids)
-            }
+    private func rank(offset: Int, cachedPrefix: [Drama]?) async throws -> DramaPage {
+        if offset > 0, cachedPrefix == nil, let comicRankPager {
+            return try await comicRankPager.page(offset: offset)
         }
-        guard let pager = comicRankPager else { throw CancellationError() }
-        return try await pager.page(offset: max(0, offset))
+        let pager = ComicRankPager(cachedPrefix: offset > 0 ? cachedPrefix ?? [] : []) { [weak self] ids in
+            guard let self else { throw CancellationError() }
+            return try await self.comicRankBatch(filterIDs: ids)
+        }
+        let page = try await pager.page(offset: max(0, offset))
+        try Task.checkCancellation()
+        comicRankPager = pager
+        return page
     }
 
     private func comicRankBatch(filterIDs: [String]) async throws -> ComicRankBatch {

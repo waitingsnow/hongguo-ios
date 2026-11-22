@@ -302,31 +302,36 @@ final class AccountService: ObservableObject {
         if ticket == generation { try? persist(); scheduleUploads(force: false) }
     }
 
-    /// Whose 猜你喜欢 a new round shows: the verified app account's session, or nil for the anonymous feed.
-    var guessOwner: UUID? { authenticated && credentials != nil ? generation : nil }
-    var guessHistoryKey: String { authenticated && !profileID.isEmpty ? "account:" + profileID : "anonymous" }
+    var guessFeedAccess: GuessFeedAccess {
+        GuessFeedAccess(hasCredentials: hasCredentials, profileID: profileID, verifiedOwner: authenticated ? generation : nil)
+    }
 
     /// One 猜你喜欢 batch. A non-nil owner carries that account's login cookie only while the same login session
     /// is still active, so an old round's pagination never mixes into a new account.
     func guessBatch(owner: UUID?, cursor: GuessCursor) async throws -> GuessBatch {
+        let access = guessFeedAccess
+        guard access.canRequest, access.owner == owner else { throw CancellationError() }
         var account: GuessAccount?
         if let owner {
             guard owner == generation, authenticated, let candidate = credentials else { throw HGError.message("账号已变化，请刷新猜你喜欢") }
             account = GuessAccount(cookie: candidate.cookie, device: candidate.device)
         }
         let session = self.session
-        return try await GuessFeed.batch(account: account, cursor: cursor,
+        let batch = try await GuessFeed.batch(account: account, cursor: cursor,
                                          identity: { try await GuessIdentity.shared.identity(session: session) },
                                          forget: { await GuessIdentity.shared.forget($0) }) { request in
+            guard guessFeedAccess == access else { throw CancellationError() }
             let (bytes, response) = try await session.data(for: request)
             try Task.checkCancellation()
-            if let owner, owner != generation { throw CancellationError() }
+            guard guessFeedAccess == access else { throw CancellationError() }
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 throw HGError.message("猜你喜欢暂时不可用（HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)）")
             }
             guard !bytes.isEmpty else { throw GuessEmptyResponse() }
             return try ProtocolJSON.object(bytes)
         }
+        guard guessFeedAccess == access else { throw CancellationError() }
+        return batch
     }
 
     func isFavorite(_ drama: Drama) -> Bool { favorites.contains { $0.id == drama.id } }

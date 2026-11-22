@@ -15,6 +15,7 @@ if ! /usr/bin/xcodebuild -project Hongguo.xcodeproj -scheme Hongguo \
     -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
     -derivedDataPath "$TASK_ROOT/build/DerivedData" \
     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' \
+    PACKAGE_SKIP_AUTO_EMBEDDING_STATIC_BINARY_FRAMEWORKS=YES \
     build > build/release-build.log 2>&1; then
     tail -100 build/release-build.log
     exit 1

@@ -2,6 +2,7 @@
 // Offline protocol tests. All inputs are synthetic and no network request is dispatched.
 import Foundation
 import JavaScriptCore
+import Openhongguo
 
 @main struct NetworkSelfTest {
     static func main() async throws {
@@ -297,6 +298,7 @@ import JavaScriptCore
         precondition(WebsiteCatalog.parseSuggestions(["suggest_list": [["name":"甲"],["display_words":["乙"]],["name":"甲"],["name":" "]]]) == ["甲","乙"])
         print("PASS: website boards and suggestions.")
         try await checkEpisodeDiscussion()
+        try checkEpisodeDanmaku(profileDirectory: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true))
         // Signed playback: the full GetVideoModelRequest query, the registered identity in the query and the official
         // player's version and headers; object/string model, rejection of unusable replies.
         let identity = RegisteredIdentity(deviceID: "9999999999999999999", installID: "9999999999999999998", cdid: "offline", appDeviceCookie: "install_id=1; ttreq=2")
@@ -625,6 +627,53 @@ import JavaScriptCore
         print("PASS: anonymous episode previews, counts without bodies, stable deduplication, ID checks and restricted pages.")
     }
 
+    static func checkEpisodeDanmaku(profileDirectory: URL) throws {
+        _ = try OpenhongguoClient.create(
+            profile: profileDirectory.appendingPathComponent("anonymous.json"),
+            options: ClientOptions(retryAttempts: 1, deviceResets: 0)
+        )
+        let emptyWindow = EpisodeDanmakuPage(
+            DanmakuPage(startMs: 0, endMs: 30_000, hasMore: true, cursor: "second-window"),
+            previousCursor: nil
+        )
+        precondition(emptyWindow.items.isEmpty && emptyWindow.hasMore && emptyWindow.nextCursor == "second-window")
+        precondition(emptyWindow.startMs == 0 && emptyWindow.endMs == 30_000 && emptyWindow.totalCount == nil)
+
+        let emoji = "👨‍👩‍👧‍👦"
+        let input = [
+            Danmaku(id: "late", text: "较晚", offsetMs: 450),
+            Danmaku(id: "early", text: "重复 ID", offsetMs: 320),
+            Danmaku(id: " early ", text: " 本集弹幕 \n", offsetMs: 100),
+            Danmaku(text: " 缺少 ID ", offsetMs: 220),
+            Danmaku(text: "缺少 ID", offsetMs: 220),
+            Danmaku(text: "缺少 ID", offsetMs: 250),
+            Danmaku(id: "negative", text: "非法时间", offsetMs: -1),
+            Danmaku(id: "blank", text: " \n\t ", offsetMs: 0),
+            Danmaku(id: String(repeating: "x", count: 150), text: String(repeating: "字", count: 200), offsetMs: 500),
+            Danmaku(id: "emoji", text: String(repeating: emoji, count: 60), offsetMs: 600),
+        ]
+        let page = EpisodeDanmakuPage(DanmakuPage(items: input), previousCursor: nil)
+        precondition(page.items.map(\.offsetMs) == [100, 220, 250, 450, 500, 600])
+        precondition(page.items.first?.text == "本集弹幕" && page.items.first?.id == "upstream:early")
+        precondition(page.items[1].id.hasPrefix("content:") && page.items[1].id != page.items[2].id)
+        precondition(page.items[4].id.hasPrefix("content:") && page.items[4].text.count == 160)
+        precondition(page.items[5].text == String(repeating: emoji, count: 1_024 / emoji.utf8.count))
+        let reordered = EpisodeDanmakuPage(DanmakuPage(items: Array(input.reversed())), previousCursor: nil)
+        precondition(reordered.items == page.items)
+        let overlap = EpisodeDanmakuPage(DanmakuPage(items: [input[3]]), previousCursor: "second-window")
+        precondition(overlap.items.first?.id == page.items[1].id)
+
+        for (hasMore, cursor) in [(true, "second-window"), (true, ""), (false, "unused-window")] {
+            let lastWindow = EpisodeDanmakuPage(
+                DanmakuPage(startMs: 30_000, endMs: 60_000, total: 100, hasMore: hasMore, cursor: cursor),
+                previousCursor: emptyWindow.nextCursor
+            )
+            precondition(lastWindow.totalCount == 100)
+            precondition(!lastWindow.hasMore && lastWindow.nextCursor == nil)
+        }
+        print("PASS: Openhongguo SDK initialized offline; timed danmaku sorting, validation, deduplication, bounds and continuation.")
+    }
+
     static func checkEpisodePreviewCache(_ url: URL, _ anotherEpisode: URL, _ anotherSeries: URL,
                                          preview: EpisodeCommentPreview, empty: EpisodeCommentPreview) async throws {
         let cache = EpisodeDiscussionAPI.PreviewCache(capacity: 2)
@@ -640,6 +689,9 @@ import JavaScriptCore
         precondition(firstResult == secondResult)
         let cached = try await cache.preview(for: url) { fatalError("A fresh preview should be reused") }
         precondition(cached == firstResult)
+        let manual = try await cache.preview(for: url, forceRefresh: true) { EpisodeCommentPreview(items: [], totalCount: 48) }
+        let afterManual = try await cache.preview(for: url) { fatalError("Successful refresh must replace the cached preview") }
+        precondition(manual.totalCount == 48 && afterManual == manual)
 
         let differentEpisode = try await cache.preview(for: anotherEpisode) { empty }
         let differentSeries = try await cache.preview(for: anotherSeries) { preview }

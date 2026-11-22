@@ -7,10 +7,13 @@ struct ComicRankBatch: Sendable { let dramas: [Drama]; let hasMore: Bool }
 /// Adapted from sunnysky123/hongguo-web 1b00f06 (2026-11-13, MIT).
 actor ComicRankPager {
     private let fetch: @Sendable ([String]) async throws -> ComicRankBatch
-    private var rows: [Drama] = []
+    private var rows: [Drama]
     private var hasMore = true
 
-    init(fetch: @escaping @Sendable ([String]) async throws -> ComicRankBatch) { self.fetch = fetch }
+    init(cachedPrefix: [Drama] = [], fetch: @escaping @Sendable ([String]) async throws -> ComicRankBatch) {
+        rows = cachedPrefix
+        self.fetch = fetch
+    }
 
     func page(offset: Int) async throws -> DramaPage {
         guard (0...600).contains(offset), offset <= rows.count else { throw HGError.message("漫剧榜单分页已变化，请刷新") }

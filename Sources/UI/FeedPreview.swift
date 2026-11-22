@@ -27,6 +27,7 @@ final class FeedHandoff {
 final class FeedPreview: ObservableObject {
     @Published private(set) var dramaID: String?
     @Published private(set) var player: AVPlayer?
+    @Published private(set) var videoSize: CGSize = .zero
     @Published private(set) var rendered = false
     @Published private(set) var paused = false
     @Published private(set) var ended = false
@@ -44,7 +45,7 @@ final class FeedPreview: ObservableObject {
     private var quality: VideoQuality = .p1080
     private var speed: Float = 1
     private var following: [Drama] = []
-    private(set) var isScrolling = false
+    @Published private(set) var isScrolling = false
     private var selectionTask: Task<Void, Never>?
     private var lookahead: PlaybackLookahead
     init(lookahead: PlaybackLookahead? = nil, library: LibraryStore? = nil) {
@@ -139,10 +140,20 @@ final class FeedPreview: ObservableObject {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         try? AVAudioSession.sharedInstance().setActive(true)
         let player = AVQueuePlayer(items: [item])
+        #if targetEnvironment(simulator)
+        if ProcessInfo.processInfo.environment["HONGGUO_QA_SILENT"] == "1" { player.volume = 0 }
+        #endif
         player.actionAtItemEnd = .pause
         player.automaticallyWaitsToMinimizeStalling = true
         observations.append(item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor in guard let self, self.ticket == ticket, item.status == .failed else { return }; self.failed = true }
+        })
+        observations.append(item.observe(\.presentationSize, options: [.initial, .new]) { [weak self] item, _ in
+            let size = item.presentationSize
+            Task { @MainActor in
+                guard let self, self.ticket == ticket, size.width > 0, size.height > 0, self.videoSize != size else { return }
+                self.videoSize = size
+            }
         })
         observations.append(player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
             Task { @MainActor in guard let self, self.ticket == ticket else { return }; self.schedule() }
@@ -185,6 +196,7 @@ final class FeedPreview: ObservableObject {
     func markRendered(_ player: AVPlayer, host: PlayerLayerHost? = nil) {
         if self.player === player, let host { layerHost = host }
         guard self.player === player, !restoringPosition, !rendered, let episode else { return }
+        if let size = player.currentItem?.presentationSize, size.width > 0, size.height > 0, videoSize != size { videoSize = size }
         rendered = true
         schedule()
         let target = PlaybackTarget(episode.detail, index: 0, quality: quality)
@@ -270,7 +282,7 @@ final class FeedPreview: ObservableObject {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }; endObserver = nil
         if let periodic { player?.removeTimeObserver(periodic) }; periodic = nil
         if !keepPlaying { player?.pause(); player?.replaceCurrentItem(with: nil) }
-        player = nil; episode = nil; dramaID = nil; rendered = false; paused = false
+        player = nil; episode = nil; dramaID = nil; videoSize = .zero; rendered = false; paused = false
         ended = false; failed = false; holding = false; speedLocked = false; restoringPosition = false
     }
     func stop() {
@@ -311,9 +323,9 @@ struct FeedGestureView: View {
         retry = tap
     }
 
-    init(preview: FeedPreview, player: AVPlayer, statusTopInset: CGFloat, statusTrailingInset: CGFloat, restoredSpeed: String) {
+    init(preview: FeedPreview, player: AVPlayer, picture: CGRect?, statusTopInset: CGFloat, statusTrailingInset: CGFloat, restoredSpeed: String) {
         playback = PlaybackGestures(preview: preview, player: player, statusTopInset: statusTopInset,
-                                    statusTrailingInset: statusTrailingInset, restoredSpeed: restoredSpeed)
+                                    statusTrailingInset: statusTrailingInset, restoredSpeed: restoredSpeed, picture: picture)
         retry = nil
     }
 
@@ -333,6 +345,7 @@ struct FeedGestureView: View {
         let statusTopInset: CGFloat
         let statusTrailingInset: CGFloat
         let restoredSpeed: String
+        let picture: CGRect?
         @State private var lockZone: SpeedLockZone?
         @State private var seekStart: Double?
         @State private var seekTarget: Double = 0
@@ -358,8 +371,10 @@ struct FeedGestureView: View {
             .overlay {
                 if isCurrent && preview.holding, let lockZone { SpeedLockTarget(zone: lockZone) }
                 if canSeek, let seekStart {
-                    SeekDragBadge(target: seekTarget, duration: preview.duration, delta: seekTarget - seekStart)
-                        .allowsHitTesting(false)
+                    GeometryReader { geometry in
+                        SeekDragBadge(target: seekTarget, duration: preview.duration, delta: seekTarget - seekStart)
+                            .position(x: picture?.midX ?? geometry.size.width / 2, y: picture?.midY ?? geometry.size.height / 2)
+                    }.allowsHitTesting(false)
                 }
             }
             .accessibilityElement()
@@ -379,7 +394,7 @@ struct FeedGestureView: View {
             .overlay(alignment: .topTrailing) {
                 SpeedLockStatus(locked: preview.speedLocked, restoredSpeed: restoredSpeed,
                                 identifier: "feed.speedUnlock", unlock: preview.unlockSpeed)
-                    .padding(.top, statusTopInset).padding(.trailing, statusTrailingInset)
+                    .padding(.top, picture?.maxY ?? statusTopInset).padding(.trailing, statusTrailingInset)
             }
         }
 

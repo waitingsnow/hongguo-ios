@@ -20,6 +20,7 @@ def quote(value):
 # committed Package.resolved (project.xcworkspace is not tracked).
 packages = [
     {'name': 'Nuke', 'url': 'https://github.com/kean/Nuke.git', 'version': '13.2.3', 'products': ['Nuke', 'NukeUI']},
+    {'name': 'Openhongguo', 'url': 'https://github.com/beilunyang/openhongguo.git', 'version': '0.4.0', 'products': ['Openhongguo']},
 ]
 
 objects = {}

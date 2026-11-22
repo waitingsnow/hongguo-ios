@@ -29,6 +29,8 @@ struct LibraryView: View {
                 }
             }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 20)
         }.navigationTitle(model.appearance == .immersive ? "追剧" : "片单").appBackground(model.appearance).tabRoot(model.appearance)
+            .scrollBounceBehavior(.always, axes: .vertical)
+            .refreshable { if showsAccount { await account.refresh() } else { library.reload() } }
             .onChange(of: showsAccount) { _, _ in editing = false }
     }
 }
@@ -147,6 +149,7 @@ struct LocalLibraryActions: View {
 /// A signed-in account's history comes first unless the entry was about this device's records.
 struct PlayHistoryView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var library: LibraryStore
     @ObservedObject private var account = AccountService.shared
     @State private var showLocal: Bool
     @State private var editing = false
@@ -165,6 +168,8 @@ struct PlayHistoryView: View {
             }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 20)
         }
         .appBackground(model.appearance).navigationTitle("播放历史").navigationBarTitleDisplayMode(.inline).secondaryPage()
+        .scrollBounceBehavior(.always, axes: .vertical)
+        .refreshable { if showsAccount { await account.refresh() } else { library.reload() } }
         .toolbar { ToolbarItem(placement: .topBarTrailing) { if !showsAccount { LocalLibraryActions(favorites: false, editing: $editing) } } }
         .onChange(of: showsAccount) { _, _ in editing = false }
     }
@@ -172,6 +177,7 @@ struct PlayHistoryView: View {
 
 struct LocalFavoritesView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var library: LibraryStore
     @State private var editing = false
 
     var body: some View {
@@ -179,6 +185,8 @@ struct LocalFavoritesView: View {
             LocalLibraryGrid(favorites: true, editing: $editing).padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 20)
         }
         .appBackground(model.appearance).navigationTitle("本机收藏").navigationBarTitleDisplayMode(.inline).secondaryPage()
+        .scrollBounceBehavior(.always, axes: .vertical)
+        .refreshable { library.reload() }
         .toolbar { ToolbarItem(placement: .topBarTrailing) { LocalLibraryActions(favorites: true, editing: $editing) } }
     }
 }

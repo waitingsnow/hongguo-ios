@@ -31,34 +31,94 @@ enum CommentDanmakuPreference {
 struct DiscussionControls: View {
     @AppStorage(CommentDanmakuPreference.key) private var enabled = CommentDanmakuPreference.defaultValue
     @Environment(\.episodeCommentPreview) private var preview
+    @Environment(\.episodeDanmakuSource) private var danmakuSource
     var vertical = false
     let showComments: () -> Void
 
     var body: some View {
         let layout = vertical ? AnyLayout(VStackLayout(spacing: 4)) : AnyLayout(HStackLayout(spacing: 2))
-        let available = preview?.hasDisplayableComments == true
-        let danmakuCount = preview?.playableDanmakuCount
+        let available = danmakuSource.isAvailable(preview)
+        let danmakuCount = danmakuSource.count(preview)
         let commentCount = preview?.displayCount
         let commentCountValue = commentCount.map { count in
             preview?.totalCount == nil ? "公开预览 \(count) 条" : "\(count) 条"
         } ?? "暂未取得数量"
         layout {
             Button { enabled.toggle() } label: {
-                InteractionButtonIcon(glyph: .danmaku(enabled: available && enabled), count: danmakuCount)
+                InteractionButtonIcon(symbol: AppSymbol.danmaku(available && enabled), count: danmakuCount)
                     .opacity(available ? 1 : 0.45)
             }
             .disabled(!available)
-            .accessibilityLabel("评论弹幕")
-            .accessibilityValue(available ? (enabled ? "开启" : "关闭") : "暂无可轮播内容")
-            .accessibilityHint(danmakuCount.map { "轮播本集 \($0) 条公开评论" } ?? "查看本集评论了解内容状态")
+            .accessibilityLabel("本集弹幕")
+            .accessibilityValue(available ? (enabled ? "开启" : "关闭") : "暂无弹幕")
+            .accessibilityHint(danmakuSource == .commentPreview ? "轮播本集公开评论" : "按播放进度显示本集弹幕")
             .accessibilityIdentifier("discussion.toggle")
             Button(action: showComments) {
-                InteractionButtonIcon(glyph: .symbol("text.bubble"), count: commentCount)
+                InteractionButtonIcon(symbol: "text.bubble", count: commentCount)
             }
             .accessibilityLabel("本集评论").accessibilityValue(commentCountValue)
             .accessibilityHint("打开本集评论")
             .accessibilityIdentifier("discussion.comments")
         }.buttonStyle(.plain)
+    }
+}
+
+private enum EpisodeDanmakuSource: Equatable, EnvironmentKey {
+    case inactive, loading, native(Int?), commentPreview
+    static let defaultValue: Self = .inactive
+
+    func isAvailable(_ preview: EpisodeCommentPreview?) -> Bool {
+        switch self {
+        case .inactive: false
+        case .loading, .native: true
+        case .commentPreview: preview?.hasDisplayableComments == true
+        }
+    }
+
+    func count(_ preview: EpisodeCommentPreview?) -> Int? {
+        switch self {
+        case .native(let total): total
+        case .commentPreview: preview?.playableDanmakuCount
+        case .inactive, .loading: nil
+        }
+    }
+}
+
+private extension EnvironmentValues {
+    var episodeDanmakuSource: EpisodeDanmakuSource {
+        get { self[EpisodeDanmakuSource.self] }
+        set { self[EpisodeDanmakuSource.self] = newValue }
+    }
+}
+
+private struct EpisodeDanmakuWindow {
+    let episode: DiscussionEpisode
+    var pages: [EpisodeDanmakuPage] = []
+    var total: Int?
+    var items: [EpisodeDanmaku] = []
+    var unavailable = false
+
+    func request(at time: Int) -> EpisodeDanmakuAPI.Position? {
+        guard let last = pages.last else { return .time(milliseconds: time) }
+        if pages.contains(where: { $0.startMs <= time && time < $0.endMs }) {
+            if time >= last.endMs - 5_000, let cursor = last.nextCursor { return .cursor(cursor) }
+            return nil
+        }
+        if time >= last.endMs {
+            guard let cursor = last.nextCursor else { return nil }
+            if time - last.endMs < 5_000 { return .cursor(cursor) }
+        }
+        return .time(milliseconds: time)
+    }
+
+    mutating func receive(_ page: EpisodeDanmakuPage, continuing: Bool) {
+        if !continuing { pages.removeAll() }
+        pages.append(page)
+        pages = Array(pages.suffix(3))
+        total = page.totalCount ?? total
+        var seen = Set<String>()
+        items = pages.flatMap(\.items).filter { seen.insert($0.id).inserted }.sorted { $0.offsetMs < $1.offsetMs }
+        unavailable = false
     }
 }
 
@@ -87,11 +147,13 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
     let player: AVPlayer?
     let foreground: Bool
     let hideDanmaku: Bool
+    let danmakuInsets: EdgeInsets
     @Binding var presented: Bool
     @AppStorage(CommentDanmakuPreference.key) private var enabled = CommentDanmakuPreference.defaultValue
     @State private var result: (episode: DiscussionEpisode, outcome: Outcome)?
     @State private var seriesFavoriteCount: (seriesID: String, count: Int)?
     @State private var retry = 0
+    @State private var timeline: EpisodeDanmakuWindow?
 
     private enum Outcome {
         case preview(EpisodeCommentPreview)
@@ -118,16 +180,38 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
         return preview
     }
 
+    private var danmakuSource: EpisodeDanmakuSource {
+        guard let episode else { return .inactive }
+        guard let timeline, timeline.episode == episode else { return .loading }
+        if timeline.unavailable { return .commentPreview }
+        return timeline.pages.isEmpty ? .loading : .native(timeline.total)
+    }
+
+    private struct TimelineRequest: Equatable {
+        let episode: DiscussionEpisode?
+        let player: ObjectIdentifier?
+        let enabled: Bool
+    }
+
     func body(content: Content) -> some View {
         content.environment(\.episodeCommentPreview, preview)
+        .environment(\.episodeDanmakuSource, danmakuSource)
         .environment(\.discussionSeriesFavoriteCount, seriesFavoriteCount?.seriesID == episode?.seriesID ? seriesFavoriteCount : nil)
         .overlay(alignment: .top) {
-            if enabled, foreground, !hideDanmaku, !presented, let preview, preview.hasDisplayableComments, let player {
-                CommentDanmaku(comments: preview.items, player: player)
-                    .id(episode)
-                    .padding(.top, 68)
+            if enabled, foreground, !hideDanmaku, !presented, let player {
+                Group {
+                    if case .native = danmakuSource, let timeline {
+                        TimedEpisodeDanmaku(items: timeline.items, player: player)
+                    } else if danmakuSource == .commentPreview, let preview, preview.hasDisplayableComments {
+                        CommentDanmaku(comments: preview.items, player: player)
+                    }
+                }.id(episode).padding(danmakuInsets)
                     .allowsHitTesting(false).accessibilityHidden(true)
             }
+        }
+        .task(id: TimelineRequest(episode: foreground && !hideDanmaku ? episode : nil, player: player.map(ObjectIdentifier.init), enabled: enabled)) {
+            guard foreground, !hideDanmaku, let episode, let player else { return }
+            await followTimeline(for: episode, player: player, enabled: enabled)
         }
         .task(id: request) {
             guard let target = request.episode else { return }
@@ -136,20 +220,7 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
             case .failed, nil: break
             }
             result = nil
-            do {
-                let preview = try await EpisodeDiscussionAPI.preview(seriesID: target.seriesID, episodeID: target.episodeID)
-                try Task.checkCancellation()
-                if let count = preview.seriesFavoriteCount { seriesFavoriteCount = (target.seriesID, count) }
-                result = (target, .preview(preview))
-            } catch {
-                guard !Task.isCancelled else { return }
-                if error as? EpisodeDiscussionAPI.ReadError == .restrictedEpisode {
-                    result = (target, .restricted)
-                } else {
-                    let message = (error as? EpisodeDiscussionAPI.ReadError)?.errorDescription ?? "请检查网络后重试。"
-                    result = (target, .failed(message))
-                }
-            }
+            await loadPreview(target)
         }
         .onChange(of: presented) { _, open in
             if open, case .failed = outcome { retry += 1 }
@@ -170,34 +241,86 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
                                 Text(message)
                             } actions: { Button("重试") { retry += 1 } }
                         case .restricted:
-                            ContentUnavailableView("本集评论暂不可读", systemImage: "text.bubble",
-                                                   description: Text(EpisodeDiscussionAPI.ReadError.restrictedEpisode.localizedDescription))
+                            ScrollView {
+                                ContentUnavailableView("本集评论暂不可读", systemImage: "text.bubble",
+                                                       description: Text(EpisodeDiscussionAPI.ReadError.restrictedEpisode.localizedDescription))
+                            }
                         case .preview(let preview):
                             commentList(preview)
                         }
                     }
                 }
+                .scrollBounceBehavior(.always, axes: .vertical)
+                .refreshable {
+                    if let target = episode { await loadPreview(target, forceRefresh: true) }
+                }
                 .navigationTitle(episode.map { "第 \($0.number) 集评论" } ?? "本集评论")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { presented = false } } }
                 .safeAreaInset(edge: .bottom) {
-                    if preview?.hasDisplayableComments == true {
-                        Toggle("轮播本集评论弹幕", isOn: $enabled)
-                            .font(.subheadline).padding(.horizontal).padding(.vertical, 8).background(.bar)
+                    if danmakuSource.isAvailable(preview) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Toggle("显示本集弹幕", isOn: $enabled)
+                            if case .native = danmakuSource {
+                                Text("按本集播放时间显示").font(.caption).foregroundStyle(.secondary)
+                                    .accessibilityIdentifier("discussion.timelineSource")
+                            } else if danmakuSource == .commentPreview {
+                                Text("时间轴弹幕暂不可用，当前轮播公开评论。").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }.font(.subheadline).padding(.horizontal).padding(.vertical, 8).background(.bar)
                     }
                 }
             }.presentationDetents([.medium, .large]).presentationDragIndicator(.visible)
         }
     }
 
+    @MainActor
+    private func followTimeline(for target: DiscussionEpisode, player: AVPlayer, enabled: Bool) async {
+        var window = EpisodeDanmakuWindow(episode: target)
+        if let timeline, timeline.episode == target, !timeline.unavailable { window = timeline }
+        if !enabled, !window.pages.isEmpty { return }
+        let (times, continuation) = AsyncStream<CMTime>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let observer = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 1), queue: .main) { time in
+            continuation.yield(time)
+        }
+        defer { player.removeTimeObserver(observer); continuation.finish() }
+        continuation.yield(player.currentTime())
+        for await time in times {
+            guard !Task.isCancelled else { return }
+            let seconds = time.seconds
+            if seconds.isFinite, seconds >= 0, seconds < Double(Int32.max),
+               let position = window.request(at: Int(seconds * 1_000)) {
+                do {
+                    let page = try await EpisodeDanmakuAPI.shared.page(seriesID: target.seriesID, episodeID: target.episodeID, position: position)
+                    try Task.checkCancellation()
+                    if case .cursor = position {
+                        guard page.endMs > (window.pages.last?.endMs ?? 0) else { return }
+                        window.receive(page, continuing: true)
+                    } else {
+                        window.receive(page, continuing: false)
+                    }
+                    timeline = window
+                    if !enabled { return }
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    window.unavailable = true
+                    timeline = window
+                    return
+                }
+            }
+        }
+    }
+
     @ViewBuilder
     private func commentList(_ preview: EpisodeCommentPreview) -> some View {
         if !preview.hasDisplayableComments {
-            if preview.totalCount == 0 {
-                ContentUnavailableView("本集暂无公开评论", systemImage: "text.bubble")
-            } else {
-                ContentUnavailableView("官网未返回可读评论", systemImage: "text.bubble",
-                                       description: preview.totalCount.map { Text("官网显示共 \($0) 条评论。") })
+            ScrollView {
+                if preview.totalCount == 0 {
+                    ContentUnavailableView("本集暂无公开评论", systemImage: "text.bubble")
+                } else {
+                    ContentUnavailableView("官网未返回可读评论", systemImage: "text.bubble",
+                                           description: preview.totalCount.map { Text("官网显示共 \($0) 条评论。") })
+                }
             }
         } else {
             List {
@@ -218,13 +341,32 @@ private struct EpisodeDiscussionPresentation: ViewModifier {
             }.listStyle(.plain)
         }
     }
+
+    private func loadPreview(_ target: DiscussionEpisode, forceRefresh: Bool = false) async {
+        do {
+            let preview = try await EpisodeDiscussionAPI.preview(seriesID: target.seriesID, episodeID: target.episodeID, forceRefresh: forceRefresh)
+            guard !Task.isCancelled, episode == target else { return }
+            if let count = preview.seriesFavoriteCount { seriesFavoriteCount = (target.seriesID, count) }
+            result = (target, .preview(preview))
+        } catch {
+            guard !Task.isCancelled, episode == target else { return }
+            if error as? EpisodeDiscussionAPI.ReadError == .restrictedEpisode {
+                result = (target, .restricted)
+            } else {
+                let message = (error as? EpisodeDiscussionAPI.ReadError)?.errorDescription ?? "请检查网络后重试。"
+                result = (target, .failed(message))
+            }
+        }
+    }
 }
 
 extension View {
     func episodeDiscussion(_ episode: DiscussionEpisode?, player: AVPlayer?, foreground: Bool,
-                           hideDanmaku: Bool = false, presented: Binding<Bool>) -> some View {
+                           hideDanmaku: Bool = false, danmakuInsets: EdgeInsets = EdgeInsets(top: 68, leading: 0, bottom: 0, trailing: 0),
+                           presented: Binding<Bool>) -> some View {
         modifier(EpisodeDiscussionPresentation(episode: episode, player: player,
-                                               foreground: foreground, hideDanmaku: hideDanmaku, presented: presented))
+                                               foreground: foreground, hideDanmaku: hideDanmaku,
+                                               danmakuInsets: danmakuInsets, presented: presented))
     }
 }
 

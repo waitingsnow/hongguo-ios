@@ -2,10 +2,17 @@ import XCTest
 
 @MainActor
 final class HongguoQATests: XCTestCase {
+    private func testApplication() -> XCUIApplication {
+        let application = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        application.launchEnvironment["HONGGUO_QA_SILENT"] = "1"
+        addTeardownBlock { @MainActor in application.terminate() }
+        return application
+    }
+
     /// Explicit anonymous real playback; run only on a task simulator.
     func testV5PlaybackAndEpisodeSwitching() throws {
         continueAfterFailure = false
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         app.launchArguments = ["-theme", "immersive", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO", "-autoNext", "NO"]
         app.launch()
         openFirstEpisode(in: app, search: "无限白粥")
@@ -36,7 +43,7 @@ final class HongguoQATests: XCTestCase {
     /// Search entry above 今日推荐, the 刷剧 feed, 清晰度 and the saved home list. Anonymous live catalogue only.
     func testHomeSearchFeedModeAndQuality() throws {
         continueAfterFailure = false
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         app.launchArguments = ["-theme", "warm", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO", "-quality", "1080p", "-autoNext", "NO"]
         app.launch()
         XCTAssertTrue(app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH %@", "home.featured.")).firstMatch.waitForExistence(timeout: 60))
@@ -76,7 +83,7 @@ final class HongguoQATests: XCTestCase {
     }
 
     func testSearchAcceptsTypingOnEntry() {
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         app.launchArguments = ["-theme", "warm", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO"]
         app.launch()
         let entry = app.buttons["搜索短剧"]
@@ -93,7 +100,7 @@ final class HongguoQATests: XCTestCase {
     /// Anonymous live catalogue only, using a task-specific simulator with no personal account.
     func testHomeSectionsDoNotRepeat() throws {
         continueAfterFailure = false
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         func ids(_ prefix: String) -> Set<String> {
             Set(app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH %@", prefix))
                 .allElementsBoundByIndex.map { String($0.identifier.dropFirst(prefix.count)) })
@@ -113,7 +120,7 @@ final class HongguoQATests: XCTestCase {
 
     func testUpdateSourcesAndVersion() throws {
         continueAfterFailure = false
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         app.launch()
         if app.buttons["开始发现好故事"].waitForExistence(timeout: 10) { app.buttons["开始发现好故事"].tap() }
         XCTAssertTrue(app.tabBars.buttons["我的"].waitForExistence(timeout: 10))
@@ -141,7 +148,7 @@ final class HongguoQATests: XCTestCase {
         let device = XCUIDevice.shared
         let previousOrientation = device.orientation
         device.orientation = .portrait
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         defer {
             app.terminate()
             device.orientation = previousOrientation
@@ -191,7 +198,7 @@ final class HongguoQATests: XCTestCase {
         let device = XCUIDevice.shared
         let previousOrientation = device.orientation
         device.orientation = .portrait
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         defer {
             app.terminate()
             device.orientation = previousOrientation
@@ -238,7 +245,7 @@ final class HongguoQATests: XCTestCase {
         let device = XCUIDevice.shared
         let previousOrientation = device.orientation
         device.orientation = .portrait
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         defer {
             app.terminate()
             device.orientation = previousOrientation
@@ -290,7 +297,7 @@ final class HongguoQATests: XCTestCase {
         let device = XCUIDevice.shared
         let previousOrientation = device.orientation
         device.orientation = .portrait
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         defer {
             app.terminate()
             device.orientation = previousOrientation
@@ -366,7 +373,7 @@ final class HongguoQATests: XCTestCase {
 
     func testRealNavigationAndPlayback() throws {
         continueAfterFailure = false
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         app.launchArguments = ["-updates.checkOnLaunch", "NO", "-speed", "1", "-autoNext", "NO"]
         app.launch()
         if app.buttons["开始发现好故事"].waitForExistence(timeout: 10) {
@@ -466,7 +473,7 @@ final class HongguoQATests: XCTestCase {
         let device = XCUIDevice.shared
         let previousOrientation = device.orientation
         device.orientation = .portrait
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         defer {
             app.terminate()
             device.orientation = previousOrientation
@@ -488,7 +495,7 @@ final class HongguoQATests: XCTestCase {
         let shortWipeStart = video.coordinate(withNormalizedOffset: CGVector(dx: 0.35, dy: 0.5))
         let shortWipeEnd = shortWipeStart.withOffset(CGVector(dx: 0, dy: -32))
         func shortWipe(hold: TimeInterval) {
-            shortWipeStart.press(forDuration: 0.02, thenDragTo: shortWipeEnd, withVelocity: .fast, thenHoldForDuration: hold)
+            shortWipeStart.press(forDuration: 0.02, thenDragTo: shortWipeEnd, withVelocity: .slow, thenHoldForDuration: hold)
         }
         func elapsedSeconds() throws -> Int {
             let timestamps = app.staticTexts.matching(NSPredicate(format: "label MATCHES %@", "[0-9]+:[0-9]{2}"))
@@ -526,7 +533,12 @@ final class HongguoQATests: XCTestCase {
         XCTAssertTrue(episodePicker.wait(for: \.isHittable, toEqual: false, timeout: 5))
         capture("22-tap-hides")
         point(0.15).tap()
-        XCTAssertTrue(episodePicker.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        let restoredPicker = app.buttons["player.episodes"]
+        XCTAssertTrue(restoredPicker.waitForExistence(timeout: 5))
+        restoredPicker.tap()
+        let episodePanel = app.navigationBars["选集"]
+        XCTAssertTrue(episodePanel.waitForExistence(timeout: 5))
+        episodePanel.buttons["完成"].tap()
         point(0.27).doubleTap()
         assertPlayback("播放中", in: app, timeout: 5)
         let currentDrama = String(app.buttons["player.dramaTitle"].label.dropLast("，第 1 集".count))
@@ -553,7 +565,7 @@ final class HongguoQATests: XCTestCase {
         let device = XCUIDevice.shared
         let previousOrientation = device.orientation
         device.orientation = .portrait
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         defer {
             app.terminate()
             device.orientation = previousOrientation
@@ -644,13 +656,58 @@ final class HongguoQATests: XCTestCase {
         capture("player-episode-2-playing")
     }
 
+    func testPlayerVerticalPagingFlickBoundaryAndPause() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["HONGGUO_QA_MODE"] == "--live")
+        continueAfterFailure = false
+        let device = XCUIDevice.shared
+        let originalOrientation = device.orientation
+        device.orientation = .portrait
+        defer { device.orientation = originalOrientation }
+        let app = testApplication()
+        app.launchArguments = ["-theme", "immersive", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO",
+                               "-speed", "1", "-autoNext", "NO"]
+        app.launch()
+        let portrait = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in app.frame.height > app.frame.width }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [portrait], timeout: 10), .completed)
+        openFirstEpisode(in: app, search: "无限白粥")
+        assertPlayback("播放中", in: app)
+
+        let video = app.buttons["视频画面"]
+        let picture = video.coordinate(withNormalizedOffset: CGVector(dx: 0.30, dy: 0.50))
+        picture.doubleTap()
+        assertPlayback("已暂停", in: app, timeout: 5)
+        let upperBlank = app.coordinate(withNormalizedOffset: CGVector(dx: 0.52, dy: 0.14))
+        let blankPicture = app.coordinate(withNormalizedOffset: CGVector(dx: 0.30, dy: 0.52))
+        func verticalDrag(from start: XCUICoordinate, by distance: CGFloat, at speed: XCUIGestureVelocity) {
+            start.press(forDuration: 0.02, thenDragTo: start.withOffset(CGVector(dx: 0, dy: distance)),
+                        withVelocity: speed, thenHoldForDuration: 0)
+        }
+        verticalDrag(from: blankPicture, by: 72, at: .fast)
+        assertEpisode(1, in: app)
+        assertPlayback("已暂停", in: app, timeout: 5)
+
+        verticalDrag(from: upperBlank, by: -62, at: .slow)
+        assertEpisode(1, in: app)
+        assertPlayback("已暂停", in: app, timeout: 5)
+        verticalDrag(from: upperBlank, by: -62, at: .fast)
+        assertEpisode(2, in: app)
+        assertPlayback("播放中", in: app)
+        capture("player-vertical-flick-playing")
+        picture.doubleTap()
+        assertPlayback("已暂停", in: app, timeout: 5)
+
+        verticalDrag(from: blankPicture, by: 72, at: .fast)
+        assertEpisode(1, in: app)
+        assertPlayback("播放中", in: app)
+    }
+
     func testPlayerLandscapeLockAndEpisodeSwitching() throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["HONGGUO_QA_MODE"] == "--live")
         continueAfterFailure = false
         let device = XCUIDevice.shared
         let previousOrientation = device.orientation
         device.orientation = .portrait
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         defer {
             app.terminate()
             device.orientation = previousOrientation
@@ -731,6 +788,7 @@ final class HongguoQATests: XCTestCase {
         upper.press(forDuration: 0.05, thenDragTo: lower, withVelocity: .fast, thenHoldForDuration: 0)
         assertEpisode(1, in: app)
         assertPlayback("播放中", in: app)
+        XCTAssertGreaterThan(app.frame.width, app.frame.height)
         capture("player-landscape-unlocked-previous")
         video.coordinate(withNormalizedOffset: CGVector(dx: 0.35, dy: 0.5)).doubleTap()
         assertPlayback("已暂停", in: app, timeout: 5)
@@ -754,7 +812,7 @@ final class HongguoQATests: XCTestCase {
         let previousOrientation = device.orientation
         device.orientation = .portrait
         defer { device.orientation = previousOrientation }
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         app.launchArguments = ["-theme", "immersive", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO",
                                "-speed", "1.5", "-autoNext", "NO"]
         app.launch()
@@ -888,7 +946,7 @@ final class HongguoQATests: XCTestCase {
         let previousOrientation = XCUIDevice.shared.orientation
         defer { XCUIDevice.shared.orientation = previousOrientation }
         XCUIDevice.shared.orientation = .portrait
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         app.launchArguments = ["-theme", "immersive", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO", "-speed", "1", "-autoNext", "NO"]
         app.launch()
 
@@ -933,7 +991,7 @@ final class HongguoQATests: XCTestCase {
         }
         XCTAssertLessThanOrEqual(favorite.frame.maxY, toggle.frame.minY)
         XCTAssertLessThanOrEqual(toggle.frame.maxY, openComments.frame.minY)
-        XCTAssertEqual(toggle.label, "评论弹幕")
+        XCTAssertEqual(toggle.label, "本集弹幕")
         XCTAssertEqual(toggle.frame.width, 44, accuracy: 2)
         XCTAssertEqual(toggle.frame.height, 44, accuracy: 2)
         XCTAssertFalse(app.buttons["小窗播放"].exists)
@@ -1013,8 +1071,9 @@ final class HongguoQATests: XCTestCase {
         }
         XCTAssertFalse(visibleBodies.isEmpty, "Expected a visible live comment body")
         capture("episode-comments")
-        let sheetSwitch = app.switches["轮播本集评论弹幕"].switches.firstMatch
+        let sheetSwitch = app.switches["显示本集弹幕"].switches.firstMatch
         XCTAssertTrue(sheetSwitch.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        XCTAssertTrue(app.staticTexts["discussion.timelineSource"].waitForExistence(timeout: 20))
         expectValue("1", of: sheetSwitch)
         sheetSwitch.tap()
         expectValue("0", of: sheetSwitch)
@@ -1024,7 +1083,7 @@ final class HongguoQATests: XCTestCase {
         assertPlayback("已暂停", in: app, timeout: 5)
         expectValue("关闭", of: toggle)
         let moreDone = openPlayerMore(in: app)
-        let moreDanmakuRow = app.switches["轮播本集评论弹幕"]
+        let moreDanmakuRow = app.switches["显示本集弹幕"]
         revealMoreOption(moreDanmakuRow, in: app)
         let nestedMoreDanmaku = moreDanmakuRow.switches.firstMatch
         expectValue("0", of: nestedMoreDanmaku.exists ? nestedMoreDanmaku : moreDanmakuRow)
@@ -1062,7 +1121,7 @@ final class HongguoQATests: XCTestCase {
         let device = XCUIDevice.shared
         let previousOrientation = device.orientation
         device.orientation = .portrait
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         defer {
             app.terminate()
             device.orientation = previousOrientation
@@ -1125,7 +1184,7 @@ final class HongguoQATests: XCTestCase {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["HONGGUO_QA_FRESH_HINT_COUNTER"] == "1",
                           "Reset playback.gestureHintDisplays on the QA simulator before this test.")
         continueAfterFailure = false
-        let app = XCUIApplication(bundleIdentifier: "com.ooiua.hongguo.ios")
+        let app = testApplication()
         app.launchArguments = ["-theme", "immersive", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO", "-autoNext", "NO"]
         app.launch()
         openFirstEpisode(in: app, search: "无限白粥")

@@ -12,6 +12,7 @@ final class LibraryStore: ObservableObject {
     @Published private(set) var storageLocked = false
     private let fileURL: URL
     private var lastWrite = Date.distantPast
+    private var needsSave = false
     private var previousEpisodes: [String: [EpisodePosition]] = [:]
 
     private struct EpisodePosition: Codable {
@@ -35,6 +36,10 @@ final class LibraryStore: ObservableObject {
 
     /// Retry after a temporary storage failure. Failed loads never authorize replacing the original file.
     func reload() {
+        if needsSave {
+            save()
+            guard !needsSave else { return }
+        }
         do {
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             if FileManager.default.fileExists(atPath: fileURL.path) {
@@ -93,6 +98,7 @@ final class LibraryStore: ObservableObject {
             previousEpisodes = previousEpisodes.filter { retained.contains($0.key) }
         }
         if let index = favorites.firstIndex(where: { $0.id == drama.id }) { favorites[index] = entry }
+        needsSave = true
         if Date().timeIntervalSince(lastWrite) >= 2 { save() }
     }
 
@@ -124,9 +130,11 @@ final class LibraryStore: ObservableObject {
         guard position.isFinite, position >= 0 else { return }
         if let index = history.firstIndex(where: { $0.id == dramaID && $0.episodeID == episodeID }) {
             history[index].position = position
+            needsSave = true
         }
         if let index = favorites.firstIndex(where: { $0.id == dramaID && $0.episodeID == episodeID }) {
             favorites[index].position = position
+            needsSave = true
         }
         if Date().timeIntervalSince(lastWrite) >= 2 { save() }
     }
@@ -149,7 +157,11 @@ final class LibraryStore: ObservableObject {
             let data = try JSONEncoder().encode(Snapshot(favorites: favorites, history: history, previousEpisodes: previousEpisodes))
             try data.write(to: fileURL, options: .atomic)
             lastWrite = Date()
+            needsSave = false
             storageError = nil
-        } catch { storageError = "本机记录暂未保存，请检查剩余存储空间。" }
+        } catch {
+            needsSave = true
+            storageError = "本机记录暂未保存，请检查剩余存储空间。"
+        }
     }
 }

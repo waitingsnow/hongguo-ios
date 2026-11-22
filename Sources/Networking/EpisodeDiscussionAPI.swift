@@ -30,7 +30,7 @@ enum EpisodeDiscussionAPI {
         var errorDescription: String? {
             switch self {
             case .invalidIdentifier: return "剧集或分集编号无效。"
-            case .restrictedEpisode: return "官网限制访问本集播放页，暂时无法读取评论和弹幕。"
+            case .restrictedEpisode: return "官网限制访问本集播放页，暂时无法读取本集评论。"
             case .unsuccessfulPage: return "官网未能加载本集播放信息。"
             case .unexpectedPage: return "官网返回的分集或评论格式不匹配。"
             case .responseTooLarge: return "官网返回的评论页面过大。"
@@ -58,10 +58,9 @@ enum EpisodeDiscussionAPI {
             self.capacity = capacity
         }
 
-        func preview(for url: URL, load: @escaping @Sendable () async throws -> EpisodeCommentPreview) async throws -> EpisodeCommentPreview {
+        func preview(for url: URL, forceRefresh: Bool = false, load: @escaping @Sendable () async throws -> EpisodeCommentPreview) async throws -> EpisodeCommentPreview {
             try Task.checkCancellation()
-            if let entry = entries[url], entry.expiresAt > ContinuousClock.now { return entry.preview }
-            entries[url] = nil
+            if !forceRefresh, let entry = entries[url], entry.expiresAt > ContinuousClock.now { return entry.preview }
 
             let task: Task<EpisodeCommentPreview, Error>
             if let ongoing = pending[url] {
@@ -113,11 +112,11 @@ enum EpisodeDiscussionAPI {
         try await preview(seriesID: seriesID, episodeID: episodeID).items
     }
 
-    static func preview(seriesID: String, episodeID: String) async throws -> EpisodeCommentPreview {
+    static func preview(seriesID: String, episodeID: String, forceRefresh: Bool = false) async throws -> EpisodeCommentPreview {
         guard let url = shareURL(seriesID: seriesID, episodeID: episodeID) else {
             throw ReadError.invalidIdentifier
         }
-        return try await cache.preview(for: url) {
+        return try await cache.preview(for: url, forceRefresh: forceRefresh) {
             try await fetchPreview(url, seriesID: seriesID, episodeID: episodeID)
         }
     }

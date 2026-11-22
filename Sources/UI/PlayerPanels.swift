@@ -24,6 +24,10 @@ struct PlayerMorePanel: View {
                 VStack(alignment: .leading, spacing: 22) {
                     speedOptions
                     qualityOptions
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("竖屏横片位置").font(.headline).accessibilityAddTraits(.isHeader)
+                        PortraitVideoPositionPicker().pickerStyle(.segmented)
+                    }
 
                     VStack(spacing: 0) {
                         sleepTimer
@@ -51,7 +55,7 @@ struct PlayerMorePanel: View {
     private var danmakuOptions: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("弹幕").font(.headline).accessibilityAddTraits(.isHeader)
-            Toggle("轮播本集评论弹幕", isOn: $commentDanmaku)
+            Toggle("显示本集弹幕", isOn: $commentDanmaku)
                 .frame(minHeight: 44)
             Text("字体大小").foregroundStyle(colors.muted).accessibilityHidden(true)
             Picker("弹幕字体大小", selection: $danmakuFontSize) {

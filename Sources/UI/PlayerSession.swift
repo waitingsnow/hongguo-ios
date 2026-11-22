@@ -271,6 +271,9 @@ final class PlayerSession: ObservableObject {
     }
 
     private func makePlayer(_ player: AVPlayer = AVQueuePlayer()) -> AVPlayer {
+        #if targetEnvironment(simulator)
+        if ProcessInfo.processInfo.environment["HONGGUO_QA_SILENT"] == "1" { player.volume = 0 }
+        #endif
         setEndAction(.pause, on: player)
         // AVPlayer waits for enough data and then resumes by itself. Without this a slow range stalled playback and
         // left it paused until the user tapped.
@@ -530,6 +533,14 @@ final class PlayerSession: ObservableObject {
     }
     func next() { guard index + 1 < detail.episodes.count else { endMessage = "已到最后一集"; return }; go(to: index + 1) }
     func previous() { guard index > 0 else { endMessage = "已经是第一集"; return }; go(to: index - 1) }
+    func turnPage(to target: Int, from origin: UUID) {
+        guard !stopped, !pauseIfSleepTimerExpired() else { return }
+        adoptQueuedEpisodeIfNeeded()
+        guard playID == origin, target != index, detail.episodes.indices.contains(target) else { return }
+        pausedBySleepTimer = false
+        load(index: target)
+    }
+
     /// Buttons, autoplay and the episode sheet all switch through here, so they slide like a user swipe when a screen is attached.
     func go(to target: Int) {
         guard detail.episodes.indices.contains(target), !stopped, !pauseIfSleepTimerExpired() else { return }

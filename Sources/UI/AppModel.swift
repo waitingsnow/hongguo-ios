@@ -202,6 +202,8 @@ final class CatalogLoader: ObservableObject {
     enum Restored { case none, fresh, stale }
     @Published private(set) var dramas: [Drama] = []
     @Published private(set) var isLoading = false
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var refreshError: String?
     @Published private(set) var hasMore = false
     @Published private(set) var error: String?
     /// Lists with a disk copy (home feeds, unfiltered 发现) set this; every loaded page updates the copy.
@@ -209,45 +211,68 @@ final class CatalogLoader: ObservableObject {
     /// The drama on screen in a paged feed. A background refresh keeps it and the pages before it in place.
     var anchorID: String?
     private var offset = 0
+    private let cache: ContentCache
+    private var snapshot: CatalogSnapshot?
+    private var firstPageAt: Date?
+    private(set) var restoredSnapshot: CatalogSnapshot?
     private var generation = UUID()
     private var task: Task<Void, Never>?
     private let coverPrefetch = CoverPrefetchWindow()
     private var coverAnchorID: String?
     private var coverPrefetchEnabled = true
-    /// A saved list this recent is shown without asking the network again; older ones are shown and then refreshed.
-    static let freshFor: TimeInterval = 30 * 60
-    static let keptFor: TimeInterval = 7 * 24 * 3600
+    init(cache: ContentCache = .shared, initialCacheKey: String? = nil) {
+        self.cache = cache
+        if let initialCacheKey { restore(key: initialCacheKey) }
+    }
+
+    var needsRevalidation: Bool {
+        !isLoading && !CatalogCacheEntry.isFresh(firstPageAt)
+    }
 
     /// Shows the saved copy for `key` straight away. Without one the list is emptied, ready for a network load.
     @discardableResult
     func restore(key: String?) -> Restored {
-        task?.cancel(); generation = UUID(); isLoading = false; error = nil
-        cacheKey = key; anchorID = nil; resetCoverPrefetch()
-        guard let key, let saved = ContentCache.shared.value(CatalogSnapshot.self, for: "catalog." + key),
-              saved.age < Self.keptFor, !saved.value.dramas.isEmpty else {
-            dramas = []; offset = 0; hasMore = false; return .none
+        cancel()
+        error = nil; refreshError = nil; cacheKey = key; anchorID = nil
+        snapshot = nil; restoredSnapshot = nil; firstPageAt = nil; offset = 0; hasMore = false
+        guard let key, let saved = cache.catalog(for: key) else {
+            dramas = []
+            return .none
         }
-        dramas = saved.value.dramas; offset = saved.value.nextOffset; hasMore = saved.value.hasMore
-        return saved.age < Self.freshFor ? .fresh : .stale
+        dramas = saved.snapshot.dramas; offset = saved.snapshot.nextOffset; hasMore = saved.snapshot.hasMore
+        firstPageAt = saved.firstPageAt
+        if firstPageAt != nil { snapshot = saved.snapshot; restoredSnapshot = saved.snapshot }
+        return CatalogCacheEntry.isFresh(firstPageAt) ? .fresh : .stale
     }
 
-    /// `inPlace` refreshes the first page behind what is already shown (a saved copy) and swaps it in when it
-    /// arrives; a failure then keeps the saved copy instead of showing an error.
-    func load(reset: Bool = false, inPlace: Bool = false, fetch: @escaping (Int) async throws -> DramaPage) {
-        if isLoading && !reset && !inPlace { return }
-        if !reset && !inPlace && !dramas.isEmpty && !hasMore { return }
+    var pendingRefresh: Task<Void, Never>? { isRefreshing ? task : nil }
+
+    @discardableResult
+    func load(reset: Bool = false, inPlace: Bool = false, refreshing: Bool = false,
+              fetch: @escaping (Int) async throws -> DramaPage) -> Task<Void, Never>? {
+        if let pendingRefresh, refreshing { return pendingRefresh }
+        if !reset && !inPlace && (isLoading || (!dramas.isEmpty && !hasMore)) { return nil }
         task?.cancel()
         let ticket = UUID(); generation = ticket
         let requestedOffset = reset || inPlace ? 0 : offset
         if reset && !inPlace { dramas = []; offset = 0; hasMore = false; resetCoverPrefetch() }
-        isLoading = true; error = nil
-        task = Task { [weak self] in
+        isLoading = true; isRefreshing = refreshing; error = nil
+        if requestedOffset == 0 { refreshError = nil }
+        let request = Task { [weak self] in
+            defer {
+                if let self, self.generation == ticket {
+                    self.isLoading = false
+                    self.isRefreshing = false
+                    self.task = nil
+                }
+            }
             do {
                 let page = try await fetch(requestedOffset)
                 try Task.checkCancellation()
                 guard let self, self.generation == ticket else { return }
                 if inPlace {
-                    let kept = self.anchorID.flatMap { id in self.dramas.firstIndex { $0.id == id } }.map { Array(self.dramas[...$0]) } ?? []
+                    let anchor = page.dramas.isEmpty ? nil : self.anchorID
+                    let kept = anchor.flatMap { id in self.dramas.firstIndex { $0.id == id } }.map { Array(self.dramas[...$0]) } ?? []
                     var seen = Set(kept.map(\.id))
                     self.dramas = kept + page.dramas.filter { seen.insert($0.id).inserted }
                 } else {
@@ -258,23 +283,30 @@ final class CatalogLoader: ObservableObject {
                 self.updateCoverPrefetch()
                 self.hasMore = page.hasMore && !page.dramas.isEmpty && page.nextOffset > requestedOffset
                 self.offset = page.nextOffset
-                self.isLoading = false
-                self.persist()
+                self.restoredSnapshot = nil
+                self.persist(page, from: requestedOffset)
             } catch is CancellationError { }
             catch {
-                guard let self, self.generation == ticket else { return }
-                self.isLoading = false
+                guard let self, self.generation == ticket, !Task.isCancelled else { return }
                 if !inPlace || self.dramas.isEmpty { self.error = friendlyError(error) }
+                if refreshing && !self.dramas.isEmpty { self.refreshError = friendlyError(error) }
             }
         }
+        task = request
+        return request
     }
 
-    func cancel() { task?.cancel(); generation = UUID(); isLoading = false; resetCoverPrefetch() }
+    func cancel() {
+        task?.cancel(); task = nil; generation = UUID()
+        isLoading = false; isRefreshing = false; resetCoverPrefetch()
+    }
 
-    private func persist() {
-        guard let cacheKey, !dramas.isEmpty else { return }
-        let kept = Array(dramas.prefix(200))
-        ContentCache.shared.store(CatalogSnapshot(dramas: kept, hasMore: hasMore || kept.count < dramas.count, nextOffset: offset), for: "catalog." + cacheKey)
+    private func persist(_ page: DramaPage, from offset: Int) {
+        if offset == 0 { firstPageAt = .now; snapshot = nil }
+        guard let cacheKey, let firstPageAt,
+              let updated = CatalogSnapshot.updated(after: page, from: offset, previous: snapshot) else { return }
+        snapshot = updated
+        cache.storeCatalog(updated, for: cacheKey, firstPageAt: firstPageAt)
     }
 
     /// Call as a row appears. Requests the next page once it is within 12 of the end, so it is in the list before the

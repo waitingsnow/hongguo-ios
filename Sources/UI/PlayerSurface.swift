@@ -53,15 +53,11 @@ final class PlayerSurface: NSObject, ObservableObject, AVPictureInPictureControl
         pip = controller
     }
 
-    func holdDisplayedFrame(ticket: UUID) {
+    private func holdDisplayedFrame(ticket: UUID) {
         guard displayedPlayID == ticket, !pipInProgress,
               UIApplication.shared.applicationState != .background,
               let frame = view.snapshotDisplayedFrame() else { return }
         heldFrame = frame
-    }
-
-    func releaseHeldFrame(ticket: UUID) {
-        if displayedPlayID == ticket { heldFrame = nil }
     }
 
     func unbind() {
@@ -115,6 +111,7 @@ struct PlayerLayerView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> PlayerLayerHost {
         let view = PlayerLayerHost()
+        view.preparesFrameSnapshots = true
         view.playerLayer.videoGravity = .resizeAspect
         return view
     }
@@ -244,6 +241,27 @@ struct HoldDrag {
     }
 }
 
+enum EpisodePageSwipe {
+    static func offset(for translation: CGFloat, height: CGFloat, hasPrevious: Bool, hasNext: Bool) -> CGFloat {
+        let reachesEdge = translation > 0 ? !hasPrevious : !hasNext
+        if reachesEdge {
+            let distance = abs(translation) / height
+            return translation * 0.28 / (1 + distance)
+        }
+        return min(height, max(-height, translation))
+    }
+
+    static func step(translation: CGFloat, velocity: CGFloat, height: CGFloat) -> Int? {
+        let distance = abs(translation)
+        guard distance >= min(32, max(18, height * 0.03)) else { return nil }
+        let forwardVelocity = translation < 0 ? -velocity : velocity
+        let projectionTime = forwardVelocity < 0 ? 0.55 : 0.24
+        let projected = distance + min(forwardVelocity, 1_800) * projectionTime
+        guard projected >= min(190, height * 0.34) else { return nil }
+        return translation < 0 ? 1 : -1
+    }
+}
+
 struct VideoGestureView: UIViewRepresentable {
     let enabled: Bool
     let locked: Bool
@@ -252,6 +270,7 @@ struct VideoGestureView: UIViewRepresentable {
     let holdBegan: (SpeedLockZone) -> Bool
     let holdEnded: () -> Void
     let lockSpeed: () -> Void
+    let dragBegan: (CGFloat) -> Void
     let dragChanged: (CGFloat) -> Void
     let dragEnded: (CGFloat, CGFloat) -> Void
     let dragCancelled: () -> Void
@@ -301,11 +320,13 @@ struct VideoGestureView: UIViewRepresentable {
         private var pinchDecided = false
         private var holdDrag: HoldDrag?
         private var navigationDirection: HorizontalSwipeDirection?
+        private var paging = false
+        private var lastPageSample: (velocity: CGFloat, time: TimeInterval)?
 
         init(_ parent: VideoGestureView) { self.parent = parent }
 
         @objc func pinchChanged(_ gesture: UIPinchGestureRecognizer) {
-            guard navigationDirection == nil else { return }
+            guard navigationDirection == nil, !paging else { return }
             if gesture.state == .began { pinchDecided = false }
             guard gesture.state == .changed, !pinchDecided, gesture.scale >= 1.18 || gesture.scale <= 0.85 else { return }
             pinchDecided = true
@@ -356,8 +377,9 @@ struct VideoGestureView: UIViewRepresentable {
 
         @objc func panned(_ gesture: UIPanGestureRecognizer) {
             guard let view = gesture.view else { return }
+            let coordinateSpace = view.window ?? view
+            let translation = gesture.translation(in: coordinateSpace)
             if let direction = navigationDirection {
-                let translation = gesture.translation(in: view.window ?? view)
                 switch gesture.state {
                 case .began:
                     if direction == .left { parent.detailDragBegan(-translation.x) }
@@ -366,7 +388,7 @@ struct VideoGestureView: UIViewRepresentable {
                 case .ended:
                     navigationDirection = nil
                     if direction == .left {
-                        parent.detailDragEnded(-translation.x, -gesture.velocity(in: view.window ?? view).x)
+                        parent.detailDragEnded(-translation.x, -gesture.velocity(in: coordinateSpace).x)
                     } else if direction.completes(translation) {
                         parent.exitFullScreen()
                     }
@@ -380,20 +402,43 @@ struct VideoGestureView: UIViewRepresentable {
                 }
                 return
             }
+            guard paging else { return }
             switch gesture.state {
-            case .began, .changed: parent.dragChanged(gesture.translation(in: view).y)
-            case .ended: parent.dragEnded(gesture.translation(in: view).y, gesture.velocity(in: view).y)
-            case .cancelled, .failed: parent.dragCancelled()
+            case .began, .changed:
+                lastPageSample = (gesture.velocity(in: coordinateSpace).y, ProcessInfo.processInfo.systemUptime)
+                if gesture.state == .began { parent.dragBegan(translation.y) }
+                else { parent.dragChanged(translation.y) }
+            case .ended:
+                paging = false
+                let measured = gesture.velocity(in: coordinateSpace).y
+                let velocity: CGFloat
+                if let sample = lastPageSample, ProcessInfo.processInfo.systemUptime - sample.time < 0.10 {
+                    velocity = measured == 0 ? sample.velocity : measured
+                } else {
+                    velocity = 0
+                }
+                lastPageSample = nil
+                parent.dragEnded(translation.y, velocity)
+            case .cancelled, .failed:
+                paging = false
+                lastPageSample = nil
+                let cancel = parent.dragCancelled
+                Task { @MainActor in cancel() }
             default: break
             }
         }
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
             guard let pan = gestureRecognizer as? UIPanGestureRecognizer, let view = pan.view else { return true }
             navigationDirection = nil
+            paging = false
             guard holdDrag == nil, pan.numberOfTouches <= 1 else { return false }
-            let velocity = pan.velocity(in: view)
-            if abs(velocity.y) > abs(velocity.x) { return true }
-            navigationDirection = HorizontalSwipeDirection(movement: velocity)
+            let translation = pan.translation(in: view.window ?? view)
+            let movement = translation == .zero ? pan.velocity(in: view.window ?? view) : translation
+            if abs(movement.y) > abs(movement.x) * 1.15 {
+                paging = true
+                return true
+            }
+            navigationDirection = HorizontalSwipeDirection(movement: movement)
             if navigationDirection == .right && !parent.allowsRightSwipe { return false }
             return navigationDirection != nil
         }

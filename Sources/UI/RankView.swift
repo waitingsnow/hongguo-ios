@@ -8,7 +8,9 @@ struct RankView: View {
     @State private var page = 0
     @State private var totalPages = 0
     @State private var loading = false
+    @State private var refreshing = false
     @State private var error: String?
+    @State private var failedPage = 1
     @State private var request: Task<Void, Never>?
 
     var body: some View {
@@ -19,9 +21,14 @@ struct RankView: View {
                     NavigationLink { DetailView(drama: entry.drama) } label: { row(entry) }.buttonStyle(.plain)
                         .onAppear { if entry.id == entries.last?.id { loadMore() } }
                 }
-                if let error { FailureView(message: error) { self.error = nil; loadMore() } }
-                if loading { ProgressView().frame(maxWidth: .infinity).padding(20) }
+                if let error { FailureView(message: error) { load(board: board, page: failedPage) } }
+                if loading && !refreshing { ProgressView().frame(maxWidth: .infinity).padding(20) }
             }.padding(16)
+        }
+        .scrollBounceBehavior(.always, axes: .vertical)
+        .refreshable {
+            load(board: board, page: 1)
+            await request?.value
         }
         .appBackground(model.appearance).navigationTitle("榜单").navigationBarTitleDisplayMode(.inline).secondaryPage()
         .onChange(of: board) { _, _ in reset() }
@@ -54,19 +61,23 @@ struct RankView: View {
     }
 
     private func load(board: RankBoard, page next: Int) {
+        request?.cancel()
         loading = true
+        refreshing = next == 1 && !entries.isEmpty
+        error = nil
         request = Task {
             do {
                 let result = try await DramaAPI.shared.rank(board: board, page: next)
                 try Task.checkCancellation()
                 guard board == self.board else { return }
-                let known = Set(entries.map(\.id))
-                entries += result.entries.filter { !known.contains($0.id) }
+                var known = next == 1 ? Set<String>() : Set(entries.map(\.id))
+                let fresh = result.entries.filter { known.insert($0.id).inserted }
+                entries = next == 1 ? fresh : entries + fresh
                 page = result.page; totalPages = result.totalPages; loading = false
             } catch is CancellationError {
             } catch {
                 guard !Task.isCancelled else { return }
-                loading = false; self.error = friendlyError(error)
+                loading = false; failedPage = next; self.error = friendlyError(error)
             }
         }
     }
