@@ -105,6 +105,7 @@ private struct PlaybackDestination: View {
     var body: some View {
         PlayerScreen(request: request, model: model) { request = $0 }
             .id(request.id)
+            .toolbarBackground(.hidden, for: .navigationBar)
             .toolbar(.hidden, for: .navigationBar)
             .background(NavigationTabBar(hidden: true))
     }

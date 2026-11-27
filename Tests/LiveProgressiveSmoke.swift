@@ -8,19 +8,29 @@ import CoreVideo
     static func main() async {
         var stage = "initializing"
         var playback: ProgressivePlayback?
+        var playbackAPI: DramaAPI?
         let cacheRoot = FileManager.default.temporaryDirectory.appendingPathComponent("hongguo-progressive-live-" + UUID().uuidString)
         defer { playback?.close(); try? FileManager.default.removeItem(at: cacheRoot) }
         do {
             guard CommandLine.arguments.contains("--live"), CommandLine.arguments.count >= 3 else { return }
             let resources = URL(fileURLWithPath: CommandLine.arguments.last!, isDirectory: true)
             let api = DramaAPI(resourceDirectory: resources)
+            playbackAPI = api
             stage = "track"
-            let page = try await api.home(feed: "hot", offset: 0)
-            guard let drama = page.dramas.first else { throw MediaError.unavailable }
-            let detail = try await api.detail(drama: drama)
-            guard let episode = detail.episodes.first else { throw MediaError.unavailable }
-            let requested = CommandLine.arguments.first(where: { $0.hasPrefix("--episode=") })?.dropFirst("--episode=".count).description ?? episode.id
-            let track = try await api.track(episodeID: requested)
+            let requested: String
+            let seriesID: String?
+            if let argument = CommandLine.arguments.first(where: { $0.hasPrefix("--episode=") }) {
+                requested = String(argument.dropFirst("--episode=".count))
+                seriesID = CommandLine.arguments.first(where: { $0.hasPrefix("--series=") }).map { String($0.dropFirst("--series=".count)) }
+            } else {
+                let page = try await api.home(feed: "hot", offset: 0)
+                guard let drama = page.dramas.first else { throw MediaError.unavailable }
+                let detail = try await api.detail(drama: drama)
+                guard let episode = detail.episodes.first else { throw MediaError.unavailable }
+                requested = episode.id
+                seriesID = detail.drama.id
+            }
+            let track = try await api.track(episodeID: requested, seriesID: seriesID)
             print("playback_trace=\(await api.lastPlaybackTrace)")
             stage = "range-index"
             let source = try await ProgressiveSource.open(track: track, episodeID: requested, cache: ProgressiveCache(root: cacheRoot))
@@ -55,6 +65,7 @@ import CoreVideo
             playback.close(); await source.close()
             print("PASS live progressive: first frame before complete download, video_frames=\(frames), audio_buffers=\(buffers)")
         } catch {
+            if let playbackAPI, stage == "track" { print("playback_trace=\(await playbackAPI.lastPlaybackTrace)") }
             print("FAIL progressive: stage=\(stage) kind=\(String(reflecting: type(of: error)))")
             exit(1)
         }

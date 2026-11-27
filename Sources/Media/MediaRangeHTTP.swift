@@ -6,10 +6,74 @@ struct MediaRangeReply: Sendable {
     let total: Int
     /// Where the bytes actually came from after redirects; nil for test sources.
     var address: URL? = nil
+    /// RFC 9530 Repr-Digest of the complete representation, when the CDN sent one.
+    var representationDigests: [String: Data] = [:]
 }
 
 /// A 4xx answer: the signed address expired or was refused, so asking it again cannot help.
 struct MediaAddressRejected: Error { let status: Int }
+
+/// One session per selected rendition. After the first read, a mirror must identify
+/// the same complete representation. A digest of the current 206 body is insufficient.
+actor MediaRangeSession {
+    private let urls: [URL]
+    private let configuration: URLSessionConfiguration?
+    private var preferred = 0
+    private var total: Int?
+    private var origin = 0
+    private var digests: [String: Data] = [:]
+    private var stopped = false
+
+    init(url: URL, backups: [URL] = [], configuration: URLSessionConfiguration? = nil) {
+        self.urls = [url] + backups.filter(MediaRangeHTTP.allowed).prefix(2)
+        self.configuration = configuration
+    }
+
+    func read(_ range: Range<Int>, attempts: Int = 5) async throws -> MediaRangeReply {
+        var index = preferred
+        var delay: UInt64 = 400_000_000
+        for attempt in 1...max(1, attempts) {
+            try Task.checkCancellation()
+            guard !stopped else { throw MediaError.unavailable }
+            let reply: MediaRangeReply
+            do {
+                reply = try await MediaRangeHTTP.fetch(urls[index], range: range, configuration: configuration)
+            } catch is MediaAddressRejected {
+                stopped = true
+                throw MediaError.unavailable
+            } catch MediaError.unavailable {
+                stopped = true
+                throw MediaError.unavailable
+            } catch let error as MediaError {
+                guard attempt < attempts, [.transport, .invalidMedia, .temporaryCDNFailure].contains(error) else { throw error }
+                if error == .temporaryCDNFailure && urls.count > 1 && (total == nil || !digests.isEmpty) {
+                    index = (index + 1) % urls.count
+                }
+                try await Task.sleep(nanoseconds: delay)
+                delay = min(delay * 2, 4_000_000_000)
+                continue
+            }
+            try Task.checkCancellation()
+            guard !stopped else { throw MediaError.unavailable }
+            if let total {
+                guard reply.total == total else { throw MediaError.invalidMedia }
+                if urls.count > 1 && (index != origin || (!digests.isEmpty && !reply.representationDigests.isEmpty)) {
+                    let common = digests.keys.filter { reply.representationDigests[$0] != nil }
+                    guard !common.isEmpty, common.allSatisfy({ digests[$0] == reply.representationDigests[$0] }) else {
+                        throw MediaError.invalidMedia
+                    }
+                }
+            } else {
+                total = reply.total
+                origin = index
+                digests = reply.representationDigests
+            }
+            preferred = index
+            return reply
+        }
+        throw MediaError.transport
+    }
+}
 
 /// Bounded HTTP 206 reads. Never downloads a whole response from a server ignoring Range.
 /// Every range goes through one shared session, so connections (and HTTP/2 streams) are reused: the old one-session-
@@ -34,9 +98,7 @@ final class MediaRangeHTTP: NSObject, URLSessionDataDelegate, @unchecked Sendabl
     }
 
     static func allowed(_ url: URL) -> Bool {
-        guard url.scheme?.lowercased() == "https", url.user == nil, url.password == nil,
-              let host = url.host?.lowercased(), url.port == nil || url.port == 443 else { return false }
-        return ["qznovelvod.com", "fqnovelvod.com", "douyinvod.com"].contains { host == $0 || host.hasSuffix("." + $0) }
+        VideoTrack.allowsMediaURL(url)
     }
     /// An allowed media host may answer 302 to another CDN for load balancing. Seen so far: *.vegslb.com, *.bdcgslb.com
     /// (2026-11-06), *.idouyinvod.com and *.smtcdns.com (2026-11-08). The set changes without notice and rejecting an
@@ -60,7 +122,7 @@ final class MediaRangeHTTP: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         var delay: UInt64 = 300_000_000
         for attempt in 1... {
             do { return try await fetch(url, range: range, configuration: configuration) }
-            catch let error as MediaError where (error == .transport || error == .invalidMedia) && attempt < attempts {
+            catch let error as MediaError where (error == .transport || error == .invalidMedia || error == .temporaryCDNFailure) && attempt < attempts {
                 try await Task.sleep(nanoseconds: delay)
                 delay = min(delay * 2, 2_000_000_000)
             }
@@ -111,8 +173,10 @@ final class MediaRangeHTTP: NSObject, URLSessionDataDelegate, @unchecked Sendabl
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
-        guard let transfer = transfer(task), let url = request.url, Self.allowedAfterRedirect(url) else {
-            transfer(task)?.failure = MediaError.transport; completionHandler(nil); return
+        guard let transfer = transfer(task), response.value(forHTTPHeaderField: "Retry-After") == nil,
+              let url = request.url, Self.allowedAfterRedirect(url) else {
+            transfer(task)?.failure = response.value(forHTTPHeaderField: "Retry-After") == nil ? MediaError.transport : MediaError.unavailable
+            completionHandler(nil); return
         }
         var safe = request; safe.httpShouldHandleCookies = false
         safe.setValue(nil, forHTTPHeaderField: "Cookie"); safe.setValue(nil, forHTTPHeaderField: "Authorization")
@@ -123,8 +187,16 @@ final class MediaRangeHTTP: NSObject, URLSessionDataDelegate, @unchecked Sendabl
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         guard let transfer = transfer(dataTask) else { completionHandler(.cancel); return }
         let range = transfer.range
-        if let http = response as? HTTPURLResponse, (400..<500).contains(http.statusCode), http.statusCode != 416 {
-            transfer.failure = MediaAddressRejected(status: http.statusCode); completionHandler(.cancel); return
+        if let http = response as? HTTPURLResponse {
+            if http.value(forHTTPHeaderField: "Retry-After") != nil {
+                transfer.failure = MediaError.unavailable; completionHandler(.cancel); return
+            }
+            if [500, 502, 503, 504].contains(http.statusCode) {
+                transfer.failure = MediaError.temporaryCDNFailure; completionHandler(.cancel); return
+            }
+            if (400..<500).contains(http.statusCode), http.statusCode != 416 {
+                transfer.failure = MediaAddressRejected(status: http.statusCode); completionHandler(.cancel); return
+            }
         }
         guard let http = response as? HTTPURLResponse, http.statusCode == 206,
               let address = http.url, Self.allowedAfterRedirect(address),
@@ -136,12 +208,28 @@ final class MediaRangeHTTP: NSObject, URLSessionDataDelegate, @unchecked Sendabl
             transfer.failure = MediaError.transport; completionHandler(.cancel); return
         }
         transfer.total = parsed.total; transfer.expected = parsed.end - parsed.start + 1; transfer.address = address
+        transfer.representationDigests = Self.fullDigests(http.value(forHTTPHeaderField: "Repr-Digest"))
         guard response.expectedContentLength < 0 || response.expectedContentLength == Int64(transfer.expected),
               http.value(forHTTPHeaderField: "Content-Encoding").map({ $0.lowercased() == "identity" }) ?? true else {
             transfer.failure = MediaError.invalidMedia; completionHandler(.cancel); return
         }
         transfer.bytes.reserveCapacity(transfer.expected)
         completionHandler(.allow)
+    }
+    /// RFC 9530 Repr-Digest covers the full representation, including on a partial response.
+    private static func fullDigests(_ header: String?) -> [String: Data] {
+        guard let header, header.utf8.count <= 4096 else { return [:] }
+        var digests: [String: Data] = [:]
+        for item in header.split(separator: ",") {
+            let pair = item.trimmingCharacters(in: .whitespaces).split(separator: "=", maxSplits: 1)
+            guard let raw = pair.first, raw == "sha-256" || raw == "sha-512" else { continue }
+            let algorithm = String(raw)
+            guard pair.count == 2, pair[1].first == ":", pair[1].last == ":", pair[1].count > 2,
+                  let value = Data(base64Encoded: String(pair[1].dropFirst().dropLast())),
+                  value.count == (algorithm == "sha-256" ? 32 : 64), digests[algorithm] == nil else { return [:] }
+            digests[algorithm] = value
+        }
+        return digests
     }
     static func contentRange(_ text: String) -> (start: Int, end: Int, total: Int)? {
         guard text.hasPrefix("bytes "), text.count <= 100 else { return nil }
@@ -171,6 +259,7 @@ final class MediaRangeHTTP: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         var total = 0
         var expected = 0
         var address: URL?
+        var representationDigests: [String: Data] = [:]
         private let lock = NSLock()
         private var continuation: CheckedContinuation<MediaRangeReply, Error>?
         private var task: URLSessionTask?
@@ -188,7 +277,9 @@ final class MediaRangeHTTP: NSObject, URLSessionDataDelegate, @unchecked Sendabl
             if wasCancelled { completion?.resume(throwing: CancellationError()) }
             else if let failure { completion?.resume(throwing: failure) }
             else if error != nil { completion?.resume(throwing: MediaError.transport) }
-            else if total > 0, bytes.count == expected { completion?.resume(returning: MediaRangeReply(data: bytes, total: total, address: address)) }
+            else if total > 0, bytes.count == expected {
+                completion?.resume(returning: MediaRangeReply(data: bytes, total: total, address: address, representationDigests: representationDigests))
+            }
             else { completion?.resume(throwing: MediaError.invalidMedia) }
         }
     }

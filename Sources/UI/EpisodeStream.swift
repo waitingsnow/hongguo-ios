@@ -8,12 +8,12 @@ enum EpisodeStream {
     /// About the first two seconds of a typical episode, enough for the first frame without waiting.
     static let startBytes = 1_536 * 1024
 
-    static func open(episodeID: String, quality: VideoQuality,
+    static func open(episodeID: String, seriesID: String, quality: VideoQuality,
                      progress: @escaping ProgressiveSource.Progress = { _, _ in }) async throws -> ProgressivePlayback {
-        let track = try await DramaAPI.shared.track(episodeID: episodeID, quality: quality)
+        let track = try await DramaAPI.shared.track(episodeID: episodeID, seriesID: seriesID, quality: quality)
         try Task.checkCancellation()
         return try await ProgressivePlayback.open(track: track, episodeID: episodeID, renew: {
-            try await DramaAPI.shared.track(episodeID: episodeID, quality: quality)
+            try await DramaAPI.shared.track(episodeID: episodeID, seriesID: seriesID, quality: quality)
         }, progress: progress)
     }
 

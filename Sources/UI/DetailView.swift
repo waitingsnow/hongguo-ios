@@ -18,6 +18,7 @@ struct DetailView: View {
     @State private var error: String?
     @State private var selected = 0
     @State private var showFullSummary = false
+    @State private var castIntroID: String?
     @State private var related: [RelatedWork] = []
     @State private var reserving: RelatedWork?
     @State private var playbackRequest: PlaybackRequest?
@@ -79,6 +80,7 @@ struct DetailView: View {
                     VStack(alignment: .leading, spacing: 12) { SectionHeading(title: "故事简介"); Text(summary).font(.subheadline).foregroundStyle(model.appearance.muted).lineSpacing(5).lineLimit(showFullSummary ? nil : 4); if summary.count > 90 { Button(showFullSummary ? "收起" : "展开全部") { showFullSummary.toggle() }.font(.caption.weight(.semibold)).foregroundStyle(model.appearance.accent) } }
                         .padding(18).background(model.appearance.surface, in: RoundedRectangle(cornerRadius: 18))
                 }
+                if let cast = detail?.cast, !cast.isEmpty { castSection(cast) }
                 if loading { ProgressView("正在获取完整选集…").frame(maxWidth: .infinity).padding(30) }
                 if let message = account.message { Text(message).font(.caption).foregroundStyle(model.appearance.muted) }
                 if let error { FailureView(message: error) { Task { await load(forceRefresh: true) } } }
@@ -102,12 +104,13 @@ struct DetailView: View {
         }.safeAreaInset(edge: .bottom) {
             if let detail, !detail.episodes.isEmpty {
                 Button { play(detail, index: selected) } label: { Label("播放第 \(detail.episodes[min(selected, detail.episodes.count - 1)].index) 集", systemImage: "play.fill").font(.headline).frame(maxWidth: .infinity).frame(height: 52) }.buttonStyle(.borderedProminent).tint(model.appearance.accent).padding(.horizontal, 20).padding(.vertical, 12).background(model.appearance.background)
+                    .accessibilityIdentifier("detail.playSelected")
             }
         }
     }
 
     private var destination: some View {
-        pageContent.appBackground(model.appearance).navigationTitle(Self.pageTitle).navigationBarTitleDisplayMode(.inline)
+        pageContent.appBackground(model.appearance, pageOwnsBarBackground: true).navigationTitle(Self.pageTitle).navigationBarTitleDisplayMode(.inline)
             .toolbar(.visible, for: .navigationBar)
             .secondaryPage()
             .playbackDestination($playbackRequest)
@@ -200,6 +203,63 @@ struct DetailView: View {
         if account.isReserved(work.id) { Text("已预约").font(.caption.weight(.semibold)).foregroundStyle(model.appearance.muted).frame(minHeight: 32) }
         else if account.authenticated { Button("预约") { reserving = work }.font(.caption.weight(.semibold)).foregroundStyle(model.appearance.accent).frame(minHeight: 32).disabled(account.busy) }
         else { NavigationLink { AccountView() } label: { Text("登录后预约").font(.caption.weight(.semibold)).foregroundStyle(model.appearance.accent).frame(minHeight: 32) } }
+    }
+
+    private func castSection(_ cast: [CastMember]) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeading(title: "演员表", subtitle: "共 \(cast.count) 位")
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: 12) {
+                    ForEach(cast) { member in
+                        if member.intro.isEmpty {
+                            castCard(member)
+                        } else {
+                            Button {
+                                castIntroID = castIntroID == member.id ? nil : member.id
+                            } label: {
+                                castCard(member)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityHint(castIntroID == member.id ? "收起简介" : "展开简介")
+                            .accessibilityAddTraits(castIntroID == member.id ? .isSelected : [])
+                        }
+                    }
+                }.padding(.vertical, 2)
+            }
+            if let member = cast.first(where: { $0.id == castIntroID }), !member.intro.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(member.nickname).font(.caption.weight(.semibold)).foregroundStyle(model.appearance.accent)
+                    Text(member.intro).font(.caption).foregroundStyle(model.appearance.muted)
+                        .lineSpacing(4).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(18).background(model.appearance.surface, in: RoundedRectangle(cornerRadius: 18))
+        .animation(.easeOut(duration: 0.18), value: castIntroID)
+    }
+
+    private func castCard(_ member: CastMember) -> some View {
+        VStack(spacing: 6) {
+            RemoteImage(address: member.avatarURL) {
+                ZStack {
+                    model.appearance.accent.opacity(0.14)
+                    Text(String(member.nickname.prefix(1))).font(.title3.weight(.semibold))
+                        .foregroundStyle(model.appearance.accent)
+                }
+            }
+            .frame(width: 52, height: 52)
+            .clipShape(Circle())
+            .overlay { Circle().strokeBorder(model.appearance.accent, lineWidth: castIntroID == member.id ? 2 : 0) }
+            .accessibilityHidden(true)
+            Text(member.nickname).font(.caption.weight(.semibold)).foregroundStyle(model.appearance.ink)
+            if !member.roleName.isEmpty {
+                Text("饰 \(member.roleName)").font(.caption2).foregroundStyle(model.appearance.muted)
+            }
+        }
+        .lineLimit(2).multilineTextAlignment(.center)
+        .frame(width: 80)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
     }
 
     private func loadRelated(forceRefresh: Bool = false) async {

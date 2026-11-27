@@ -13,16 +13,56 @@ enum AccountRules {
         var result: [String: Drama] = [:]
         for value in ProtocolJSON.array(raw["data"]) {
             let row = ProtocolJSON.dictionary(value)
-            guard let id = ProtocolJSON.identifier(row["book_id"]) ?? ProtocolJSON.identifier(row["series_id"]),
+            let nested = ProtocolJSON.dictionary(row["video_data"])
+            let nestedID = ProtocolJSON.identifier(nested["book_id"]) ?? ProtocolJSON.identifier(nested["series_id"])
+            guard let id = ProtocolJSON.identifier(row["book_id"]) ?? ProtocolJSON.identifier(row["series_id"]) ?? nestedID,
                   requested.contains(id) else { continue }
-            let title = [row["book_name"], row["series_title"]].compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .first { !$0.isEmpty } ?? ""
-            let cover = posterURL(row["thumb_url"], row["series_cover"], row["series_cover_url"], row["cover"])
-            let metadata = Drama(id: id, title: title, coverURL: cover, summary: ProtocolJSON.text(row["abstract"]),
-                                 episodeCount: max(ProtocolJSON.integer(row["episode_cnt"]), ProtocolJSON.integer(row["episode_count"])))
+            let video = nestedID == nil || nestedID == id ? nested : [:]
+            let title = metadataTitle(id, row["book_name"], row["series_title"], video["series_title"], video["book_name"])
+            let cover = posterURL(row["thumb_url"], row["series_cover"], row["series_cover_url"], row["cover"], row["cover_url"],
+                                  video["series_cover"], video["series_cover_url"], video["cover"], video["cover_url"], video["thumb_url"])
+            let summary = [row["abstract"], row["series_intro"], video["series_intro"], video["video_desc"]]
+                .compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }.first { !$0.isEmpty } ?? ""
+            let count = max(0, ProtocolJSON.integer(row["episode_cnt"]), ProtocolJSON.integer(row["episode_count"]),
+                            ProtocolJSON.integer(video["episode_cnt"]), ProtocolJSON.integer(video["episode_count"]))
+            let metadata = Drama(id: id, title: title, coverURL: cover, summary: summary, episodeCount: count)
             result[id] = result[id]?.replacingMetadata(with: metadata) ?? metadata
         }
         return result
+    }
+
+    static func completeListMetadata(_ items: [Drama], previous: [Drama],
+                                     load: ([String]) async throws -> [String: Any]) async throws -> [Drama] {
+        try Task.checkCancellation()
+        var seen = Set<String>()
+        let ids = items.map(\.id).filter { ProtocolJSON.identifier($0) != nil && seen.insert($0).inserted }
+        var known: [String: Drama] = [:]
+        for drama in previous where seen.contains(drama.id) {
+            let metadata = normalizedMetadata(drama)
+            known[drama.id] = metadata.replacingMetadata(with: known[drama.id])
+        }
+        var details: [String: Drama] = [:]
+        for start in stride(from: 0, to: ids.count, by: 50) {
+            let batch = Array(ids[start..<min(start + 50, ids.count)])
+            let raw = try await load(batch)
+            try Task.checkCancellation()
+            details.merge(detailMetadata(raw, requested: Set(batch))) { current, _ in current }
+        }
+        return items.map { item in
+            item.replacingMetadata(with: known[item.id])
+                .replacingMetadata(with: normalizedMetadata(item))
+                .replacingMetadata(with: details[item.id])
+        }
+    }
+
+    private static func metadataTitle(_ id: String, _ values: Any?...) -> String {
+        values.compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty && $0 != "剧集" && $0 != "剧集 \(id)" } ?? ""
+    }
+
+    private static func normalizedMetadata(_ drama: Drama) -> Drama {
+        Drama(id: drama.id, title: metadataTitle(drama.id, drama.title), coverURL: posterURL(drama.coverURL),
+              summary: drama.summary.trimmingCharacters(in: .whitespacesAndNewlines), episodeCount: drama.episodeCount)
     }
 
     static func posterURL(_ values: Any?...) -> String {
@@ -40,19 +80,17 @@ enum AccountRules {
 
     static func mergeHistory(progress: [LibraryEntry], records: [LibraryEntry]) -> [LibraryEntry] {
         var newest: [String: LibraryEntry] = [:]
-        for entry in progress where newest[entry.id].map({ $0.updatedAt < entry.updatedAt }) ?? true {
-            newest[entry.id] = entry
-        }
-        for record in records {
-            guard var current = newest[record.id], current.updatedAt >= record.updatedAt else {
-                newest[record.id] = record
+        for entry in progress + records {
+            guard let current = newest[entry.id] else {
+                newest[entry.id] = entry
                 continue
             }
-            let drama = record.drama
-            let title = drama.title == "剧集" ? "" : drama.title
-            current.drama = current.drama.replacingMetadata(with: Drama(id: drama.id, title: title, coverURL: drama.coverURL,
-                                                                        summary: drama.summary, episodeCount: drama.episodeCount))
-            newest[record.id] = current
+            let useEntry = entry.updatedAt > current.updatedAt
+            var latest = useEntry ? entry : current
+            let older = useEntry ? current : entry
+            latest.drama = latest.drama.replacingMetadata(with: normalizedMetadata(older.drama))
+                .replacingMetadata(with: normalizedMetadata(latest.drama))
+            newest[entry.id] = latest
         }
         return Array(newest.values.sorted { $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt }.prefix(200))
     }

@@ -212,6 +212,7 @@ struct PlayerEpisodePanel: View {
                 .padding(.vertical, 10)
                 .frame(maxWidth: .infinity)
             }
+            .accessibilityIdentifier("player.episodeGrid")
             .onAppear {
                 guard episodes.indices.contains(session.index), session.index >= columns else { return }
                 proxy.scrollTo(session.index / columns, anchor: .top)

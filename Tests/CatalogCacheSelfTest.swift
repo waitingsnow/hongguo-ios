@@ -23,9 +23,20 @@ struct CatalogCacheSelfTest {
                                                         from: 0, previous: savedSecond))
         cache.store(empty, for: "catalog.discover.ai_series")
         cache.storeCatalog(empty, for: "discover.ai_series", firstPageAt: .now)
+        let episodes = [Episode(id: "101", index: 1, title: "第1集")]
+        let legacyDrama = firstPage.dramas[0]
+        cache.store(LegacyDetail(drama: legacyDrama, episodes: episodes), for: "detail." + legacyDrama.id)
+        let castDrama = firstPage.dramas[1]
+        let cast = [CastMember(celebrityID: "7001", nickname: "范祺", roleName: "沈如锦",
+                               avatarURL: "https://example.test/avatar.jpg", intro: "代表作《测试》")]
+        cache.store(DramaDetail(drama: castDrama, episodes: episodes, cast: cast), for: "detail." + castDrama.id)
         disk.flush()
 
         let restarted = ContentCache(storage: try DataCache(path: directory))
+        let legacyDetail = try required(restarted.value(DramaDetail.self, for: "detail." + legacyDrama.id)).value
+        precondition(legacyDetail.drama == legacyDrama && legacyDetail.episodes == episodes && legacyDetail.cast.isEmpty)
+        let castDetail = try required(restarted.value(DramaDetail.self, for: "detail." + castDrama.id)).value
+        precondition(castDetail.drama == castDrama && castDetail.episodes == episodes && castDetail.cast == cast)
         let stale = try required(restarted.catalog(for: "home.latest"))
         precondition(stale.snapshot.dramas.count == 36 && stale.snapshot.nextOffset == 41 && stale.snapshot.hasMore)
         precondition(stale.firstPageAt == firstPageAt && !CatalogCacheEntry.isFresh(stale.firstPageAt))
@@ -70,7 +81,12 @@ struct CatalogCacheSelfTest {
         let continued = try await pager.page(offset: comic.snapshot.dramas.count)
         precondition(continued.dramas.map(\.id) == (19...36).map(String.init))
         precondition(continued.hasMore && continued.nextOffset == 36)
-        print("Catalog cache checks passed: restart, account verification/switch isolation, freshness, expiry, legacy, empty results, pagination boundary and comic resume")
+        print("Catalog cache checks passed: restart, account verification/switch isolation, freshness, expiry, legacy, empty results, pagination boundary, comic resume and detail cast")
+    }
+
+    private struct LegacyDetail: Codable {
+        let drama: Drama
+        let episodes: [Episode]
     }
 
     private static func page(_ range: ClosedRange<Int>, next: Int) -> DramaPage {

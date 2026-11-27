@@ -2,14 +2,101 @@
 // Adapted from OOIUa/hongguo-android Client/WebSource/AppSource and their attributed upstreams.
 import Foundation
 
-final class ProtocolSessionDelegate: NSObject, URLSessionTaskDelegate {
+class ProtocolSessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
+}
+
+final class PlaybackResponseReader: ProtocolSessionDelegate, URLSessionDataDelegate, @unchecked Sendable {
+    private let limit: Int
+    private let validate: @Sendable (HTTPURLResponse) throws -> Void
+    private let lock = NSLock()
+    private var cancelled = false
+    private var continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>?
+    private var response: HTTPURLResponse?
+    private var data = Data()
+    private var failure: Error?
+
+    private init(limit: Int, validate: @escaping @Sendable (HTTPURLResponse) throws -> Void) {
+        self.limit = limit
+        self.validate = validate
+    }
+
+    static func read(_ request: URLRequest, session: URLSession, limit: Int,
+                     validate: @escaping @Sendable (HTTPURLResponse) throws -> Void) async throws -> (Data, HTTPURLResponse) {
+        let reader = PlaybackResponseReader(limit: limit, validate: validate)
+        let task = session.dataTask(with: request)
+        task.delegate = reader
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let start = reader.lock.withLock {
+                    guard !reader.cancelled else { return false }
+                    reader.continuation = continuation
+                    return true
+                }
+                if start { task.resume() }
+                else {
+                    task.cancel()
+                    continuation.resume(throwing: CancellationError())
+                }
+            }
+        } onCancel: {
+            let started = reader.lock.withLock {
+                reader.cancelled = true
+                return reader.continuation != nil
+            }
+            if started { task.cancel() }
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        do {
+            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+            try validate(http)
+            guard http.expectedContentLength <= limit else { throw HGError.message("服务返回的数据过大") }
+            self.response = http
+            if http.expectedContentLength > 0 { data.reserveCapacity(Int(http.expectedContentLength)) }
+            completionHandler(.allow)
+        } catch {
+            failure = error
+            completionHandler(.cancel)
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
+        guard failure == nil else { return }
+        guard chunk.count <= limit - data.count else {
+            failure = HGError.message("服务返回的数据过大")
+            dataTask.cancel()
+            return
+        }
+        data.append(chunk)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let pending = lock.withLock {
+            let pending = continuation
+            continuation = nil
+            return pending
+        }
+        guard let pending else { return }
+        do {
+            if let failure { throw failure }
+            if response == nil, let http = task.response as? HTTPURLResponse { try validate(http) }
+            if let error { throw error }
+            guard let response else { throw URLError(.badServerResponse) }
+            pending.resume(returning: (data, response))
+        } catch {
+            pending.resume(throwing: error)
+        }
+    }
 }
 
 actor DramaAPI {
     static let shared = DramaAPI()
     private static let playbackBudget: TimeInterval = 20
+    @TaskLocal static var playbackDeadline: TimeInterval?
     private let session: URLSession
     private let delegate = ProtocolSessionDelegate()
     private let signer: ProtocolSigner
@@ -31,9 +118,10 @@ actor DramaAPI {
 
     private struct SearchCursor { var upstreamOffset = 0; var passback = ""; var searchID = ""; var results = [Drama](); var hasMore = true; var fetchedAt = Date() }
 
-    init(resourceDirectory: URL? = nil) {
-        let config = URLSessionConfiguration.ephemeral
+    init(resourceDirectory: URL? = nil, configuration: URLSessionConfiguration = .ephemeral) {
+        let config = configuration.copy() as! URLSessionConfiguration
         config.httpCookieStorage = nil; config.urlCache = nil; config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCredentialStorage = nil
         config.httpShouldSetCookies = false; config.timeoutIntervalForRequest = 18; config.timeoutIntervalForResource = 25
         config.httpMaximumConnectionsPerHost = 3
         session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
@@ -197,11 +285,28 @@ actor DramaAPI {
             }.sorted { $0.index < $1.index }
             guard !episodes.isEmpty else { throw HGError.message("暂未取得分集列表") }
             let updated = Drama(id: drama.id, title: firstText(video["series_title"], drama.title), coverURL: cleanURL(firstText(video["series_cover"], drama.coverURL)), summary: intro.isEmpty ? drama.summary : intro, episodeCount: max(episodes.count, ProtocolJSON.integer(video["episode_cnt"])))
-            let result = DramaDetail(drama: updated, episodes: episodes); cacheDetail(result); return result
+            let result = DramaDetail(drama: updated, episodes: episodes, cast: castMembers(video))
+            cacheDetail(result)
+            return result
         } catch {
             try Task.checkCancellation()
             if let result = try? await webDetail(drama) { cacheDetail(result); return result }
             throw error
+        }
+    }
+
+    func castMembers(_ video: [String: Any]) -> [CastMember] {
+        ProtocolJSON.array(video["celebrities"]).compactMap { value in
+            let row = ProtocolJSON.dictionary(value)
+            let nickname = ProtocolJSON.text(row["nickname"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !nickname.isEmpty else { return nil }
+            return CastMember(
+                celebrityID: ProtocolJSON.text(row["celebrity_id"]),
+                nickname: nickname,
+                roleName: ProtocolJSON.text(row["role_name"]).trimmingCharacters(in: .whitespacesAndNewlines),
+                avatarURL: cleanURL(ProtocolJSON.text(row["avatar"])),
+                intro: stripHTML(ProtocolJSON.text(row["intro"])).trimmingCharacters(in: .whitespacesAndNewlines)
+            )
         }
     }
 
@@ -241,32 +346,77 @@ actor DramaAPI {
     }
 
     /// `quality`: the highest row at or below that size is preferred, falling back to the nearest available one.
-    func track(episodeID: String, quality: VideoQuality? = nil) async throws -> VideoTrack {
+    func track(episodeID: String, seriesID: String? = nil, quality: VideoQuality? = nil) async throws -> VideoTrack {
         guard ProtocolJSON.identifier(episodeID) != nil else { throw HGError.message("分集编号无效") }
         // device_level=3 makes the server ship some episodes' 360P–720P as undecodable bytevc2, leaving only
         // 1080P; level 1 serves normal episodes the same ladder (synchronized from hongguoTV 0.1.12).
         let biz: [String: Any] = ["detail_page_version":0,"device_level":1,"disable_digg_stat":false,"need_all_video_definition":true,
             "need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024]
         let body = try ProtocolJSON.data(["biz_param":biz,"mixed_video_id_map":["1004":[episodeID]]])
-        let retryDeadline = ProcessInfo.processInfo.systemUptime + Self.playbackBudget
-        return try await playbackTrack(
-            identity: { [self] in try await freshPlaybackIdentity() },
-            mobile: { [self] identity in try await readMobilePlayback(episodeID: episodeID, identity: identity) },
-            single: { [self] identity in try await readSinglePlayback(episodeID: episodeID, identity: identity) },
-            read: { [self] route, identity in
-                try await readPlaybackRoute(route, episodeID: episodeID, body: body, identity: identity, retryDeadline: retryDeadline)
-            },
-            use: { [self] model in
-                guard !model.isEmpty else { throw HGError.message("服务暂未返回当前分集片源") }
-                return try await modelTrack(model, quality: quality)
-            })
+        let publicEpisode: (@Sendable () async throws -> VideoTrack)? = seriesID
+            .flatMap(ProtocolJSON.identifier)
+            .map { seriesID in
+                { @Sendable [session] in try await PublicEpisodeSource.track(seriesID: seriesID, episodeID: episodeID, session: session) }
+            }
+        return try await Self.withPlaybackBudget(Self.playbackBudget) {
+            try await self.playbackTrack(
+                identity: { try await self.freshPlaybackIdentity() },
+                tabV5: { try await self.readTabPlaybackV5(episodeID: episodeID, identity: $0) },
+                mobile: { try await self.readMobilePlayback(episodeID: episodeID, identity: $0) },
+                single: { try await self.readSinglePlayback(episodeID: episodeID, identity: $0) },
+                publicEpisode: publicEpisode,
+                read: { try await self.readPlaybackRoute($0, episodeID: episodeID, body: body, identity: $1) },
+                use: {
+                    guard !$0.isEmpty else { throw HGError.message("服务暂未返回当前分集片源") }
+                    return try await self.modelTrack($0, quality: quality)
+                })
+        }
+    }
+
+    static func withPlaybackBudget<Value: Sendable>(_ seconds: TimeInterval, timeoutError: any Error = URLError(.timedOut),
+        operation: @escaping @Sendable () async throws -> Value) async throws -> Value {
+        try Task.checkCancellation()
+        let now = ProcessInfo.processInfo.systemUptime
+        let deadline = min(now + seconds, playbackDeadline ?? .infinity)
+        guard deadline > now else { throw timeoutError }
+        return try await withThrowingTaskGroup(of: Value.self) { group in
+            group.addTask {
+                try await $playbackDeadline.withValue(deadline) { try await operation() }
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(max(0, deadline - ProcessInfo.processInfo.systemUptime)))
+                throw timeoutError
+            }
+            defer { group.cancelAll() }
+            let result = await group.nextResult()!
+            if case .failure(let error) = result, error is CompatibilityWindowEnded {
+                group.cancelAll()
+                if case .failure(let refusal as PlaybackRefusal) = await group.nextResult() { throw refusal }
+            }
+            try Task.checkCancellation()
+            let value = try result.get()
+            guard ProcessInfo.processInfo.systemUptime < deadline else { throw timeoutError }
+            return value
+        }
+    }
+
+    static func boundedRequest(_ input: URLRequest, until deadline: TimeInterval? = playbackDeadline) throws -> URLRequest {
+        try Task.checkCancellation()
+        guard let deadline else { return input }
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0 else { throw URLError(.timedOut) }
+        var request = input
+        request.timeoutInterval = min(request.timeoutInterval, remaining)
+        return request
     }
 
     /// Picks a track from a playback model. Inline rows with neither a key nor a declared encryption state may use the
     /// model's fallback_api, whose answer must separately match id, full duration, quality and encryption
     /// (synchronized from hongguo-drama 5.5).
     func modelTrack(_ model: [String: Any], quality: VideoQuality? = nil, readFallback: (@Sendable (String) async throws -> [String: Any])? = nil) async throws -> VideoTrack {
-        let read: @Sendable (String) async throws -> [String: Any] = readFallback ?? { [self] in try await request(url: try await checkedFallback($0), body: nil, headers: ["User-Agent":PlaybackRegistration.userAgent]) }
+        let read: @Sendable (String) async throws -> [String: Any] = readFallback ?? { [self] in
+            try await request(url: try await checkedFallback($0), body: nil, headers: ["User-Agent":PlaybackRegistration.userAgent], playback: true)
+        }
         let address = fallbackURL(model["fallback_api"])
         let inlineRows = (model["video_list"] as? [Any])?.count ?? (model["video_list"] as? [String: Any])?.count ?? 0
         guard inlineRows > 0 else {
@@ -283,9 +433,8 @@ actor DramaAPI {
         } catch let incomplete as IncompleteEncryption {
             do {
                 return try await verifiedFallback(model, address: address, incomplete: incomplete, quality: quality, read: read)
-            } catch is CancellationError { throw CancellationError()
             } catch {
-                try Task.checkCancellation()
+                try Self.checkPlaybackStop(error)
                 // 2026-11-09 (Android issue #3, season 2 episodes 14, 18, …): the server leaves encrypt_info out entirely
                 // for episodes whose media is plain hvc1. When no fallback confirms a source, those undeclared rows play as
                 // plain; ProgressiveSource and MP4Processor.validate(requirePlain:) refuse an index with encv/enca/sinf/senc.
@@ -332,9 +481,8 @@ actor DramaAPI {
                     let other = try fallbackInfo(try await read(compatible))
                     try Self.confirmSameVideo(info, other)
                     return try selectTrack(other, requireEncryption: false, minimumPixels: 0, quality: quality)
-                } catch is CancellationError { throw CancellationError()
                 } catch {
-                    try Task.checkCancellation()
+                    try Self.checkPlaybackStop(error)
                 }
             }
             throw onlyByteVC2
@@ -367,7 +515,8 @@ actor DramaAPI {
 
     private func fallbackInfo(_ outer: [String: Any]) throws -> [String: Any] {
         let outerInfo = ProtocolJSON.dictionary(outer["video_info"])
-        guard ProtocolJSON.integer(outer["Code"] ?? outer["code"]) == 0, ProtocolJSON.integer(outerInfo["Code"]) == 0 else { throw HGError.message("当前分集暂时无法播放") }
+        try Self.checkPlaybackBusinessRejection(outer)
+        try Self.checkPlaybackBusinessRejection(outerInfo)
         return ProtocolJSON.dictionary(outerInfo["data"])
     }
 
@@ -417,12 +566,20 @@ actor DramaAPI {
             }
             if !spade.isEmpty && (try? SpadeKey.decode(spade)) == nil { continue }
             let candidates = [row.item["main_url"],row.item["backup_url"]].compactMap { $0 as? String } + (row.item["backup_url_list"] as? [String] ?? [])
+            let allowMirrors = seedText.isEmpty && spade.isEmpty &&
+                ["false", "0"].contains(ProtocolJSON.text(encryptInfo["encrypt"]).lowercased())
+            var urls: [URL] = []
             for candidate in candidates where !candidate.isEmpty {
                 do {
                     let address = seedText.isEmpty ? cleanURL(candidate) : try decryptURL(candidate, seed: seed)
                     let url = try checkedURL(address, domains: ["qznovelvod.com","fqnovelvod.com","douyinvod.com"])
-                    return VideoTrack(url: url, spadeA: spade, encrypted: !spade.isEmpty, definition: row.quality, shortSide: row.pixels)
+                    if urls.isEmpty || (url.fragment == nil && !urls.contains(url)) { urls.append(url) }
+                    if !allowMirrors || urls.count == 3 { break }
                 } catch { continue }
+            }
+            if let first = urls.first {
+                return VideoTrack(url: first, spadeA: spade, encrypted: !spade.isEmpty,
+                                  definition: row.quality, shortSide: row.pixels, backupURLs: Array(urls.dropFirst()))
             }
         }
         if incomplete, let best = rows.first { throw IncompleteEncryption(minimumPixels: best.shortSide) }
@@ -439,8 +596,12 @@ actor DramaAPI {
     /// Fresh anonymous identity for an uncached or empty-response attempt; account devices stay separate.
     private func freshPlaybackIdentity() async throws -> RegisteredIdentity {
         if let failed = registrationFailedAt, Date().timeIntervalSince(failed) < 10 { throw HGError.message("匿名播放设备注册失败，请稍后重试") }
-        do { let identity = try await PlaybackRegistration.register(session: session); registrationFailedAt = nil; return identity }
-        catch { try Task.checkCancellation(); if !(error is CancellationError) { registrationFailedAt = Date() }; throw error }
+        do { let identity = try await PlaybackRegistration.register(session: session, playback: true); registrationFailedAt = nil; return identity }
+        catch {
+            try Task.checkCancellation()
+            if (error as? URLError)?.code != .cancelled, !(error is CancellationError) { registrationFailedAt = Date() }
+            throw error
+        }
     }
 
     static let playbackHost = "api5-normal-sinfonlineb.fqnovel.com", playbackRetryHost = "api5-normal-hl.fqnovel.com"
@@ -448,134 +609,146 @@ actor DramaAPI {
 
     /// Recover the preferred v5 endpoint before older routes (N3urda 6672b55 / LiuWQ0809 89169c0).
     /// Reuse only proven anonymous identities; retain cancellation, route order and model-error precedence.
-    func playbackTrack(routes: [PlaybackRoute] = DramaAPI.playbackRoutes, budget: TimeInterval = DramaAPI.playbackBudget,
+    func playbackTrack(routes: [PlaybackRoute] = DramaAPI.playbackRoutes, budget requestedBudget: TimeInterval = DramaAPI.playbackBudget,
                        now: @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-                       pause: @Sendable () async throws -> Void = { try await Task.sleep(nanoseconds: 300_000_000) },
-                       identity newIdentity: @Sendable () async throws -> RegisteredIdentity,
+                       pause: @escaping @Sendable () async throws -> Void = { try await Task.sleep(nanoseconds: 300_000_000) },
+                       identity newIdentity: @escaping @Sendable () async throws -> RegisteredIdentity,
+                       tabV5: (@Sendable (RegisteredIdentity) async throws -> PlaybackRead)? = nil,
                        mobile: (@Sendable (RegisteredIdentity) async throws -> PlaybackRead)? = nil,
                        single: (@Sendable (RegisteredIdentity) async throws -> PlaybackRead)? = nil,
-                       read: @Sendable (PlaybackRoute, RegisteredIdentity) async throws -> PlaybackRead,
+                       publicEpisode: (@Sendable () async throws -> VideoTrack)? = nil,
+                       read: @escaping @Sendable (PlaybackRoute, RegisteredIdentity) async throws -> PlaybackRead,
                        use: @Sendable ([String: Any]) async throws -> VideoTrack) async throws -> VideoTrack {
         let started = now()
         try Task.checkCancellation()
-        guard budget > 0 else { throw HGError.message("播放取流超时，请稍后重试") }
+        let budget = min(requestedBudget, (Self.playbackDeadline ?? .infinity) - ProcessInfo.processInfo.systemUptime)
+        guard budget > 0 else { throw URLError(.timedOut) }
         var identity: RegisteredIdentity
         if let cached = successfulPlaybackIdentity { identity = cached }
         else { identity = try await newIdentity() }
         var trace: [String] = []
-        var failure: Error?, modelFailure: Error?
-        var onlyEmpty = true
+        var hardFailure: Error?, transientFailure: URLError?, modelFailure: Error?
+        var receivedEmpty = false, receivedInvalid = false
         defer { lastPlaybackTrace = trace.joined(separator: " ") }
-        let label = mobile == nil ? "S" : "M"
-        if let primary = mobile ?? single {
-            // An empty body can be transient. Give the current episode one more read
-            // in the same session, leaving time for the existing fallback readers.
-            for attempt in 0..<2 {
-                try Task.checkCancellation()
-                guard now() - started < budget else { break }
-                var model: [String: Any]?
-                do {
-                    switch try await primary(identity) {
-                    case .empty:
-                        trace.append(label + "=0B")
-                        guard attempt == 0, now() - started < budget else { break }
-                        try await pause()
-                        continue
-                    case .invalid: trace.append(label + "=invalid"); onlyEmpty = false
-                    case .model(let value): model = value
-                    }
-                } catch is CancellationError { throw CancellationError()
-                } catch let error as PlaybackRefusal {
-                    forgetPlaybackIdentity(identity, after: error)
-                    trace.append(label + (error.isBackoff ? "=backoff" : "=rejected"))
-                    throw error
-                } catch { try Task.checkCancellation(); trace.append(label + "=failed"); onlyEmpty = false; failure = error }
-                if let model {
-                    onlyEmpty = false
-                    do {
-                        let track = try await use(model)
-                        try Task.checkCancellation()
-                        if successfulPlaybackIdentity == nil { successfulPlaybackIdentity = identity }
-                        trace.append(label + "=ok")
-                        return track
-                    } catch is CancellationError { throw CancellationError()
-                    } catch let error as PlaybackRefusal { forgetPlaybackIdentity(identity, after: error); throw error
-                    } catch {
-                        try Task.checkCancellation()
-                        trace.append(label + "=unusable")
-                        modelFailure = error
-                    }
-                }
-                break // Only an empty reply repeats the single endpoint.
-            }
+
+        var remaining: TimeInterval { budget - (now() - started) }
+        var guestEligible: Bool {
+            publicEpisode != nil && receivedEmpty && !receivedInvalid && hardFailure == nil && modelFailure == nil
         }
-        if mobile != nil, let single, now() - started < budget {
+        func optionalRead<Value: Sendable>(_ operation: @escaping @Sendable () async throws -> Value) async throws -> Value {
             try Task.checkCancellation()
-            do {
-                switch try await single(identity) {
-                case .model(let model):
-                    onlyEmpty = false
-                    do {
-                        let track = try await use(model)
-                        try Task.checkCancellation()
-                        if successfulPlaybackIdentity == nil { successfulPlaybackIdentity = identity }
-                        trace.append("S=ok"); return track
-                    } catch is CancellationError { throw CancellationError()
-                    } catch let error as PlaybackRefusal { throw error
-                    } catch { try Task.checkCancellation(); modelFailure = modelFailure ?? error; trace.append("S=unusable") }
-                case .empty: trace.append("S=0B")
-                case .invalid: trace.append("S=invalid"); onlyEmpty = false
-                }
-            } catch is CancellationError { throw CancellationError()
-            } catch let error as PlaybackRefusal { forgetPlaybackIdentity(identity, after: error); throw error
-            } catch { try Task.checkCancellation(); failure = error; onlyEmpty = false; trace.append("S=failed") }
+            guard remaining > 0 else { throw URLError(.timedOut) }
+            guard guestEligible else { return try await operation() }
+            return try await Self.withPlaybackBudget(remaining - min(6, budget / 3), timeoutError: CompatibilityWindowEnded(),
+                                                     operation: operation)
         }
-        for route in routes {
-            guard now() - started < budget else { break }
+        func checkStop(_ error: Error, label: String) throws {
             try Task.checkCancellation()
-            if route.renewsIdentity {
-                do { identity = try await newIdentity(); trace.append("new") }
-                catch { try Task.checkCancellation(); trace.append("new=failed") }
+            if let refusal = error as? PlaybackRefusal {
+                forgetPlaybackIdentity(identity, after: refusal)
+                trace.append(label + (refusal.isBackoff ? "=backoff" : "=rejected"))
             }
-            try Task.checkCancellation()
-            guard now() - started < budget else { break }
-            let label = (route.post ? "P:" : "G:") + (route.host == Self.playbackHost ? "b" : "hl")
-            let model: [String: Any]
+            try Self.checkPlaybackStop(error)
+        }
+
+        func attempt(_ label: String, _ operation: @escaping @Sendable () async throws -> PlaybackRead)
+            async throws -> (track: VideoTrack?, empty: Bool) {
+            let reply: PlaybackRead
             do {
-                switch try await read(route, identity) {
-                case .empty: trace.append(label + "=0B"); continue
-                case .invalid: trace.append(label + "=invalid"); onlyEmpty = false; continue
-                case .model(let value): model = value
-                }
-            } catch is CancellationError { throw CancellationError()
-            } catch let error as PlaybackRefusal {
-                forgetPlaybackIdentity(identity, after: error)
-                trace.append(label + (error.isBackoff ? "=backoff" : "=rejected"))
-                throw error
-            } catch let error as HGError {
-                try Task.checkCancellation()
-                if case .message(let text) = error, text == Self.rejectedPlayback { forgetPlaybackIdentity(identity); trace.append(label + "=rejected"); throw error }
-                trace.append(label + "=failed"); onlyEmpty = false; failure = error; continue
-            } catch { try Task.checkCancellation(); trace.append(label + "=failed"); onlyEmpty = false; failure = error; continue }
-            onlyEmpty = false
-            do {
-                let track = try await use(model)
-                try Task.checkCancellation()
-                if successfulPlaybackIdentity == nil { successfulPlaybackIdentity = identity }
-                trace.append(label + "=ok")
-                return track
-            } catch is CancellationError { throw CancellationError()
-            } catch let error as PlaybackRefusal { forgetPlaybackIdentity(identity, after: error); throw error
+                reply = try await optionalRead(operation)
+            } catch let cutoff as CompatibilityWindowEnded {
+                throw cutoff
             } catch {
-                try Task.checkCancellation()
-                trace.append(label + "=unusable")
-                if modelFailure == nil { modelFailure = error }
+                try checkStop(error, label: label)
+                trace.append(label + "=failed")
+                if let transport = error as? URLError, [.networkConnectionLost, .cannotConnectToHost, .timedOut].contains(transport.code) {
+                    transientFailure = transport
+                } else {
+                    hardFailure = error
+                }
+                return (nil, false)
+            }
+            switch reply {
+            case .empty:
+                receivedEmpty = true
+                trace.append(label + "=0B")
+                return (nil, true)
+            case .invalid:
+                receivedInvalid = true
+                trace.append(label + "=invalid")
+            case .model(let model):
+                do {
+                    let track = try await use(model)
+                    try Task.checkCancellation()
+                    guard remaining > 0 else { throw URLError(.timedOut) }
+                    if successfulPlaybackIdentity == nil { successfulPlaybackIdentity = identity }
+                    trace.append(label + "=ok")
+                    return (track, false)
+                } catch {
+                    try checkStop(error, label: label)
+                    trace.append(label + "=unusable")
+                    modelFailure = modelFailure ?? error
+                }
+            }
+            return (nil, false)
+        }
+
+        do {
+            if let tabV5, remaining > 0 {
+                let reply = try await attempt("T") { [identity] in try await tabV5(identity) }
+                if let track = reply.track { return track }
+            }
+            if let primary = mobile ?? single {
+                let label = mobile == nil ? "S" : "M"
+                let first = try await attempt(label) { [identity] in try await primary(identity) }
+                if let track = first.track { return track }
+                if first.empty, remaining > 0 {
+                    try await optionalRead(pause)
+                    let retry = try await attempt(label) { [identity] in try await primary(identity) }
+                    if let track = retry.track { return track }
+                }
+            }
+            if mobile != nil, let single, remaining > 0 {
+                let reply = try await attempt("S") { [identity] in try await single(identity) }
+                if let track = reply.track { return track }
+            }
+            for route in routes {
+                guard remaining > 0 else { break }
+                if route.renewsIdentity {
+                    do { identity = try await optionalRead(newIdentity); trace.append("new") }
+                    catch let cutoff as CompatibilityWindowEnded { throw cutoff }
+                    catch { try checkStop(error, label: "new"); hardFailure = error; trace.append("new=failed") }
+                }
+                guard remaining > 0 else { break }
+                let label = (route.post ? "P:" : "G:") + (route.host == Self.playbackHost ? "b" : "hl")
+                let reply = try await attempt(label) { [identity] in try await read(route, identity) }
+                if let track = reply.track { return track }
+            }
+        } catch is CompatibilityWindowEnded {
+            trace.append("app=budget")
+        }
+
+        try Task.checkCancellation()
+        guard remaining > 0 else { throw URLError(.timedOut) }
+        if let modelFailure { throw modelFailure }
+        if let hardFailure { throw hardFailure }
+        if guestEligible, let publicEpisode {
+            do {
+                let track = try await Self.withPlaybackBudget(remaining, operation: publicEpisode)
+                trace.append("W=ok")
+                return track
+            } catch {
+                trace.append("W=failed")
+                try Self.checkPlaybackStop(error)
+                throw error
             }
         }
-        if let modelFailure { throw modelFailure }
-        if onlyEmpty { throw HGError.message("播放服务返回空响应，原因尚未确认，请稍后重试") }
-        throw failure ?? HGError.message("服务暂未返回当前分集片源")
+        if let transientFailure { throw transientFailure }
+        if receivedEmpty && !receivedInvalid { throw HGError.message("播放服务返回空响应，原因尚未确认，请稍后重试") }
+        throw HGError.message("服务暂未返回当前分集片源")
     }
+
+    private struct CompatibilityWindowEnded: Error {}
 
     private func forgetPlaybackIdentity(_ identity: RegisteredIdentity, after refusal: PlaybackRefusal? = nil) {
         if refusal?.isBackoff != true, successfulPlaybackIdentity == identity { successfulPlaybackIdentity = nil }
@@ -596,29 +769,74 @@ actor DramaAPI {
             isBackoff = true
             errorDescription = "播放服务要求稍后重试（HTTP \(retryAfterStatus)）"
         }
+        init() {
+            isBackoff = false
+            errorDescription = "播放服务要求验证，请在官方客户端完成"
+        }
+    }
+
+    private static func checkPlaybackStop(_ error: Error) throws {
+        try Task.checkCancellation()
+        if error is CancellationError || (error as? URLError)?.code == .cancelled { throw CancellationError() }
+        if let refusal = error as? PlaybackRefusal { throw refusal }
     }
 
     static func checkPlaybackBusinessRejection(_ data: Data) throws {
         guard let reply = try? ProtocolJSON.object(data) else { return }
-        let code = ProtocolJSON.integer(reply["code"] ?? reply["Code"])
-        if [1003, 101144, 110001, 110002].contains(code) { throw PlaybackRefusal(code: code) }
+        try checkPlaybackBusinessRejection(reply)
+    }
+
+    static func checkPlaybackBusinessRejection(_ reply: [String: Any]) throws {
+        for fields in [reply, ProtocolJSON.dictionary(reply["data"])] {
+            if ["captcha", "verify_center_decision_conf"].contains(where: { key in
+                guard let value = fields[key], !(value is NSNull) else { return false }
+                if let text = value as? String { return !text.isEmpty }
+                return true
+            }) { throw PlaybackRefusal() }
+        }
+        for key in ["code", "Code", "StatusCode"] {
+            if let code = Int(ProtocolJSON.text(reply[key])), code != 0 { throw PlaybackRefusal(code: code) }
+        }
+    }
+
+    static func checkPlaybackHTTP(_ http: HTTPURLResponse) throws {
+        if let retryAfter = http.value(forHTTPHeaderField: "Retry-After"),
+           !retryAfter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw PlaybackRefusal(retryAfterStatus: http.statusCode)
+        }
+        if http.value(forHTTPHeaderField: "cf-mitigated")?.lowercased() == "challenge" { throw PlaybackRefusal() }
+        if (300..<400).contains(http.statusCode) || [401, 403, 407, 429, 451].contains(http.statusCode) {
+            throw PlaybackRefusal(http: http.statusCode)
+        }
     }
 
     /// One route's answer: a model, 0 bytes, or a body that is not a usable model response.
-    enum PlaybackRead { case model([String: Any]), empty, invalid }
-    private static let rejectedPlayback = "当前分集暂未提供播放信息"
+    enum PlaybackRead: @unchecked Sendable { case model([String: Any]), empty, invalid }
 
-    private func readPlaybackRoute(_ route: PlaybackRoute, episodeID: String, body: Data, identity: RegisteredIdentity,
-                                   retryDeadline: TimeInterval) async throws -> PlaybackRead {
+    private func readPlaybackRoute(_ route: PlaybackRoute, episodeID: String, body: Data, identity: RegisteredIdentity) async throws -> PlaybackRead {
         let signed = try await signedPlaybackRequest(route: route, episodeID: episodeID, body: body, identity: identity)
-        let data = try await fetch(url: signed.url, body: route.post ? body : nil, headers: signed.headers, timeout: 8,
-                                   playback: true, retryDeadline: retryDeadline)
+        let data = try await fetch(url: signed.url, body: route.post ? body : nil, headers: signed.headers, timeout: 8, playback: true)
         guard !data.isEmpty else { return .empty }
         try Self.checkPlaybackBusinessRejection(data)
         if !route.post { return Self.tabVideoModel(data, episodeID: episodeID).map { .model($0) } ?? .invalid }
         guard let response = try? ProtocolJSON.object(data) else { return .invalid }
-        guard ProtocolJSON.integer(response["code"] ?? response["Code"]) == 0 else { throw HGError.message(Self.rejectedPlayback) }
+        guard ProtocolJSON.text(response["code"] ?? response["Code"]) == "0" else { return .invalid }
         return .model(ProtocolJSON.dictionary(ProtocolJSON.dictionary(ProtocolJSON.dictionary(response["data"])[episodeID])["video_model"]))
+    }
+
+    /// video_tab 的 v5 无正文 GET。2026-11-20 起这是优先取源路径，失败后再走原有接口和官网回退。
+    private func readTabPlaybackV5(episodeID: String, identity: RegisteredIdentity) async throws -> PlaybackRead {
+        let device = Self.mobileDevice(identity)
+        let signed = try await signer.signedPlaybackGetV5(baseURL: Self.videoTabV5URL,
+            query: try Self.videoTabV5Query(identity, episodeID: episodeID), device: device,
+            now: Int64(Date().timeIntervalSince1970 * 1000))
+        var headers = signed.headers
+        headers["User-Agent"] = Self.videoTabV5UserAgent
+        headers["Accept"] = "application/json"
+        let data = try await fetch(url: signed.url, body: nil, headers: headers, timeout: 8, playback: true)
+        guard !data.isEmpty else { return .empty }
+        try Self.checkPlaybackBusinessRejection(data)
+        return Self.tabVideoModel(data, episodeID: episodeID).map { .model($0) } ?? .invalid
     }
 
     private func readMobilePlayback(episodeID: String, identity: RegisteredIdentity) async throws -> PlaybackRead {
@@ -788,13 +1006,13 @@ actor DramaAPI {
         return response
     }
 
-    private func request(url: URL, body: Data?, headers: [String: String]) async throws -> [String: Any] {
-        let data = try await fetch(url: url, body: body, headers: headers)
+    private func request(url: URL, body: Data?, headers: [String: String], playback: Bool = false) async throws -> [String: Any] {
+        let data = try await fetch(url: url, body: body, headers: headers, playback: playback)
         guard !data.isEmpty else { throw HGError.message("服务返回空响应，请稍后重试") }
         do { return try ProtocolJSON.object(data) } catch { throw HGError.message("服务数据格式发生变化，请稍后重试") }
     }
     private func fetch(url: URL, body: Data? = nil, headers: [String: String], timeout: TimeInterval = 18,
-                       playback: Bool = false, retryDeadline: TimeInterval = .infinity) async throws -> Data {
+                       playback: Bool = false) async throws -> Data {
         try Task.checkCancellation()
         let scheduled = max(Date(), nextRequestAt); nextRequestAt = scheduled.addingTimeInterval(0.26)
         let wait = scheduled.timeIntervalSinceNow
@@ -803,13 +1021,27 @@ actor DramaAPI {
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = body == nil ? "GET" : "POST"; request.httpBody = body; request.httpShouldHandleCookies = false
         for (name,value) in headers { request.setValue(value, forHTTPHeaderField: name) }
-        return try await Self.responseData(for: request, playback: playback, retryDeadline: retryDeadline) { try await session.data(for: $0) }
+        return try await Self.responseData(for: request, playback: playback) { request in
+            if playback { return try await Self.playbackResponse(for: request, session: session) }
+            return try await session.data(for: request)
+        }
+    }
+
+    static func playbackResponse(for request: URLRequest, session: URLSession) async throws -> (Data, URLResponse) {
+        let (data, response) = try await PlaybackResponseReader.read(request, session: session, limit: 8 * 1024 * 1024) {
+            try checkPlaybackHTTP($0)
+        }
+        if !data.isEmpty, ["text/html", "application/xhtml+xml"].contains(response.mimeType?.lowercased() ?? "") {
+            throw PlaybackRefusal()
+        }
+        return (data, response)
     }
 
     static func responseData(for request: URLRequest, playback: Bool, retryDeadline: TimeInterval = .infinity,
                              send: (URLRequest) async throws -> (Data, URLResponse)) async throws -> Data {
         try Task.checkCancellation()
-        let deadline = min(retryDeadline, ProcessInfo.processInfo.systemUptime + request.timeoutInterval)
+        let request = try boundedRequest(request)
+        let deadline = min(retryDeadline, playbackDeadline ?? .infinity, ProcessInfo.processInfo.systemUptime + request.timeoutInterval)
         let (data, response): (Data, URLResponse)
         do {
             (data, response) = try await send(request)
@@ -817,20 +1049,13 @@ actor DramaAPI {
             (error.code == .cannotConnectToHost || error.code == .networkConnectionLost) {
             try Task.checkCancellation()
             let remaining = deadline - ProcessInfo.processInfo.systemUptime
-            guard remaining > 0 else { throw error }
+            guard remaining > 0 else { throw URLError(.timedOut) }
             var retry = request
             retry.timeoutInterval = remaining
             (data, response) = try await send(retry)
         }
         try Task.checkCancellation()
-        if playback, let http = response as? HTTPURLResponse {
-            if [403, 429].contains(http.statusCode) { throw PlaybackRefusal(http: http.statusCode) }
-            if http.statusCode == 503 || (http.statusCode == 200 && data.isEmpty),
-               let retryAfter = http.value(forHTTPHeaderField: "Retry-After"),
-               !retryAfter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                throw PlaybackRefusal(retryAfterStatus: http.statusCode)
-            }
-        }
+        if playback, let http = response as? HTTPURLResponse { try checkPlaybackHTTP(http) }
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             throw HGError.message("服务连接失败（HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)）")
         }

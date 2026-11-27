@@ -32,7 +32,7 @@ struct PlaybackPictureLayout {
         var footer: CGFloat { self == .player ? 124 : 142 }
         var accessoryRoom: CGFloat { 44 }
         var interactionColumnBottom: CGFloat { self == .player ? 118 : 66 }
-        var interactionSpacing: CGFloat { self == .player ? 4 : 16 }
+        var interactionSpacing: CGFloat { 0 }
     }
 
     let canvas: CGSize
@@ -72,7 +72,7 @@ struct PlaybackPictureLayout {
     }
 
     private var interactionColumnTop: CGFloat {
-        canvas.height - insets.bottom - context.interactionColumnBottom - (3 * 44 + 2 * context.interactionSpacing)
+        canvas.height - insets.bottom - context.interactionColumnBottom - (3 * InteractionButtonIcon.countedHeight + 2 * context.interactionSpacing)
     }
 
     func danmakuInsets(around picture: CGRect?) -> EdgeInsets {
@@ -126,25 +126,53 @@ struct FollowDramaButton: View {
     }
 }
 
-struct InteractionButtonIcon: View {
+struct InteractionButtonIcon: UIViewRepresentable {
+    private static let symbolHeight: CGFloat = 24
+    private static let countFont = UIFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+    private static let labelSpacing: CGFloat = 3
+    private static let verticalPadding: CGFloat = 10
+    static var countedHeight: CGFloat { symbolHeight + labelSpacing + ceil(countFont.lineHeight) + 2 * verticalPadding }
     let symbol: String
     let count: Int?
 
-    var body: some View {
-        VStack(spacing: 2) {
-            Image(systemName: symbol)
-                .font(.system(size: 20, weight: .semibold))
-                .symbolRenderingMode(.monochrome)
-                .frame(height: 23)
-                .accessibilityHidden(true)
-            Text(verbatim: count.map(Self.countLabel) ?? "")
-                .font(.system(size: 11, weight: .semibold)).monospacedDigit()
-                .lineLimit(1).minimumScaleFactor(0.7)
-                .frame(height: 13)
-        }
-        .foregroundStyle(.white)
-        .frame(width: 44, height: 44)
-        .contentShape(Rectangle())
+    final class IconStack: UIStackView {
+        let icon = UIImageView()
+        let number = UILabel()
+    }
+
+    func makeUIView(context: Context) -> IconStack {
+        let stack = IconStack()
+        stack.axis = .vertical
+        stack.alignment = .center
+        stack.spacing = Self.labelSpacing
+        stack.isLayoutMarginsRelativeArrangement = true
+        stack.insetsLayoutMarginsFromSafeArea = false
+        stack.directionalLayoutMargins = .init(top: Self.verticalPadding, leading: 0, bottom: Self.verticalPadding, trailing: 0)
+        stack.icon.contentMode = .scaleAspectFit
+        stack.icon.tintColor = .white
+        stack.icon.preferredSymbolConfiguration = .init(pointSize: 20, weight: .semibold)
+        stack.number.font = Self.countFont
+        stack.number.textColor = .white
+        stack.number.adjustsFontSizeToFitWidth = true
+        stack.number.minimumScaleFactor = 0.7
+        stack.number.textAlignment = .center
+        stack.addArrangedSubview(stack.icon)
+        stack.addArrangedSubview(stack.number)
+        stack.icon.heightAnchor.constraint(equalToConstant: Self.symbolHeight).isActive = true
+        stack.number.widthAnchor.constraint(lessThanOrEqualToConstant: 44).isActive = true
+        stack.accessibilityElementsHidden = true
+        stack.isUserInteractionEnabled = false
+        return stack
+    }
+
+    func updateUIView(_ stack: IconStack, context: Context) {
+        stack.icon.image = UIImage(systemName: symbol)
+        stack.number.text = count.map(Self.countLabel)
+        stack.number.isHidden = count == nil
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: IconStack, context: Context) -> CGSize? {
+        CGSize(width: 44, height: ceil(uiView.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize).height))
     }
 
     private static func countLabel(_ count: Int) -> String {
@@ -305,6 +333,15 @@ struct ChoiceChip: View {
     }
 }
 
+/// 长按 2× 的屏幕提示,沉浸信息流与全屏播放器共用;按住期间显示,松手淡出。
+struct HoldSpeedBadge: View {
+    var body: some View {
+        Label("2× 临时加速中", systemImage: "forward.fill").font(.caption.bold()).foregroundStyle(.white)
+            .padding(.horizontal, 13).padding(.vertical, 8).background(.black.opacity(0.5), in: Capsule())
+            .accessibilityElement(children: .combine).accessibilityLabel("2× 临时加速播放中")
+    }
+}
+
 struct SectionHeading: View {
     let title: String
     var subtitle: String? = nil
@@ -336,7 +373,11 @@ struct HeaderIcon: View {
 }
 
 extension View {
-    func appBackground(_ theme: ThemeColors) -> some View { self.background(theme.background.ignoresSafeArea()).toolbarBackground(theme.background, for: .navigationBar).toolbarBackground(.visible, for: .navigationBar) }
+    func appBackground(_ theme: ThemeColors, pageOwnsBarBackground: Bool = false) -> some View {
+        background(theme.background.ignoresSafeArea())
+            .toolbarBackground(theme.background, for: .navigationBar)
+            .toolbarBackground(pageOwnsBarBackground ? .hidden : .visible, for: .navigationBar)
+    }
     /// Pages pushed from 我的 (settings, account) cover the tab bar, like Android's full-screen settings.
     func secondaryPage() -> some View {
         background(NavigationTabBar(hidden: true)).background(InteractiveBackSwipe(enabled: true))

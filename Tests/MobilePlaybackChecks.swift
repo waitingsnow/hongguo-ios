@@ -27,6 +27,38 @@ func checkMobilePlayback(context: JSContext, root: URL) async throws {
     precondition(signed.headers["x-khronos"] == "1800000000" && signed.headers["x-medusa"] != nil && signed.headers["x-helios"] != nil)
     precondition(signed.headers["x-ss-stub"] == HGCrypto.md5(body).hexString.uppercased())
     precondition(signed.headers["Cookie"] == nil && signed.headers["x-argus"] == nil && signed.headers["x-ladon"] == nil)
+    let tabSigned = try await signer.signedPlaybackGetV5(baseURL: "https://example.test/tab",
+        query: try DramaAPI.videoTabV5Query(identity, episodeID: "1234"), device: device,
+        now: 1_800_000_000_000)
+    let tabValues = URLComponents(url: tabSigned.url, resolvingAgainstBaseURL: false)!.queryItems!
+    precondition(tabValues.first { $0.name == "video_id" }?.value == "1234")
+    precondition(tabValues.first { $0.name == "aid" }?.value == "8662" && tabValues.first { $0.name == "version_name" }?.value == "7.4.3.32")
+    precondition(tabValues.first { $0.name == "device_level" }?.value == "1" && tabValues.first { $0.name == "from_video_id" }?.value == "")
+    precondition(tabValues.first { $0.name == "ts" } == nil)
+    precondition(tabSigned.headers["x-khronos"] == "1800000000" && tabSigned.headers["x-medusa"] != nil && tabSigned.headers["x-helios"] != nil)
+    precondition(tabSigned.headers["x-ss-stub"] == nil, "Bodyless GET must not carry x-ss-stub")
+    precondition(tabSigned.headers["Cookie"] == nil && tabSigned.headers["x-argus"] == nil && tabSigned.headers["x-ladon"] == nil)
+    // 2026-11-24 (hongguo-android c0821c6): the official 28-item device context must be in the signed query.
+    for name in ["resolution", "dpi", "os_api", "rom_version", "host_abi", "dragon_device_type", "compliance_status",
+                 "player_so_load", "is_android_pad_screen", "manifest_version_code", "device_brand", "os", "ssmix", "ac"] {
+        precondition(tabValues.contains { $0.name == name }, "Missing device context field \(name)")
+    }
+    precondition(tabValues.first { $0.name == "resolution" }?.value == "1920*1080" && tabValues.first { $0.name == "device_brand" }?.value == "HONOR")
+    precondition(tabValues.first { $0.name == "klink_egdi" } == nil, "No klink_egdi must be written when registration did not send one")
+    let activated = RegisteredIdentity(deviceID: identity.deviceID, installID: identity.installID, cdid: identity.cdid,
+                                       appDeviceCookie: identity.appDeviceCookie, egdi: "opaque-token")
+    let activatedQuery = try DramaAPI.videoTabV5Query(activated, episodeID: "1234")
+    precondition(activatedQuery.first { $0[0] == "klink_egdi" }?[1] == "opaque-token", "klink_egdi must ride the signed query when present")
+    // Compare like with like: tabValues is read back from the signed URL and carries the signer's _rticket.
+    let plainQuery = try DramaAPI.videoTabV5Query(identity, episodeID: "1234")
+    precondition(plainQuery.count == 38 && activatedQuery.count == 39, "29 device fields + 9 tab fields (+ klink_egdi)")
+    precondition(Set(activatedQuery.map { $0[0] }) == Set(plainQuery.map { $0[0] }).union(["klink_egdi"]))
+    // The medusa envelope's device profile carries device_brand so the signer can fill the 38-field deviceInfo.
+    precondition(device["device_brand"] == "HONOR" && device["channel"] == "vivo_8662_64")
+    precondition(PlaybackRegistration.responseEgdi(["klink_egdi": " abc "]) == "abc")
+    precondition(PlaybackRegistration.responseEgdi(["data": ["klink_egdi": "nested"]]) == "nested")
+    precondition(PlaybackRegistration.responseEgdi(["klink_egdi": "", "data": ["klink_egdi": "later"]]) == "later")
+    precondition(PlaybackRegistration.responseEgdi(["device_id": 1]).isEmpty && PlaybackRegistration.responseEgdi(["klink_egdi": 42]).isEmpty)
     let model: [String: Any] = ["video_list":[["main_url":"https://example.test/video", "codec_type":"h264"]]]
     for entries: [String: Any] in [["1234":["video_model":model]], ["1004":["1234":["video_model":model]]]] {
         let bytes = try ProtocolJSON.data(["code":0,"data":entries])
@@ -38,7 +70,7 @@ func checkMobilePlayback(context: JSContext, root: URL) async throws {
     catch is DramaAPI.PlaybackRefusal { }
     do { _ = try DramaAPI.mobileVideoModel(Data(repeating: 0, count: 2 * 1024 * 1024 + 1), episodeID: "1234"); preconditionFailure("Oversized model accepted") }
     catch is HGError { }
-    print("PASS mobile v5: 32 independent digest vectors, 4 carriers, exact gzip/identity binding, both model maps, refusal and size limits")
+    print("PASS mobile v5: 32 independent digest vectors, 4 carriers, exact gzip/identity binding, both model maps, refusal and size limits; bodyless video_tab GET carries only khronos/helios/medusa with the 7.4.3.32 tab query, the full official device context and klink_egdi when registered")
 }
 
 private func checkPlaybackHTTPResponses() async throws {
@@ -63,20 +95,25 @@ private func checkPlaybackHTTPResponses() async throws {
     }
 
     func expectTransportFailure(_ attempt: URLRequest, playback: Bool, code: URLError.Code,
-                                expectedCalls: Int, delay: UInt64 = 0, retryDeadline: TimeInterval = .infinity) async throws {
+                                expectedCalls: Int, delay: UInt64 = 0, retryDeadline: TimeInterval? = nil,
+                                expectedCode: URLError.Code? = nil) async throws {
         var calls = 0
         do {
-            _ = try await DramaAPI.responseData(for: attempt, playback: playback, retryDeadline: retryDeadline) { _ in
-                calls += 1
-                if delay > 0 { try await Task.sleep(nanoseconds: delay) }
-                throw URLError(code)
+            _ = try await DramaAPI.$playbackDeadline.withValue(retryDeadline) {
+                try await DramaAPI.responseData(for: attempt, playback: playback) { _ in
+                    calls += 1
+                    if delay > 0 { try await Task.sleep(nanoseconds: delay) }
+                    throw URLError(code)
+                }
             }
             preconditionFailure("Transport failure accepted")
-        } catch let error as URLError { precondition(error.code == code && calls == expectedCalls) }
+        } catch is CancellationError { precondition(code == .cancelled && calls == expectedCalls) }
+        catch let error as URLError { precondition(error.code == (expectedCode ?? code) && calls == expectedCalls) }
     }
     try await expectTransportFailure(request, playback: true, code: .cannotConnectToHost, expectedCalls: 2)
     try await expectTransportFailure(request, playback: true, code: .cannotDecodeRawData, expectedCalls: 1)
     try await expectTransportFailure(request, playback: true, code: .cancelled, expectedCalls: 1)
+    try await expectTransportFailure(request, playback: true, code: .timedOut, expectedCalls: 1)
     try await expectTransportFailure(request, playback: false, code: .networkConnectionLost, expectedCalls: 1)
     var post = request
     post.httpMethod = "POST"
@@ -85,10 +122,31 @@ private func checkPlaybackHTTPResponses() async throws {
     var expiring = request
     expiring.timeoutInterval = 0.001
     try await expectTransportFailure(expiring, playback: true, code: .cannotConnectToHost,
-                                     expectedCalls: 1, delay: 10_000_000)
+                                     expectedCalls: 1, delay: 10_000_000, expectedCode: .timedOut)
     // The episode lookup can run out of time while the individual GET still has most of its second left.
     try await expectTransportFailure(request, playback: true, code: .cannotConnectToHost, expectedCalls: 1,
-                                     delay: 10_000_000, retryDeadline: ProcessInfo.processInfo.systemUptime + 0.001)
+                                     delay: 10_000_000, retryDeadline: ProcessInfo.processInfo.systemUptime + 0.001,
+                                     expectedCode: .timedOut)
+
+    for initial in [request, post] {
+        _ = try await DramaAPI.withPlaybackBudget(0.25) {
+            try await DramaAPI.responseData(for: initial, playback: true) { attempt in
+                precondition(attempt.timeoutInterval > 0 && attempt.timeoutInterval <= 0.25)
+                return (payload, ok)
+            }
+        }
+        try await expectTransportFailure(initial, playback: true, code: .timedOut, expectedCalls: 0,
+                                         retryDeadline: ProcessInfo.processInfo.systemUptime - 1)
+    }
+    // The request can stay active longer than its timeout interval when data arrives in small chunks.
+    do {
+        try await DramaAPI.withPlaybackBudget(0.03) {
+            do { try await Task.sleep(for: .seconds(2)) }
+            catch { precondition(Task.isCancelled); throw error }
+            preconditionFailure("The active request outlived the episode deadline")
+        } as Void
+        preconditionFailure("A late response was accepted")
+    } catch let error as URLError { precondition(error.code == .timedOut) }
 
     let cancelled = Task {
         var calls = 0
@@ -104,11 +162,11 @@ private func checkPlaybackHTTPResponses() async throws {
     try await cancelled.value
 
     for (status, headers) in [(200, ["Retry-After": "5"]), (503, ["Retry-After": "5"]),
-                              (403, [:]), (429, [:])] {
+                              (502, ["Retry-After": "5"]), (401, [:]), (403, [:]), (429, [:])] {
         let reply = HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: headers)!
         var calls = 0
         do {
-            _ = try await DramaAPI.responseData(for: request, playback: true) { _ in calls += 1; return (Data(), reply) }
+            _ = try await DramaAPI.responseData(for: request, playback: true) { _ in calls += 1; return (payload, reply) }
             preconditionFailure("Server backoff or refusal accepted")
         } catch is DramaAPI.PlaybackRefusal { precondition(calls == 1) }
     }

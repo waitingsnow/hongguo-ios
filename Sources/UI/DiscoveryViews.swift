@@ -524,7 +524,8 @@ private struct ImmersivePage: View {
                     let actions = dockInteractions ? AnyLayout(HStackLayout(spacing: spacing)) : AnyLayout(VStackLayout(spacing: spacing))
                     actions {
                         favoriteButton
-                        if activeDetail != nil { DiscussionControls(vertical: !dockInteractions, spacing: spacing, showComments: openComments) }
+                        DiscussionControls(showComments: openComments)
+                            .disabled(activeDetail == nil)
                     }.shadow(color: .black.opacity(0.8), radius: 2, y: 1)
                 }
                 episodeStrip

@@ -135,7 +135,7 @@ final class PlaybackLookahead {
         if let known = target.detail { detail = known } else { detail = try await DramaDetails.load(target.drama) }
         try Task.checkCancellation()
         guard detail.episodes.indices.contains(target.index) else { throw HGError.message("这部剧暂时没有可播放剧集") }
-        let stream = try await EpisodeStream.open(episodeID: detail.episodes[target.index].id, quality: target.quality)
+        let stream = try await EpisodeStream.open(episodeID: detail.episodes[target.index].id, seriesID: detail.drama.id, quality: target.quality)
         return OpenEpisode(detail: detail, stream: stream)
     }
 

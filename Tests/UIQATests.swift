@@ -9,6 +9,106 @@ final class HongguoQATests: XCTestCase {
         return application
     }
 
+    func testReportedEpisodePlaybackAdvances() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["HONGGUO_QA_MODE"] == "--live")
+        continueAfterFailure = false
+        let app = testApplication()
+        app.launchArguments = ["-theme", "immersive", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO", "-autoNext", "NO"]
+        app.launch()
+        let search = ProcessInfo.processInfo.environment["HONGGUO_QA_EPISODE_SEARCH"] ?? "我合成了全世界"
+        openFirstEpisode(in: app, search: search)
+        assertPlayback("播放中", in: app, timeout: 90)
+        try assertProgressAdvances(in: app, minimumSeconds: 12)
+        capture("reported-episode-playing")
+    }
+
+    func testDeathWandererEpisodeSwitching() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["HONGGUO_QA_MODE"] == "--live")
+        continueAfterFailure = false
+        let app = testApplication()
+        app.launchArguments = ["-theme", "immersive", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO", "-autoNext", "NO"]
+        app.launch()
+        openDeathWandererPlayer(in: app)
+        for episode in [2, 3] {
+            app.buttons["player.episodes"].tap()
+            app.buttons["\(episode)"].firstMatch.tap()
+            assertEpisode(episode, in: app)
+            assertPlayback("播放中", in: app, timeout: 90)
+            try assertProgressAdvances(in: app)
+            capture("death-wanderer-playing-\(episode)")
+        }
+    }
+
+    private func assertProgressAdvances(in app: XCUIApplication, minimumSeconds: Int = 2) throws {
+        let elapsed = app.staticTexts["player.elapsed"]
+        func elapsedSeconds() -> Int? {
+            let parts = elapsed.label.split(separator: ":").compactMap { Int($0) }
+            guard parts.count >= 2 else { return nil }
+            return parts.reduce(0) { $0 * 60 + $1 }
+        }
+        XCTAssertTrue(app.sliders["播放进度"].wait(for: \.isEnabled, toEqual: true, timeout: 15))
+        let initial = try XCTUnwrap(elapsedSeconds())
+        let advances = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            elapsedSeconds().map { $0 >= initial + minimumSeconds } == true
+        }, object: nil)
+        let result = XCTWaiter.wait(for: [advances], timeout: 20)
+        if result != .completed { capture("stalled-episode") }
+        XCTAssertEqual(result, .completed, "Elapsed time started at \(initial)s and ended at \(elapsed.label)")
+    }
+
+    func testDeathWanderer417ContinuesInto418() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["HONGGUO_QA_MODE"] == "--live")
+        continueAfterFailure = false
+        let app = testApplication()
+        app.launchArguments = ["-theme", "immersive", "-hasChosenTheme", "YES", "-updates.checkOnLaunch", "NO", "-autoNext", "YES", "-speed", "1"]
+        app.launch()
+        openDeathWandererPlayer(in: app)
+        app.buttons["player.episodes"].tap()
+        let grid = app.scrollViews["player.episodeGrid"]
+        XCTAssertTrue(grid.waitForExistence(timeout: 5))
+        let target = app.buttons["417"].firstMatch
+        for _ in 0..<50 {
+            if target.isHittable { break }
+            if grid.buttons.allElementsBoundByIndex.first(where: \.isHittable).flatMap({ Int($0.label) }) ?? 0 > 417 {
+                grid.swipeDown(velocity: .slow)
+            } else {
+                grid.swipeUp()
+            }
+        }
+        XCTAssertTrue(target.isHittable)
+        target.tap()
+        assertEpisode(417, in: app)
+        let video = app.buttons["视频画面"]
+        let retry = app.buttons["重试"]
+        let started = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            (video.value as? String) == "播放中" || retry.exists
+        }, object: nil)
+        let result = XCTWaiter.wait(for: [started], timeout: 90)
+        guard result == .completed, !retry.exists else {
+            capture("death-wanderer-417-start-failure")
+            return XCTFail("第 417 集未起播，重试按钮可见：\(retry.exists)")
+        }
+        let elapsed = app.staticTexts["player.elapsed"]
+        let title = app.buttons["player.dramaTitle"]
+        let start = try XCTUnwrap(elapsed.label.split(separator: ":").last.flatMap { Int($0) })
+        XCTAssertTrue(elapsed.label.hasPrefix("00:") || elapsed.label.hasPrefix("0:"))
+        XCTAssertLessThanOrEqual(start, 3)
+        capture("death-wanderer-417-start")
+        for checkpoint in [15, 35, 55] {
+            let reached = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                guard title.label.hasSuffix("，第 417 集"), (video.value as? String) == "播放中" else { return false }
+                let parts = elapsed.label.split(separator: ":").compactMap { Int($0) }
+                return parts.count == 2 && parts[0] == 0 && parts[1] >= checkpoint
+            }, object: nil)
+            XCTAssertEqual(XCTWaiter.wait(for: [reached], timeout: 40), .completed, "第 417 集未播放到 \(checkpoint) 秒")
+        }
+        capture("death-wanderer-417-near-end")
+        assertEpisode(418, in: app)
+        assertPlayback("播放中", in: app)
+        try assertProgressAdvances(in: app, minimumSeconds: 5)
+        capture("death-wanderer-418-playing")
+    }
+
     /// Explicit anonymous real playback; run only on a task simulator.
     func testV5PlaybackAndEpisodeSwitching() throws {
         continueAfterFailure = false
@@ -106,8 +206,8 @@ final class HongguoQATests: XCTestCase {
         let comments = app.buttons["discussion.comments"].firstMatch
         XCTAssertTrue(comments.waitForExistence(timeout: 45))
         if comments.frame.midY > favorite.frame.maxY {
-            XCTAssertGreaterThanOrEqual(danmaku.frame.minY - favorite.frame.maxY, 15)
-            XCTAssertGreaterThanOrEqual(comments.frame.minY - danmaku.frame.maxY, 15)
+            XCTAssertEqual(danmaku.frame.minY, favorite.frame.maxY, accuracy: 1)
+            XCTAssertEqual(comments.frame.minY, danmaku.frame.maxY, accuracy: 1)
         } else {
             XCTAssertGreaterThanOrEqual(danmaku.frame.minX - favorite.frame.maxX, 7)
             XCTAssertGreaterThanOrEqual(comments.frame.minX - danmaku.frame.maxX, 7)
@@ -325,6 +425,26 @@ final class HongguoQATests: XCTestCase {
         XCTAssertTrue(settings.wait(for: \.isHittable, toEqual: true, timeout: 5))
         XCTAssertFalse(settingsBar.exists)
         XCTAssertTrue(myTab.wait(for: \.isHittable, toEqual: true, timeout: 5))
+    }
+
+    func testPlayerReturnsToLightDetailWithoutWaitingForVideo() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["HONGGUO_QA_MODE"] == "--live")
+        continueAfterFailure = false
+        let app = testApplication()
+        app.launchArguments = ["-theme", "warm", "-home.feedMode", "NO", "-hasChosenTheme", "YES", "-autoNext", "NO"]
+        app.launch()
+        let drama = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "home.featured.")).firstMatch
+        XCTAssertTrue(drama.wait(for: \.isHittable, toEqual: true, timeout: 45))
+        drama.tap()
+        openFirstEpisodeFromDetail(in: app)
+        let close = app.buttons["player.close"]
+        let edge = app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5))
+        let partial = app.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.5))
+        edge.press(forDuration: 0, thenDragTo: partial, withVelocity: .slow, thenHoldForDuration: 1.5)
+        XCTAssertTrue(close.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        swipeRight(in: app, from: 0)
+        XCTAssertTrue(app.navigationBars["剧集详情"].buttons.firstMatch.wait(for: \.isHittable, toEqual: true, timeout: 5))
+        XCTAssertFalse(close.isHittable)
     }
 
     func testPlayerNavigationPushCancelAndRestore() throws {
@@ -1259,7 +1379,20 @@ final class HongguoQATests: XCTestCase {
         }
     }
 
+    private func openDeathWandererPlayer(in app: XCUIApplication) {
+        searchAndOpenDetail(in: app, search: "死亡游神")
+        let resume = app.buttons["detail.playSelected"]
+        XCTAssertTrue(resume.wait(for: \.isHittable, toEqual: true, timeout: 20))
+        resume.tap()
+        XCTAssertTrue(app.buttons["player.episodes"].waitForExistence(timeout: 15))
+    }
+
     private func openFirstEpisode(in app: XCUIApplication, search: String) {
+        searchAndOpenDetail(in: app, search: search)
+        openFirstEpisodeFromDetail(in: app)
+    }
+
+    private func searchAndOpenDetail(in app: XCUIApplication, search: String) {
         let discover = app.tabBars.buttons["剧场"]
         XCTAssertTrue(discover.waitForExistence(timeout: 25)); discover.tap()
         let searchButton = app.buttons["搜索短剧"]
@@ -1270,7 +1403,6 @@ final class HongguoQATests: XCTestCase {
         let result = app.buttons.matching(NSPredicate(format: "label CONTAINS %@ AND label CONTAINS %@", search, "查看选集")).firstMatch
         XCTAssertTrue(result.waitForExistence(timeout: 40), "Missing live catalogue sample \(search)")
         result.tap()
-        openFirstEpisodeFromDetail(in: app)
     }
 
     private func openFirstEpisodeFromDetail(in app: XCUIApplication) {

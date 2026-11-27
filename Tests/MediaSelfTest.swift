@@ -18,10 +18,49 @@ func nodes(_ d: Data, _ start: Int, _ end: Int) -> [Node] {
 func child(_ d: Data, _ n: Node, _ type: String, skip: Int = 0) -> Node { nodes(d,n.payload + skip,n.end).first { $0.type == type }! }
 
 @main struct Main {
+    private static func durationChecks(in directory: URL) throws {
+        let url = directory.appendingPathComponent("duration.mp4")
+        func writeMovieHeader(_ payload: Data) throws {
+            let movie = box("moov", box("mvhd", payload) + box("trak", Data()))
+            try (box("ftyp", Data("isom".utf8)) + movie + box("mdat", Data([0]))).write(to: url)
+        }
+
+        let timestamps32 = Data(repeating: 0, count: 12)
+        try writeMovieHeader(timestamps32 + be32(1_000) + be32(125_140))
+        try MP4Processor.validate(url: url, expectedDuration: .declared(125))
+        try MP4Processor.validate(url: url, expectedDuration: .unlisted)
+        do {
+            try MP4Processor.validate(url: url, expectedDuration: .declared(10))
+            fatalError("A different episode duration was accepted")
+        } catch MediaError.durationMismatch {}
+        for previewTicks in [10_000, 10_140, 11_000] {
+            try writeMovieHeader(timestamps32 + be32(1_000) + be32(previewTicks))
+            try MP4Processor.validate(url: url)
+            do {
+                try MP4Processor.validate(url: url, expectedDuration: .unlisted)
+                fatalError("A preview was accepted when the episode page omitted its length")
+            } catch MediaError.durationMismatch {}
+        }
+
+        let ticks = 12_514_000_000
+        let timestamps64 = Data([1]) + Data(repeating: 0, count: 19)
+        try writeMovieHeader(timestamps64 + be32(100_000_000) + be32(ticks >> 32) + be32(ticks))
+        try MP4Processor.validate(url: url, expectedDuration: .declared(125))
+        for invalid in [Data([1]), timestamps64 + be32(0) + be32(0) + be32(10),
+                        timestamps32 + be32(1_000) + be32(Int(UInt32.max))] {
+            try writeMovieHeader(invalid)
+            do {
+                try MP4Processor.validate(url: url, expectedDuration: .declared(125))
+                fatalError("An invalid movie duration was accepted")
+            } catch MediaError.invalidMedia {}
+        }
+    }
+
     static func main() async throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent("hongguo-media-test-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: base) }
+        try durationChecks(in: base)
         let origin = base.appendingPathComponent("original.mp4")
         try? FileManager.default.removeItem(at:origin)
         let writer = try AVAssetWriter(url:origin,fileType:.mp4)
@@ -87,7 +126,13 @@ func child(_ d: Data, _ n: Node, _ type: String, skip: Int = 0) -> Node { nodes(
         do {try MP4Processor.validate(url:sencOnly,requirePlain:true);fatalError("senc on a clear track accepted as plain")} catch MediaError.invalidMedia {}
         let spade=Data(hex:"93bc1df253ba1bf7618b19c448b806f64d810afc45b715fe5eb925f26cbf12f541ba098282")!.base64EncodedString()
         let decodedKey = try SpadeKey.decode(spade); precondition(decodedKey == key)
-        try MP4Processor.decrypt(url:output,spade:spade,progress:{_,_ in})
+        do {
+            try MP4Processor.decrypt(url: output, spade: spade, expectedDuration: .declared(125), progress: { _, _ in })
+            fatalError("An encrypted preview passed duration validation")
+        } catch MediaError.durationMismatch {}
+        let rejected = try Data(contentsOf: output)
+        precondition(rejected == encrypted, "Duration rejection changed encrypted media")
+        try MP4Processor.decrypt(url: output, spade: spade, expectedDuration: .declared(2), progress: { _, _ in })
         try MP4Processor.decrypt(url:out8,spade:spade,progress:{_,_ in})
         let clear8=try Data(contentsOf:out8)
         for i in 0..<count {precondition(clear8.subdata(in:offsets[i]..<(offsets[i]+sizes[i]))==original.subdata(in:offsets[i]..<(offsets[i]+sizes[i])))}
@@ -107,6 +152,6 @@ func child(_ d: Data, _ n: Node, _ type: String, skip: Int = 0) -> Node { nodes(
         precondition(reader.status == .completed && frames==40)
         let truth=[("93bc1df253ba1bf7618b19c448b806f64d810afc45b715fe5eb925f26cbf12f541ba098282","287216bfa89e662a0f748120c305e199"),("a1bc2ff164b91df04dbf00f17dba00f47cbb35c27b922aec67a628eb52972fdc7ea036a7a7","d742b28967e4e6c92b699f4375add27f"),("9cbc12fb588721cd69b739f977b70be7429c08e074990ec847843dcc738638cf76b33ebcbc","113fb30d9767d80e3edbb905b052204f"),("a3bc2df760ba2bc27b8b34c04a8907f557be19f249be35c748ba03f64fbc1ff161ba29a2a2","b5674a8384f25d757585dadf343274d5"),("9cbc12f45aba11f76fb814f444bd15f459b225cb5e8c15dd459a0fd170ac0ad358aa108b8b","121846f9d5829130ebc0397023feaf8c")]
         for (cipher,key) in truth { let actual = try SpadeKey.decode(Data(hex:cipher)!.base64EncodedString()); precondition(actual == Data(hex:key)!) }
-        print("PASS: 5 Android Spade truth vectors; 40 real H.264 frames CENC encrypted, decrypted, byte matched, and decoded through AVFoundation; tail moov same offsets; 8/16-byte IVs; truncation/cancellation rejection; isPlayable.")
+        print("PASS: MP4 duration checks; 5 Android Spade truth vectors; 40 real H.264 frames CENC encrypted, decrypted, byte matched, and decoded through AVFoundation; tail moov same offsets; 8/16-byte IVs; truncation/cancellation rejection; isPlayable.")
     }
 }

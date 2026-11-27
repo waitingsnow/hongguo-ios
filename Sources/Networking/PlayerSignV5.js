@@ -41,12 +41,30 @@ function heliosV5(khronos) {
 }
 
 
+// medusa 信封按官方 v04.10.03 形态补全（2026-11-24，同步自 hongguo-android c0821c6）。
+// 此前 deviceInfo 只有 16 个字段、env 只有 4 个字段、flags 全零、缺 f16 secToken；
+// 上游把这种「设备画像不完整」的信封当作低质量设备，回 HTTP 200 + 0 字节。
+// 官方形态：38 个 deviceInfo 字段（含进程启动/当前时间戳、机型与品牌重复分量、6 个 0 值 float）
+// + 9 个 env 字段 + f16 设备令牌 + f15 嵌套常量。
+function secDeviceToken() {
+    // 25 字符设备令牌：前缀 A + 24 字符进程 nonce（18 随机字节的 base64url 恰为 24 字符）。
+    const nonce=String(PROCESS_NONCE);
+    return 'A'+(nonce.length>=24?nonce.slice(0,24):nonce.padEnd(24,'A'));
+}
 function medusaV5(url, body, ts, who) {
     const query=sm3(url.split('?')[1]), f13=hashF13V5(query,crypto.createHash('md5').update(body).digest(),le32(ts),ts);
-    const flags=Buffer.alloc(8), magic=Buffer.from('2d4b4fca49750d433fb5ae2c226dcc56','hex');
-    const info=proto([[1,1,'sint'],[2,2,'sint'],[3,'8662'],[4,who.device_id],[5,PROCESS_NONCE],[6,'!noperm!'],[12,'Asia/Shanghai,8'],[13,'zh_CN'],[22,who.os_version],[25,PROCESS_STARTED,'sint'],[30,who.device_type],[31,'HONOR'],[32,who.device_type],[34,'HONOR']]);
-    const env=proto([[6,'v04.10.03.04-bugfix'],[8,who.channel],[12,info,'message'],[14,who.version_name]]);
-    const message=proto([[1,magic,'bytes'],[2,5,'sint'],[3,Math.floor(Math.random()*0x100000000),'sint'],[4,'8662'],[5,who.device_id],[6,'646637794'],[7,who.version_name],[8,'v04.10.03-ml-android'],[9,0x040a0300,'sint'],[10,flags,'bytes'],[12,ts,'sint'],[13,f13,'bytes'],[14,query.subarray(0,6),'bytes'],[15,proto([[1,1,'sint'],[2,1,'sint'],[3,1,'sint'],[5,1,'sint']]),'message'],[17,ts,'sint'],[20,'none'],[21,377,'sint'],[23,env,'message'],[24,'{"cmr":16777216,"cmr2":16777216,"un_h":11,"vpn":0,"kd":0,"dyn":"","do":1,"tk":true}']]);
+    const flags=Buffer.from('4480000000000000','hex'), magic=Buffer.from('2d4b4fca49750d433fb5ae2c226dcc56','hex');
+    const secToken=secDeviceToken(), brand=(who.device_brand||'').trim()||'HONOR', devType=who.device_type||'PGT-AN10';
+    const info=proto([[1,1,'sint'],[2,2,'sint'],[3,'8662'],[4,who.device_id],[5,secToken],[6,'!noperm!'],
+        [7,-888888,'sint'],[8,-888888,'sint'],[9,3,'sint'],[10,-888888,'sint'],[11,'!notset!'],[12,'Asia/Shanghai,8'],[13,'zh_CN'],[14,4,'sint'],
+        [16,0,'float'],[17,0,'float'],[18,0,'float'],[19,0,'float'],[20,0,'float'],[21,0,'float'],
+        [22,who.os_version],[23,41,'sint'],[24,36,'sint'],[25,PROCESS_STARTED,'sint'],[26,PROCESS_STARTED,'sint'],[27,PROCESS_STARTED,'sint'],[28,Date.now(),'sint'],
+        [29,-1,'sint'],[30,devType],[31,brand],[32,devType],[33,devType],[34,brand],[35,brand],[36,brand],[38,31,'sint']]);
+    const envLaunch=Math.floor(Math.random()*21)+100, envPid=Math.floor(Math.random()*2000)+10001;
+    const env=proto([[1,envLaunch,'sint'],[2,247235599,'sint'],[3,247235596,'sint'],[5,7,'sint'],[6,'v04.10.03.04-bugfix'],[7,envPid,'sint'],[8,who.channel],
+        [12,info,'message'],[13,proto([[1,ts,'sint'],[2,-2,'sint'],[4,200,'sint']]),'message'],[14,who.version_name]]);
+    const message=proto([[1,magic,'bytes'],[2,5,'sint'],[3,Math.floor(Math.random()*0x100000000),'sint'],[4,'8662'],[5,who.device_id],[6,'646637794'],[7,who.version_name],[8,'v04.10.03-ml-android'],[9,0x040a0300,'sint'],[10,flags,'bytes'],[12,ts,'sint'],[13,f13,'bytes'],[14,query.subarray(0,6),'bytes'],
+        [15,proto([[1,305,'sint'],[2,4,'sint'],[3,694367,'sint'],[5,1621072674,'sint']]),'message'],[16,secToken],[17,ts,'sint'],[20,'none'],[21,312,'sint'],[23,env,'message'],[24,'{"cmr":16777216,"cmr2":16777216,"un_h":11,"vpn":0,"kd":0,"dyn":"","do":1,"tk":true}']]);
     const nonce=Math.floor(Math.random()*0x100000000), key=Buffer.from('b23c2a470a20d105dc3f8c4438f8272ed46d6c89ffdcdedd5108698d26e9489d','hex');
     const [hash,seed]=keyHash(key,nonce), transformed=Buffer.concat([flags,xmxor(message,hash)]).reverse();
     for(let i=0;i<transformed.length;i++)transformed[i]^=seed[(~i)&3];
@@ -55,6 +73,23 @@ function medusaV5(url, body, ts, who) {
     const encrypted=new AesV5(crypto.createHash('md5').update(key.subarray(0,16)).digest(),ts).encrypt(packed,crypto.createHash('md5').update(key.subarray(16)).digest());
     const prefix=Buffer.concat([le32(5),magic]);for(let i=0;i<prefix.length;i++)prefix[i]^=le32(ts)[i&3];
     return Buffer.concat([prefix,Buffer.from([nonce&255,(nonce>>>8)&255,0,1]),encrypted]).toString('base64');
+}
+// v5 无正文 GET 签名（video_tab 用；2026-11-20 起唯一可用的取源路径，同步自
+// jackotom/hongguo-drama 7.7 / OOIUa/hongguo-android PR #12，GPL-3.0-only）。
+// 与带正文的 v5 POST 相比：正文摘要按**空 body 的 MD5** 计算，且只返回
+// x-khronos / x-helios / x-medusa 三个头，调用方不得附带 Content-Type /
+// Content-Encoding / x-ss-stub。
+function hgSignedPlaybackGetV5(base,pairsJSON,deviceJSON,now) {
+    const pairs=JSON.parse(pairsJSON).filter(p=>p[0]!=='_rticket'), device=JSON.parse(deviceJSON);
+    const ts=Math.floor(now/1000), body=Buffer.alloc(0), bodyHash=crypto.createHash('md5').update(body).digest();
+    const encode=s=>encodeURIComponent(String(s)).replace(/[!'()]/g,c=>'%'+c.charCodeAt(0).toString(16).toUpperCase());
+    for(let offset=0;offset<1024;offset++) {
+        const query=pairs.concat([['_rticket',String(now+offset)]]).map(p=>encode(p[0])+'='+encode(p[1])).join('&');
+        if((getIv(getIv(getIv(0x20230928,sm3(query)),bodyHash),le32(ts))&15)!==12)continue;
+        const url=base+'?'+query;
+        return JSON.stringify({url,headers:{'x-khronos':String(ts),'x-helios':heliosV5(ts),'x-medusa':medusaV5(url,body,ts,device)}});
+    }
+    throw new Error('v5 signature unavailable');
 }
 function hgSignedPlaybackV5(base,pairsJSON,bodyBase64,deviceJSON,now) {
     const pairs=JSON.parse(pairsJSON).filter(p=>p[0]!=='_rticket'), device=JSON.parse(deviceJSON), body=Buffer.from(bodyBase64,'base64');

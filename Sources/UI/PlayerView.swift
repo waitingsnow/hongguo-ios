@@ -787,12 +787,12 @@ struct PlayerScreen: View {
     }
 
     private func sideActions(horizontal: Bool) -> some View {
-        let layout = horizontal ? AnyLayout(HStackLayout(spacing: 8)) : AnyLayout(VStackLayout(spacing: 4))
+        let layout = horizontal ? AnyLayout(HStackLayout(spacing: 8)) : AnyLayout(VStackLayout(spacing: PlaybackPictureLayout.Context.player.interactionSpacing))
         return layout {
             FollowDramaButton(seriesID: session.detail.drama.id, selected: library.isFavorite(session.detail.drama)) {
                 library.toggleFavorite(session.detail.drama)
             }.accessibilityIdentifier("player.favorite")
-            DiscussionControls(vertical: !horizontal) { commentsVisible = true }
+            DiscussionControls { commentsVisible = true }
         }.buttonStyle(.plain).shadow(color: .black.opacity(0.8), radius: 2, y: 1)
     }
 
@@ -811,7 +811,11 @@ struct PlayerScreen: View {
     }
 
     private func errorPanel(_ message: String) -> some View {
-        VStack(spacing: 16) { Image(systemName: "exclamationmark.circle").font(.largeTitle); Text(message).font(.subheadline).multilineTextAlignment(.center).lineLimit(5); HStack(spacing: 15) { Button("重试", action: session.retry).buttonStyle(.borderedProminent).tint(Color(hex: 0xC94426)); Button("选择其他集") { episodesVisible = true }.buttonStyle(.bordered) } }.padding(25).background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 20))
+        VStack(spacing: 16) {
+            Image(systemName: "exclamationmark.circle").font(.largeTitle)
+            Text(message).font(.subheadline).multilineTextAlignment(.center).lineLimit(5)
+            Button("重试", action: session.retry).buttonStyle(.borderedProminent).tint(Color(hex: 0xC94426))
+        }.padding(25).background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 20))
     }
 
     private func bottomBar(compact: Bool, dockInteractions: Bool) -> some View {
@@ -833,6 +837,7 @@ struct PlayerScreen: View {
             }
             HStack(spacing: 10) {
                 Text(timeLabel(session.scrubbing ? session.previewPosition : session.position)).font(.caption.monospacedDigit()).frame(minWidth: 36)
+                    .accessibilityIdentifier("player.elapsed")
                 Slider(value: Binding(get: { session.scrubbing ? session.previewPosition : session.position }, set: { session.previewPosition = $0 }), in: 0...max(session.duration, 1), onEditingChanged: session.setSeeking).tint(session.app.appearance.accent).disabled(session.duration <= 0).accessibilityLabel("播放进度")
                 Text(timeLabel(session.duration)).font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.6)).frame(minWidth: 36)
             }

@@ -3,6 +3,20 @@ import Foundation
 import os
 @testable import Hongguo
 
+private final class FailingQueuePlayer: AVQueuePlayer {
+    private let simulatedFailure = OSAllocatedUnfairLock(initialState: false)
+
+    override var status: AVPlayer.Status {
+        simulatedFailure.withLock { $0 } ? .failed : super.status
+    }
+
+    func signalFailure() {
+        willChangeValue(forKey: "status")
+        simulatedFailure.withLock { $0 = true }
+        didChangeValue(forKey: "status")
+    }
+}
+
 @main @MainActor
 struct PlaybackContinuityProbe {
     struct Failure: Error { let message: String }
@@ -304,6 +318,42 @@ struct PlaybackContinuityProbe {
                     && manualPlayer.actionAtItemEnd == .pause, "immediate timer left pending playback")
         manual.stop()
         try require(manualPlayer.items().isEmpty, "stopping the session left items attached")
+        var attempts: [Int: Int] = [:]
+        let switchingQueue = PlaybackLookahead { target in
+            attempts[target.index, default: 0] += 1
+            if target.index == 1 && attempts[1] == 1 { throw CancellationError() }
+            if target.index == 2 { throw PublicEpisodeSource.Failure.unavailable }
+            return try await queue.claim(target).value
+        }
+        let switchingRequest = PlaybackRequest(detail: detail, index: 1, position: 0, recordsLocalHistory: false,
+                                               handoff: FeedHandoff(lookahead: switchingQueue, live: nil, speedLocked: false))
+        let switching = PlayerSession(request: switchingRequest, app: app)
+        switching.start()
+        try await eventually("cancelled episode request left the current selection loading") { switching.rendered }
+        try require(attempts[1] == 2, "cancelled child request did not recover exactly once")
+        switching.go(to: 2)
+        try await eventually("unavailable episode stayed in preparation") { switching.error != nil }
+        switching.stop()
+        let recoveryEpisode = try await queue.claim(targets[1]).value
+        let failingPlayer = FailingQueuePlayer(items: [recoveryEpisode.item])
+        let recoveryRequest = PlaybackRequest(detail: detail, index: 1, position: 0, recordsLocalHistory: false,
+                                              handoff: FeedHandoff(lookahead: queue, live: (failingPlayer, recoveryEpisode), speedLocked: false))
+        let recovery = PlayerSession(request: recoveryRequest, app: app)
+        recovery.start()
+        try await eventually("episode never advanced before the simulated player failure") { recovery.position > 1 }
+        await failingPlayer.seek(to: CMTime(seconds: 7, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        try await eventually("session did not observe the seek before failure") { recovery.position >= 7 }
+        let resumePosition = recovery.position
+        failingPlayer.signalFailure()
+        try await eventually("session kept the failed AVPlayer") { recovery.player != nil && recovery.player !== failingPlayer }
+        try await eventually("replacement player never displayed its first frame") { recovery.rendered }
+        try require((recovery.player?.currentTime().seconds ?? 0) >= resumePosition - 0.6, "replacement player restarted at the beginning")
+        try await eventually("replacement player did not resume the same episode") {
+            recovery.index == 1 && recovery.rendered && recovery.isPlaying && recovery.position > resumePosition + 0.5
+        }
+        try require(failingPlayer.items().isEmpty, "retired player still owns its items")
+        recovery.stop()
+        print("PASS: terminal AVPlayer failure replaced the engine and resumed the current episode")
         print("PASS: bounded lookahead, live handoff, manual selection, failed-preload fallback, last episode, disabled autoplay and timers")
     }
 }

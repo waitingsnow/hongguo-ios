@@ -8,7 +8,11 @@ ln -s \
   "$project_dir/Sources/Core/Models.swift" "$project_dir/Sources/Core/HGCrypto.swift" \
   "$project_dir/Sources/Media/MP4Processor.swift" "$project_dir"/Sources/Networking/*.swift \
   "$project_dir/Sources/Networking/Discussion/EpisodeDanmakuAPI.swift" \
-  "$project_dir/Tests/NetworkSelfTest.swift" "$project_dir/Tests/PlaybackRecoveryChecks.swift" \
+  "$project_dir/Sources/Danmaku/DanmakuRepository.swift" "$project_dir/Sources/Danmaku/DanmakuLoader.swift" \
+  "$project_dir/Sources/Danmaku/DanmakuPrefs.swift" "$project_dir/Sources/Danmaku/DanmakuEmoji.swift" \
+  "$project_dir/Tests/NetworkSelfTest.swift" "$project_dir/Tests/DanmakuChecks.swift" \
+  "$project_dir/Tests/PlaybackRecoveryChecks.swift" \
+  "$project_dir/Tests/PublicEpisodeSourceChecks.swift" \
   "$project_dir/Tests/MobilePlaybackChecks.swift" "$work_dir/Sources"
 cat > "$work_dir/Package.swift" <<'SWIFT'
 // swift-tools-version: 5.9

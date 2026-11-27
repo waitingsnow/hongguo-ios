@@ -167,7 +167,7 @@ struct PlayHistoryView: View {
                 else { LocalLibraryGrid(favorites: false, editing: $editing) }
             }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 20)
         }
-        .appBackground(model.appearance).navigationTitle("播放历史").navigationBarTitleDisplayMode(.inline).secondaryPage()
+        .appBackground(model.appearance, pageOwnsBarBackground: true).navigationTitle("播放历史").navigationBarTitleDisplayMode(.inline).secondaryPage()
         .scrollBounceBehavior(.always, axes: .vertical)
         .refreshable { if showsAccount { await account.refresh() } else { library.reload() } }
         .toolbar { ToolbarItem(placement: .topBarTrailing) { if !showsAccount { LocalLibraryActions(favorites: false, editing: $editing) } } }
@@ -184,7 +184,7 @@ struct LocalFavoritesView: View {
         ScrollView {
             LocalLibraryGrid(favorites: true, editing: $editing).padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 20)
         }
-        .appBackground(model.appearance).navigationTitle("本机收藏").navigationBarTitleDisplayMode(.inline).secondaryPage()
+        .appBackground(model.appearance, pageOwnsBarBackground: true).navigationTitle("本机收藏").navigationBarTitleDisplayMode(.inline).secondaryPage()
         .scrollBounceBehavior(.always, axes: .vertical)
         .refreshable { library.reload() }
         .toolbar { ToolbarItem(placement: .topBarTrailing) { LocalLibraryActions(favorites: true, editing: $editing) } }

@@ -119,6 +119,11 @@ final class PlayerSession: ObservableObject {
         sessionNotifications.append(NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in _ = self?.refreshSleepTimer() }
         })
+        sessionNotifications.append(NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            let type = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt).flatMap(AVAudioSession.InterruptionType.init)
+            let options = AVAudioSession.InterruptionOptions(rawValue: note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
+            Task { @MainActor in self?.interrupted(began: type == .began, shouldResume: options.contains(.shouldResume)) }
+        })
         if sleepDeadline != nil, sleepTimerTask == nil { scheduleSleepTimer() }
         guard !pausedBySleepTimer else { return }
         if let live = handoff?.live {
@@ -252,12 +257,17 @@ final class PlayerSession: ObservableObject {
                     guard self.playID == ticket, !self.stopped, !Task.isCancelled else { return }
                     self.install(episode: episode, startAt: saved, ticket: ticket)
                     return
-                } catch is CancellationError {
-                    return
                 } catch {
-                    guard let self, self.playID == ticket, !self.stopped else { return }
+                    guard let self, self.playID == ticket, !self.stopped, !Task.isCancelled else { return }
                     // One quiet second attempt: a dropped connection or an expired address usually works right away.
-                    if attempt == 0 {
+                    let shouldRetry: Bool
+                    switch error {
+                    case PublicEpisodeSource.Failure.unavailable, PublicEpisodeSource.Failure.rateLimited, is DramaAPI.PlaybackRefusal:
+                        shouldRetry = false
+                    default:
+                        shouldRetry = true
+                    }
+                    if attempt == 0, shouldRetry {
                         attempt += 1; self.stage = "正在重新连接"
                         try? await Task.sleep(nanoseconds: 700_000_000)
                         guard self.playID == ticket, !self.stopped, !Task.isCancelled else { return }
@@ -303,14 +313,19 @@ final class PlayerSession: ObservableObject {
                 self.finishPendingItemEnd()
             }
         })
-        periodic = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.tick() }
-        }
-        sessionNotifications.append(NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
-            let type = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt).flatMap(AVAudioSession.InterruptionType.init)
-            let options = AVAudioSession.InterruptionOptions(rawValue: note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
-            Task { @MainActor in self?.interrupted(began: type == .began, shouldResume: options.contains(.shouldResume)) }
+        playerObservations.append(player.observe(\.status, options: [.new]) { [weak self] player, _ in
+            Task { @MainActor in
+                guard let self, self.player === player, player.status == .failed, self.currentEpisode != nil,
+                      !self.pausedByRequest, !self.finished, self.error == nil else { return }
+                self.failed("播放器中断，请重试。")
+            }
         })
+        periodic = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self, weak player] _ in
+            Task { @MainActor in
+                guard let self, let player, self.player === player else { return }
+                self.tick()
+            }
+        }
         self.player = player
         return player
     }
@@ -319,6 +334,12 @@ final class PlayerSession: ObservableObject {
         guard !pauseIfSleepTimerExpired(), !pausedBySleepTimer else { return }
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         try? AVAudioSession.sharedInstance().setActive(true)
+        if player?.status == .failed {
+            clearStagedEpisodes()
+            lookahead.clear()
+            releasePlayer()
+            episode.renewItemForRevisit()
+        }
         let player = self.player ?? makePlayer()
         let item = episode.item
         currentEpisode = episode; episode.stream.resume()
@@ -353,7 +374,7 @@ final class PlayerSession: ObservableObject {
         itemObservations.append(item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor in
                 guard let self, self.playID == ticket else { return }
-                if item.status == .failed { self.failed("视频播放失败，请重试或选择其他集。") }
+                if item.status == .failed { self.failed("视频播放失败，请重试。") }
                 let length = item.duration.seconds
                 if length.isFinite && length > 0 { self.duration = length }
             }
@@ -363,7 +384,7 @@ final class PlayerSession: ObservableObject {
             Task { @MainActor in guard let self, self.playID == ticket, size.width > 0, size.height > 0 else { return }; self.videoSize = size }
         })
         itemNotifications.append(NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in Task { @MainActor in self?.itemDidEnd(ticket: ticket) } })
-        itemNotifications.append(NotificationCenter.default.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main) { [weak self] _ in Task { @MainActor in guard let self, self.playID == ticket else { return }; self.failed("视频播放中断，请重试或选择其他集。") } })
+        itemNotifications.append(NotificationCenter.default.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main) { [weak self] _ in Task { @MainActor in guard let self, self.playID == ticket else { return }; self.failed("视频播放中断，请重试。") } })
     }
 
     private func tick() {
@@ -438,7 +459,9 @@ final class PlayerSession: ObservableObject {
     func toggle() {
         guard !stopped, !pauseIfSleepTimerExpired() else { return }
         adoptQueuedEpisodeIfNeeded()
-        if pausedBySleepTimer {
+        if player?.status == .failed {
+            retry()
+        } else if pausedBySleepTimer {
             pausedBySleepTimer = false; endMessage = nil
             if finished || currentEpisode == nil || error != nil || quality != app.quality {
                 retry()
@@ -773,6 +796,14 @@ final class PlayerSession: ObservableObject {
         itemNotifications.removeAll()
     }
 
+    private func releasePlayer() {
+        playerObservations.removeAll()
+        if let periodic, let player { player.removeTimeObserver(periodic) }
+        periodic = nil
+        if let queue = player as? AVQueuePlayer { queue.removeAllItems() } else { player?.replaceCurrentItem(with: nil) }
+        player = nil
+    }
+
     func stop() {
         guard !stopped else { return }
         adoptQueuedEpisodeIfNeeded()
@@ -785,10 +816,8 @@ final class PlayerSession: ObservableObject {
         requestTask?.cancel(); requestTask = nil; lookahead.clear(); playID = UUID()
         frameTask?.cancel(); frameTask = nil
         detachItem()
-        if let periodic, let player { player.removeTimeObserver(periodic) }; periodic = nil
-        playerObservations.removeAll(); sessionNotifications.forEach { NotificationCenter.default.removeObserver($0) }; sessionNotifications.removeAll()
-        if let queue = player as? AVQueuePlayer { queue.removeAllItems() } else { player?.replaceCurrentItem(with: nil) }
-        player = nil
+        releasePlayer()
+        sessionNotifications.forEach { NotificationCenter.default.removeObserver($0) }; sessionNotifications.removeAll()
         retiringEpisode = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }

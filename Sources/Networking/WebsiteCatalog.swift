@@ -2,6 +2,7 @@
 // Rank boards and search suggestions adapted from tsukiyo-zero/hongguoTV kotlin-tv/core RankBrowser.kt, ComicRank.kt and
 // ContentRepository.kt at f22bb3f (2026-11-03) through hongguo-android. Only the page's serialized data is read; no script runs.
 import Foundation
+import CoreFoundation
 
 enum RankBoard: String, CaseIterable, Identifiable, Sendable {
     case all = "hot-drama", real = "hot-real-drama", comic = "hot-comic-drama", ai = "hot-ai-drama"
@@ -134,5 +135,104 @@ enum WebsiteCatalog {
     private static func decodeEntities(_ value: String) -> String {
         value.replacingOccurrences(of: "&quot;", with: "\"").replacingOccurrences(of: "&#x27;", with: "'").replacingOccurrences(of: "&#39;", with: "'")
             .replacingOccurrences(of: "&lt;", with: "<").replacingOccurrences(of: "&gt;", with: ">").replacingOccurrences(of: "&amp;", with: "&")
+    }
+}
+
+enum PublicEpisodeSource {
+    enum Failure: LocalizedError {
+        case unavailable, rateLimited, invalidResponse, http(Int)
+
+        var errorDescription: String? {
+            switch self {
+            case .unavailable: return "官网暂未向访客提供本集完整片源"
+            case .rateLimited: return "官网请求过于频繁，请稍后再试"
+            case .invalidResponse: return "官网未返回有效的分集播放信息"
+            case .http(let status): return "官网片源请求失败（HTTP \(status)）"
+            }
+        }
+    }
+
+    struct EpisodeInfo {
+        let duration: WebEpisodeDuration
+        let shortSide: Int
+    }
+
+    static func track(seriesID: String, episodeID: String, session: URLSession) async throws -> VideoTrack {
+        guard ProtocolJSON.identifier(seriesID) != nil, ProtocolJSON.identifier(episodeID) != nil else { throw Failure.invalidResponse }
+        let page = URL(string: "\(WebsiteCatalog.base)/player/\(seriesID)/\(episodeID)")!
+        let html = try await load(URLRequest(url: page), session: session, limit: 4 * 1024 * 1024)
+        let info = try episodeInfo(html: String(decoding: html, as: UTF8.self), seriesID: seriesID, episodeID: episodeID)
+
+        var request = URLRequest(url: URL(string: WebsiteCatalog.base + "/api/video/protected/fallback-play-info")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try ProtocolJSON.data(["item_id": episodeID])
+        let data = try await load(request, session: session, limit: 64 * 1024)
+        return try track(response: data, info: info)
+    }
+
+    static func episodeInfo(html: String, seriesID: String, episodeID: String) throws -> EpisodeInfo {
+        guard let page = WebsiteCatalog.inlineRouterValue(html, select: { $0["player_(series_id)/(vid)/page"] as? [String: Any] }),
+              boolean(page["isSuccess"]) == true,
+              ProtocolJSON.identifier(page["series_id"]) == seriesID, ProtocolJSON.identifier(page["vid"]) == episodeID,
+              let series = page["seriesDetail"] as? [String: Any], ProtocolJSON.identifier(series["series_id"]) == seriesID
+        else { throw Failure.invalidResponse }
+        let access = ProtocolJSON.dictionary(page["req"])
+        let ids = ProtocolJSON.array(series["vid_list"])
+        let count = series["accessible_episode_cnt"]
+        guard boolean(access["pcLoginRequired"]) == false, boolean(access["pcAuthenticatedPlayback"]) == false,
+              boolean(count) == nil, let accessibleCount = Int(ProtocolJSON.text(count)),
+              let index = ids.firstIndex(where: { ProtocolJSON.identifier($0) == episodeID }), index < accessibleCount
+        else { throw Failure.unavailable }
+        try DramaAPI.checkPlaybackBusinessRejection(page)
+        try DramaAPI.checkPlaybackBusinessRejection(access)
+
+        let metadata = ProtocolJSON.dictionary(page["publicVideoSeo"])
+        guard boolean(metadata["available"]) == true else { return EpisodeInfo(duration: .unlisted, shortSide: 0) }
+        guard ProtocolJSON.identifier(metadata["seriesId"]) == seriesID, ProtocolJSON.identifier(metadata["itemId"]) == episodeID,
+              let duration = Double(ProtocolJSON.text(metadata["durationSeconds"])), duration.isFinite, duration > 0
+        else { throw Failure.invalidResponse }
+        let pixels = min(ProtocolJSON.integer(metadata["width"]), ProtocolJSON.integer(metadata["height"]))
+        return EpisodeInfo(duration: .declared(duration), shortSide: max(0, pixels))
+    }
+
+    private static func boolean(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+        return number.boolValue
+    }
+
+    static func track(response: Data, info: EpisodeInfo, now: Date = Date()) throws -> VideoTrack {
+        guard let json = try? ProtocolJSON.object(response) else { throw Failure.invalidResponse }
+        let status = ProtocolJSON.dictionary(json["base_resp"])
+        try DramaAPI.checkPlaybackBusinessRejection(json)
+        try DramaAPI.checkPlaybackBusinessRejection(status)
+        let code = status["StatusCode"] ?? json["code"]
+        guard boolean(code) == nil, ProtocolJSON.text(code) == "0",
+              let rawURL = json["main_url"] as? String, let url = URL(string: rawURL),
+              VideoTrack.allowsMediaURL(url) else { throw Failure.invalidResponse }
+        if let value = json["url_expire"] {
+            guard let expiry = Double(ProtocolJSON.text(value)), expiry.isFinite,
+                  expiry > now.timeIntervalSince1970 + 5 else { throw Failure.invalidResponse }
+        }
+        let definition = info.shortSide > 0 ? "网页 \(info.shortSide)P" : "网页片源"
+        return VideoTrack(url: url, spadeA: "", encrypted: false, definition: definition,
+                          shortSide: info.shortSide, expectedDuration: info.duration)
+    }
+
+    private static func load(_ input: URLRequest, session: URLSession, limit: Int) async throws -> Data {
+        var request = input
+        request.httpShouldHandleCookies = false
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.timeoutInterval = 6
+        let (data, _) = try await PlaybackResponseReader.read(DramaAPI.boundedRequest(request), session: session, limit: limit) { http in
+            guard http.url == input.url else { throw Failure.unavailable }
+            do { try DramaAPI.checkPlaybackHTTP(http) }
+            catch let refusal as DramaAPI.PlaybackRefusal { throw refusal.isBackoff ? Failure.rateLimited : Failure.unavailable }
+            if http.statusCode == 404 { throw Failure.unavailable }
+            guard http.statusCode == 200 else { throw Failure.http(http.statusCode) }
+        }
+        try Task.checkCancellation()
+        return data
     }
 }

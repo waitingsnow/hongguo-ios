@@ -554,26 +554,26 @@ final class AccountService: ObservableObject {
     /// Current official clients read the light `video/list` shelf and name it from the detail batch; `video/info`
     /// stays as the fallback when the light list fails, or is empty for an account still on the old logic.
     private func fetchFavorites(_ candidate: AccountCredentials) async throws -> [Drama] {
+        let ticket = generation
         let light: [String]?
         do { light = try AccountRules.favoriteList(try await appJSON(candidate, path: "/reading/bookapi/bookshelf/video/list/v1/").0) }
         catch let failure as AccountFailure where failure.expired { throw failure }
         catch is CancellationError { throw CancellationError() }
         catch { light = nil }
-        guard let ids = light else { return try await fetchLegacyFavorites(candidate) }
+        guard let ids = light else { return try await fetchLegacyFavorites(candidate, ticket: ticket) }
         if ids.isEmpty {
             // The light list already answered; the legacy shelf can only add rows, never turn that answer into an error.
-            do { return try await fetchLegacyFavorites(candidate) }
+            do { return try await fetchLegacyFavorites(candidate, ticket: ticket) }
             catch let failure as AccountFailure where failure.expired { throw failure }
             catch is CancellationError { throw CancellationError() }
             catch { return [] }
         }
-        let shown = Array(ids.prefix(200))
-        return try await completeListMetadata(shown.map { id in
-            favorites.first { $0.id == id } ?? Drama(id: id, title: "剧集 \(id)", coverURL: "", summary: "", episodeCount: 0)
-        }, candidate: candidate)
+        let shown = ids.prefix(200).map { Drama(id: $0, title: "剧集 \($0)", coverURL: "", summary: "", episodeCount: 0) }
+        return try await completeListMetadata(shown, previous: knownListMetadata, candidate: candidate, ticket: ticket)
     }
 
-    private func fetchLegacyFavorites(_ candidate: AccountCredentials) async throws -> [Drama] {
+    private func fetchLegacyFavorites(_ candidate: AccountCredentials, ticket: UUID) async throws -> [Drama] {
+        guard ticket == generation else { throw CancellationError() }
         let (raw,_) = try await appJSON(candidate, path: "/reading/bookapi/bookshelf/video/info/v1/")
         let data = ProtocolJSON.dictionary(raw["data"])
         guard data["video_shelf_info"] != nil else { throw HGError.message("账户收藏数据格式发生变化") }
@@ -583,39 +583,51 @@ final class AccountService: ObservableObject {
             return drama(row: row, video: video)
         }
         guard rows.isEmpty || !result.isEmpty else { throw HGError.message("账户收藏条目格式发生变化") }
-        return try await completeListMetadata(unique(result), candidate: candidate)
+        return try await completeListMetadata(unique(result), previous: knownListMetadata, candidate: candidate, ticket: ticket)
     }
     /// The endpoint intermittently answers with an empty body, so one read is repeated once.
     private func fetchLikes(_ candidate: AccountCredentials) async throws -> [Drama] {
+        let ticket = generation
         let params = ["count":"50","object_type_list":"6,15,10","offset":"0","action_type":"3"]
         let liked: [Drama]
         do { liked = AccountRules.likes(try await appJSON(candidate, path: "/reading/ugc/action/mget/v1/", params: params).0) }
         catch let failure as AccountFailure where failure.expired { throw failure }
         catch is CancellationError { throw CancellationError() }
-        catch { liked = AccountRules.likes(try await appJSON(candidate, path: "/reading/ugc/action/mget/v1/", params: params).0) }
-        return try await completeListMetadata(liked, candidate: candidate)
+        catch {
+            guard ticket == generation else { throw CancellationError() }
+            liked = AccountRules.likes(try await appJSON(candidate, path: "/reading/ugc/action/mget/v1/", params: params).0)
+        }
+        return try await completeListMetadata(liked, candidate: candidate, ticket: ticket)
     }
 
-    private func completeListMetadata(_ items: [Drama], candidate: AccountCredentials) async throws -> [Drama] {
-        let ids = items.map(\.id)
-        var mapped = [String:Drama]()
-        for start in stride(from: 0, to: ids.count, by: 50) {
-            let batch = ids[start..<min(start + 50, ids.count)]
+    private var knownListMetadata: [Drama] {
+        favorites + history.map(\.drama) + likes + reservations.map(\.drama)
+    }
+
+    private func completeListMetadata(_ items: [Drama], previous: [Drama] = [], candidate: AccountCredentials, ticket: UUID) async throws -> [Drama] {
+        guard ticket == generation else { throw CancellationError() }
+        let result = try await AccountRules.completeListMetadata(items, previous: previous) { ids in
+            guard ticket == self.generation else { throw CancellationError() }
             do {
-                let (metadata,_) = try await appJSON(candidate, path: "/reading/bookapi/multi-detail/v1/", params: ["book_id":batch.joined(separator: ","),"book_type":"2"])
-                mapped.merge(AccountRules.detailMetadata(metadata, requested: Set(batch))) { _, new in new }
+                return try await self.appJSON(candidate, path: "/reading/bookapi/multi-detail/v1/",
+                                              params: ["book_id":ids.joined(separator: ","),"book_type":"2"]).0
             } catch let failure as AccountFailure where failure.expired { throw failure }
             catch is CancellationError { throw CancellationError() }
-            catch { }
+            catch { return [:] }
         }
-        return items.map { $0.replacingMetadata(with: mapped[$0.id]) }
+        guard ticket == generation else { throw CancellationError() }
+        return result
     }
 
     /// Watch records add works the progress list leaves out; a failure there keeps the progress list.
-    private func fetchRecords(_ candidate: AccountCredentials) async -> [LibraryEntry] {
-        guard let (raw,_) = try? await appJSON(candidate, path: "/reading/bookapi/read_history/list/v1/", params: ["book_type":"2","limit":"0","offset":"0",
-            "last_min_read_timestamp_ms":"0","full_field":"true","is_first_load":"true","query_soft_deleted":"false"]) else { return [] }
-        return (try? AccountRules.readHistory(raw)) ?? []
+    private func fetchRecords(_ candidate: AccountCredentials) async throws -> [LibraryEntry] {
+        do {
+            let (raw,_) = try await appJSON(candidate, path: "/reading/bookapi/read_history/list/v1/", params: ["book_type":"2","limit":"0","offset":"0",
+                "last_min_read_timestamp_ms":"0","full_field":"true","is_first_load":"true","query_soft_deleted":"false"])
+            return try AccountRules.readHistory(raw)
+        } catch let failure as AccountFailure where failure.expired { throw failure }
+        catch is CancellationError { throw CancellationError() }
+        catch { return [] }
     }
 
     /// The account's recent progress rows, without titles or covers.
@@ -635,9 +647,12 @@ final class AccountService: ObservableObject {
     }
 
     private func fetchHistory(_ candidate: AccountCredentials) async throws -> [LibraryEntry] {
-        var result = try await fetchProgressRows(candidate)
-        result = AccountRules.mergeHistory(progress: result, records: await fetchRecords(candidate))
-        let metadata = try await completeListMetadata(result.map(\.drama), candidate: candidate)
+        let ticket = generation
+        let progress = try await fetchProgressRows(candidate)
+        guard ticket == generation else { throw CancellationError() }
+        let records = try await fetchRecords(candidate)
+        let result = AccountRules.mergeHistory(progress: progress, records: records)
+        let metadata = try await completeListMetadata(result.map(\.drama), previous: knownListMetadata, candidate: candidate, ticket: ticket)
         return zip(result, metadata).map { item, drama in
             var entry = item
             entry.drama = drama

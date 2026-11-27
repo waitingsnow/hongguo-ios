@@ -2,15 +2,16 @@
 // Protocol and CENC layout ported from hongguo-android's Spade/Mp4/Mp4Progressive.
 import Foundation
 
-enum MediaError: LocalizedError {
-    case invalidMedia, unsupported, invalidKey, tooLarge, transport, unavailable
+enum MediaError: LocalizedError, Equatable {
+    case invalidMedia, durationMismatch, unsupported, invalidKey, tooLarge, transport, temporaryCDNFailure, unavailable
     var errorDescription: String? {
         switch self {
         case .invalidMedia: return "视频文件不完整或格式损坏，请重试。"
+        case .durationMismatch: return "片源时长与本集不符，无法播放。"
         case .unsupported: return "此视频的封装或加密格式暂不支持。"
         case .invalidKey: return "暂时无法解析本集播放信息，请尝试其他剧集。"
         case .tooLarge: return "本集视频超过 512 MB 缓存限制。"
-        case .transport: return "视频下载失败，请检查网络后重试。"
+        case .transport, .temporaryCDNFailure: return "视频下载失败，请检查网络后重试。"
         case .unavailable: return "此视频暂时无法播放。"
         }
     }
@@ -107,13 +108,15 @@ enum MP4Processor {
 
     /// Builds a same-length clear virtual file using metadata alone, without reading mdat.
     static func streamPlan(length: Int, moovOffset: Int, moov: Data, media: [Range<Int>],
-                           psshOffsets: [Int], encrypted: Bool, spade: String) throws -> StreamPlan {
+                           psshOffsets: [Int], encrypted: Bool, spade: String,
+                           expectedDuration: WebEpisodeDuration? = nil) throws -> StreamPlan {
         guard length > 0, length <= maximumBytes, moov.count <= 32 * 1024 * 1024,
               moovOffset >= 0, moovOffset <= length - moov.count, !media.isEmpty else { throw MediaError.invalidMedia }
         let layout = FileLayout(length: length, moovOffset: moovOffset, moov: moov, media: media, psshOffsets: psshOffsets)
         var bytes = Array(moov), count = 0
         let roots = try parse(bytes, start: 0, end: bytes.count, depth: 0, count: &count)
         guard roots.count == 1, roots[0].type == "moov", roots[0].children.contains(where: { $0.type == "trak" }) else { throw MediaError.invalidMedia }
+        try validateDuration(expectedDuration, bytes: bytes, moov: roots[0])
         let tracks = try readTracks(bytes, moov: roots[0], layout: layout)
         // A plain track must really be plain: readTracks refuses sinf/senc on clear entries and returns every encv/enca.
         guard encrypted ? !tracks.isEmpty : tracks.isEmpty else { throw MediaError.unsupported }
@@ -139,22 +142,55 @@ enum MP4Processor {
 
     /// `requirePlain`: a source the server gave without encryption info is taken as plain only when its index says so,
     /// with no encv/enca sample entry, sinf or senc (2026-11-09, Android issue #3).
-    static func validate(url: URL, requirePlain: Bool = false) throws {
+    static func validate(url: URL, requirePlain: Bool = false, expectedDuration: WebEpisodeDuration? = nil) throws {
         let layout = try inspectFile(url)
         var count = 0
         let bytes = Array(layout.moov)
         let roots = try parse(bytes, start: 0, end: bytes.count, depth: 0, count: &count)
         guard roots.count == 1, roots[0].type == "moov", roots[0].children.contains(where: { $0.type == "trak" }) else { throw MediaError.invalidMedia }
+        try validateDuration(expectedDuration, bytes: bytes, moov: roots[0])
         if requirePlain { guard try readTracks(bytes, moov: roots[0], layout: layout).isEmpty else { throw MediaError.unsupported } }
     }
 
-    static func decrypt(url: URL, spade: String, progress: @Sendable (String, Double) -> Void) throws {
+    private static func validateDuration(_ expected: WebEpisodeDuration?, bytes: [UInt8], moov: Box) throws {
+        guard let expected else { return }
+        let header = try moov.require("mvhd")
+        try require(header, 4)
+        let timescale: Int, ticks: Int
+        switch bytes[header.payload] {
+        case 0:
+            try require(header, 20)
+            timescale = try u32(bytes, header.payload + 12)
+            ticks = try u32(bytes, header.payload + 16)
+            guard ticks != Int(UInt32.max) else { throw MediaError.invalidMedia }
+        case 1:
+            try require(header, 32)
+            timescale = try u32(bytes, header.payload + 20)
+            ticks = try u64(bytes, header.payload + 24)
+        default:
+            throw MediaError.invalidMedia
+        }
+        guard timescale > 0, ticks > 0 else { throw MediaError.invalidMedia }
+        let seconds = Double(ticks) / Double(timescale)
+        switch expected {
+        case .declared(let duration):
+            // The page may round the episode length to a whole second.
+            guard duration.isFinite, duration > 0, abs(seconds - duration) <= 1 else { throw MediaError.durationMismatch }
+        case .unlisted:
+            // When the page omits the full length, exclude its ten-second preview, including rounding.
+            guard seconds > 11 else { throw MediaError.durationMismatch }
+        }
+    }
+
+    static func decrypt(url: URL, spade: String, expectedDuration: WebEpisodeDuration? = nil,
+                        progress: @Sendable (String, Double) -> Void) throws {
         try Task.checkCancellation()
         let key = try SpadeKey.decode(spade)
         let layout = try inspectFile(url)
         var bytes = Array(layout.moov); var count = 0
         let roots = try parse(bytes, start: 0, end: bytes.count, depth: 0, count: &count)
         guard roots.count == 1 else { throw MediaError.invalidMedia }
+        try validateDuration(expectedDuration, bytes: bytes, moov: roots[0])
         let tracks = try readTracks(bytes, moov: roots[0], layout: layout)
         guard !tracks.isEmpty, let video = tracks.first(where: { $0.handler == "vide" }) else { throw MediaError.unsupported }
         let file = try FileHandle(forUpdating: url); defer { try? file.close() }

@@ -36,7 +36,8 @@ private func check(_ condition: Bool, _ label: String) throws {
         try check(fixture.encrypted.count > 1024 * 1024, "Fixture must contain over 1 MB of actual video")
         print("fixture_bytes=\(fixture.encrypted.count)")
         let cache = ProgressiveCache(root: base.appendingPathComponent("cache"))
-        let track = VideoTrack(url: URL(string: "https://test.qznovelvod.com/video.mp4")!, spadeA: fixture.spade, encrypted: true, definition: "test")
+        let track = VideoTrack(url: URL(string: "https://test.qznovelvod.com/video.mp4")!, spadeA: fixture.spade,
+                               encrypted: true, definition: "test", expectedDuration: .declared(9))
         let server = FixtureServer(fixture.encrypted, delay: 80_000_000)
         // Read-ahead off: these checks measure what the first frame itself needed (read-ahead is checked separately).
         let source = try await ProgressiveSource.open(track: track, episodeID: "test", cache: cache, fetch: { try await server.fetch($0) }, readAhead: 0)
@@ -102,10 +103,13 @@ private func check(_ condition: Bool, _ label: String) throws {
         await source8.close()
         let plainTrack = VideoTrack(url: track.url, spadeA: "", encrypted: false, definition: "plain")
         let plainServer = FixtureServer(fixture.plain)
-        let plain = try await ProgressiveSource.open(track: plainTrack, episodeID: "plain", cache: cache, fetch: { try await plainServer.fetch($0) })
+        let plain = try await ProgressiveSource.open(track: plainTrack, episodeID: "plain", cache: cache,
+                                                     fetch: { try await plainServer.fetch($0) }, readAhead: 0)
         let plainBytes = try await plain.read(at: 500_003, count: 32_001)
         try check(plainBytes == fixture.plain.subdata(in: 500_003..<532_004), "Plain MP4 range mismatch")
         await plain.close()
+        try await cachedDurationChecks(fixture: fixture.plain, track: plainTrack, cache: cache,
+                                       preparedRoot: base.appendingPathComponent("prepared"))
         // A row without encryption info is opened as plain; a CENC index behind it must still be refused.
         let protectedServer = FixtureServer(fixture.encrypted)
         do {
@@ -147,6 +151,46 @@ private func check(_ condition: Bool, _ label: String) throws {
         let filesAfter = (FileManager.default.enumerator(at: base.appendingPathComponent("cache"), includingPropertiesForKeys: nil)?.allObjects as? [URL]) ?? []
         try check(!filesAfter.contains { $0.pathExtension == "chunk" }, "Closed cache could not be cleared")
         print("PASS 8/16-byte IVs, plain MP4, cache cleanup; no external network used")
+    }
+
+    private static func cachedDurationChecks(fixture: Data, track: VideoTrack, cache: ProgressiveCache,
+                                             preparedRoot: URL) async throws {
+        let episodeID = "plain"
+        try FileManager.default.createDirectory(at: preparedRoot, withIntermediateDirectories: true)
+        let key = HGCrypto.sha256(Data((episodeID + ":" + track.definition).utf8)).map { String(format: "%02x", $0) }.joined()
+        let movie = preparedRoot.appendingPathComponent(key + ".mp4")
+        try fixture.write(to: movie)
+        let digest = HGCrypto.sha256(fixture).map { String(format: "%02x", $0) }.joined()
+        let record = try JSONSerialization.data(withJSONObject: ["bytes": fixture.count, "sha256": digest])
+        try record.write(to: preparedRoot.appendingPathComponent(key + ".json"))
+
+        let preparer = MediaPreparer(root: preparedRoot)
+        let server = FixtureServer(fixture)
+        var candidate = track
+        candidate.expectedDuration = .declared(9)
+        let matching = try await preparer.cachedPlayback(track: candidate, episodeID: episodeID)
+        try check(matching == movie, "Existing complete-file cache with matching duration was not reused")
+        let source = try await ProgressiveSource.open(track: candidate, episodeID: episodeID, cache: cache,
+                                                      fetch: { try await server.fetch($0) }, readAhead: 0)
+        let opened = await server.requested()
+        let cached = try await source.read(at: 500_003, count: 32_001)
+        let afterRead = await server.requested()
+        await source.close()
+        try check(opened == afterRead && cached == fixture.subdata(in: 500_003..<532_004),
+                  "Existing progressive cache with matching duration was not reused")
+
+        for duration in [WebEpisodeDuration.declared(125), .unlisted] {
+            candidate.expectedDuration = duration
+            let mismatched = try await preparer.cachedPlayback(track: candidate, episodeID: episodeID)
+            try check(mismatched == nil, "Complete-file cache returned a preview as the full episode")
+            do {
+                let preview = try await ProgressiveSource.open(track: candidate, episodeID: episodeID, cache: cache,
+                                                               fetch: { try await server.fetch($0) }, readAhead: 0)
+                await preview.close()
+                try check(false, "Progressive cache returned a preview as the full episode")
+            } catch MediaError.durationMismatch {}
+        }
+        print("PASS duration checks reject cached previews in prepared files and progressive ranges")
     }
 
     private static func sparseRevisit(fixture: ProgressiveFixture, track: VideoTrack, cache: ProgressiveCache) async throws {

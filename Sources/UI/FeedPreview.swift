@@ -37,7 +37,7 @@ final class FeedPreview: ObservableObject {
     @Published private(set) var holding = false
     @Published private(set) var speedLocked = false
     private var episode: OpenEpisode?
-    var detail: DramaDetail? { episode?.detail }
+    @Published private(set) var detail: DramaDetail?
     private let library: LibraryStore
     private var recentPositions: [(dramaID: String, episodeID: String, position: Double)] = []
     private let recentFrames = NSCache<NSString, UIImage>()
@@ -111,6 +111,7 @@ final class FeedPreview: ObservableObject {
         resetPlayer()
         self.quality = quality
         dramaID = drama.id
+        detail = DramaDetails.cached(drama.id)?.detail
         let ticket = self.ticket
         lookahead.frameAvailable = { [weak self] in self?.objectWillChange.send() }
         task = Task { [weak self] in
@@ -118,14 +119,20 @@ final class FeedPreview: ObservableObject {
                 let episode = try await withTaskCancellationHandler(operation: { try await opening.value }, onCancel: { opening.cancel() })
                 guard let self, self.ticket == ticket, !Task.isCancelled else { return }
                 self.episode = episode
+                self.detail = episode.detail
                 try await self.install(episode.item, startAt: self.savedPosition(for: episode.detail), ticket: ticket)
                 guard self.ticket == ticket, !Task.isCancelled else { return }
                 if let present = self.pendingPresentation, let request = self.handoff(index: 0) { present(request) }
             } catch {
                 guard let self, self.ticket == ticket, !Task.isCancelled else { return }
+                let present = self.pendingPresentation
                 self.pendingPresentation = nil
                 self.awaitingHandoff = false
                 self.failed = true
+                if self.detail == nil { self.detail = DramaDetails.cached(drama.id)?.detail }
+                if let present, let detail = self.detail, !detail.episodes.isEmpty {
+                    present(PlaybackRequest(detail: detail, index: 0, position: self.savedPosition(for: detail), recordsLocalHistory: true))
+                }
             }
         }
     }
@@ -282,7 +289,7 @@ final class FeedPreview: ObservableObject {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }; endObserver = nil
         if let periodic { player?.removeTimeObserver(periodic) }; periodic = nil
         if !keepPlaying { player?.pause(); player?.replaceCurrentItem(with: nil) }
-        player = nil; episode = nil; dramaID = nil; videoSize = .zero; rendered = false; paused = false
+        player = nil; episode = nil; detail = nil; dramaID = nil; videoSize = .zero; rendered = false; paused = false
         ended = false; failed = false; holding = false; speedLocked = false; restoringPosition = false
     }
     func stop() {

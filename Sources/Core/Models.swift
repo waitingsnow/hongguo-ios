@@ -24,15 +24,47 @@ struct Episode: Identifiable, Codable, Hashable, Sendable {
     let title: String
 }
 
+struct CastMember: Identifiable, Codable, Hashable, Sendable {
+    var id: String { celebrityID.isEmpty ? nickname : celebrityID }
+    let celebrityID: String
+    let nickname: String
+    let roleName: String
+    let avatarURL: String
+    let intro: String
+}
+
 struct DramaDetail: Codable, Sendable {
     let drama: Drama
     let episodes: [Episode]
+    let cast: [CastMember]
+
+    private enum CodingKeys: String, CodingKey {
+        case drama, episodes, cast
+    }
+
+    init(drama: Drama, episodes: [Episode], cast: [CastMember] = []) {
+        self.drama = drama
+        self.episodes = episodes
+        self.cast = cast
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        drama = try values.decode(Drama.self, forKey: .drama)
+        episodes = try values.decode([Episode].self, forKey: .episodes)
+        cast = try values.decodeIfPresent([CastMember].self, forKey: .cast) ?? []
+    }
 }
 
 struct DramaPage: Sendable {
     let dramas: [Drama]
     let hasMore: Bool
     let nextOffset: Int
+}
+
+enum WebEpisodeDuration: Equatable, Sendable {
+    case declared(Double)
+    case unlisted
 }
 
 struct VideoTrack: Sendable {
@@ -42,6 +74,17 @@ struct VideoTrack: Sendable {
     let definition: String
     /// The picture's shorter side in pixels (720 for 720P), 0 when the server did not say.
     var shortSide: Int = 0
+    var expectedDuration: WebEpisodeDuration? = nil
+    /// Extra addresses for the same clear rendition. Encrypted rows keep a single URL.
+    var backupURLs: [URL] = []
+}
+
+extension VideoTrack {
+    static func allowsMediaURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "https", url.user == nil, url.password == nil,
+              let host = url.host?.lowercased(), url.port == nil || url.port == 443 else { return false }
+        return ["qznovelvod.com", "fqnovelvod.com", "douyinvod.com"].contains { host == $0 || host.hasSuffix("." + $0) }
+    }
 }
 
 /// The player's 清晰度 choice. The server's ladder differs per episode, so this is a preference: the highest row at or

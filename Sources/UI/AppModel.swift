@@ -86,6 +86,8 @@ final class AppModel: ObservableObject {
     @Published var speed: Float { didSet { UserDefaults.standard.set(speed, forKey: "speed") } }
     /// 默认清晰度 for every new episode; the player's 清晰度 button changes it too, like the speed.
     @Published var quality: VideoQuality { didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") } }
+    /// 官方弹幕参数；每一项单独落盘，键名与 Android 端同一语义（屏占比用千分数）。
+    @Published var danmaku: DanmakuSettings { didSet { Self.storeDanmaku(danmaku) } }
     @Published var tab = 0
     @Published var systemDark = UITraitCollection.current.userInterfaceStyle == .dark
     @Published private(set) var playback: PlaybackRequest?
@@ -138,7 +140,32 @@ final class AppModel: ObservableObject {
         let saved = defaults.float(forKey: "speed")
         speed = [Float(0.5), 0.75, 1, 1.25, 1.5, 2].contains(saved) ? saved : 1
         quality = defaults.string(forKey: "quality").flatMap(VideoQuality.init) ?? .p1080
+        danmaku = Self.loadDanmaku(defaults).normalized()
     }
+
+    private static func loadDanmaku(_ defaults: UserDefaults) -> DanmakuSettings {
+        let permille = defaults.integer(forKey: "danmaku_coverage_permille")
+        return DanmakuSettings(
+            enabled: defaults.object(forKey: "danmaku_enabled") as? Bool ?? true,
+            coverage: permille > 0 ? DanmakuPrefs.coverageFromPermille(permille) : DanmakuPrefs.coverageDefault,
+            font: DanmakuPrefs.font(defaults.integer(forKey: "danmaku_font")),
+            opacity: DanmakuPrefs.opacity(defaults.integer(forKey: "danmaku_opacity")),
+            effect: DanmakuPrefs.effect(defaults.integer(forKey: "danmaku_effect")),
+            speed: DanmakuPrefs.speed(defaults.integer(forKey: "danmaku_speed")))
+    }
+
+    private static func storeDanmaku(_ next: DanmakuSettings) {
+        let defaults = UserDefaults.standard
+        let normalized = next.normalized()
+        defaults.set(normalized.enabled, forKey: "danmaku_enabled")
+        defaults.set(DanmakuPrefs.coveragePermille(normalized.coverage), forKey: "danmaku_coverage_permille")
+        defaults.set(normalized.font, forKey: "danmaku_font")
+        defaults.set(normalized.opacity, forKey: "danmaku_opacity")
+        defaults.set(normalized.effect, forKey: "danmaku_effect")
+        defaults.set(normalized.speed, forKey: "danmaku_speed")
+    }
+
+    func setDanmaku(_ next: DanmakuSettings) { danmaku = next.normalized() }
 
     func play(_ detail: DramaDetail, index: Int? = nil, resume: LibraryEntry? = nil,
               sleepDeadline: ContinuousClock.Instant? = nil, present: (PlaybackRequest) -> Void) {

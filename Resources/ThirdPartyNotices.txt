@@ -109,3 +109,16 @@ Timed danmaku
   https://github.com/beilunyang/openhongguo/tree/v0.4.0
 - The Openhongguo Swift package reads timed danmaku with its anonymous client. The upstream
   license is included as Openhongguo-Apache-2.0.txt.
+
+Official danmaku
+
+- hongguo-android 0.7.32 (PR #13), GPL-3.0-only, originally from tsukiyo-zero/hongguoTV and jycao2/hongguoTV.
+  Sources/Danmaku and Sources/UI/DanmakuPanels.swift keep the official comment window, emoji expansion and settings.
+
+Public guest episode playback
+
+- OOIUa/hongguo-ios, commit 665868b (GPL-3.0-only), implements guest availability,
+  episode identity and media duration checks for the official web player.
+  https://github.com/OOIUa/hongguo-ios/commit/665868b5275b7d7c02767a32f30a5670a5e71efa
+- The web-player fallback follows jackotom/hongguo-drama v8.0, src/native/hongguo.js (GPL-3.0-only).
+  https://github.com/jackotom/hongguo-drama/blob/8d14d07b3aaf99ecbe6b3ecb8ba2d0308261845d/src/native/hongguo.js

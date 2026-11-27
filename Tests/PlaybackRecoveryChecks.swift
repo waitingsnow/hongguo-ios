@@ -2,7 +2,7 @@ import Foundation
 
 func playbackRecoveryChecks(resources: URL) async throws {
     final class Calls: @unchecked Sendable {
-        var registered = 0, singles = 0, legacy = 0
+        var registered = 0, singles = 0, legacy = 0, publicReads = 0
         var identities: [RegisteredIdentity] = []
         var time: TimeInterval = 0
         func identity() -> RegisteredIdentity {
@@ -12,10 +12,12 @@ func playbackRecoveryChecks(resources: URL) async throws {
     }
     let model: [String: Any] = ["fixture":true]
     let track = VideoTrack(url: URL(string: "https://v1.qznovelvod.com/recovery.mp4")!, spadeA: "", encrypted: false, definition: "720p")
+    let unexpectedPublicRead: @Sendable () async throws -> VideoTrack = { fatalError("Unexpected public episode lookup") }
     let mobileAPI = DramaAPI(resourceDirectory: resources), mobileCalls = Calls()
     _ = try await mobileAPI.playbackTrack(pause: {}, identity: { mobileCalls.identity() },
         mobile: { _ in mobileCalls.singles += 1; return .model(model) },
         single: { _ in fatalError("Successful v5 must skip old single endpoint") },
+        publicEpisode: unexpectedPublicRead,
         read: { _,_ in fatalError("Successful v5 must skip compatibility endpoints") }, use: { _ in track })
     precondition(mobileCalls.singles == 1)
     let mobileTrace = await mobileAPI.lastPlaybackTrace
@@ -36,8 +38,8 @@ func playbackRecoveryChecks(resources: URL) async throws {
     } catch is DramaAPI.PlaybackRefusal { }
     let modelPriority = DramaAPI(resourceDirectory: resources)
     do {
-        _ = try await modelPriority.playbackTrack(identity: { mobileFallback.identity() }, mobile: { _ in .invalid },
-            single: { _ in .model(model) }, read: { _,_ in throw HGError.message("transport marker") },
+        _ = try await modelPriority.playbackTrack(identity: { mobileFallback.identity() }, mobile: { _ in .empty },
+            single: { _ in .model(model) }, publicEpisode: unexpectedPublicRead, read: { _,_ in throw HGError.message("transport marker") },
             use: { _ in throw HGError.message("model marker") })
         fatalError("Invalid model accepted")
     } catch { precondition(error.localizedDescription == "model marker") }
@@ -64,12 +66,72 @@ func playbackRecoveryChecks(resources: URL) async throws {
     } catch { precondition(error.localizedDescription.contains("空响应")) }
     precondition(finite.singles == 2 && finite.registered == 1)
 
+    let guest = Calls()
+    let guestTrack = try await exhausted.playbackTrack(pause: {}, identity: { guest.identity() },
+        mobile: { _ in .empty }, single: { _ in throw URLError(.networkConnectionLost) },
+        publicEpisode: {
+            precondition(guest.legacy == DramaAPI.playbackRoutes.count)
+            guest.publicReads += 1
+            return track
+        }, read: { _,_ in guest.legacy += 1; return .empty }, use: { _ in fatalError("No app model") })
+    let guestTrace = await exhausted.lastPlaybackTrace
+    precondition(guestTrack.url == track.url && guest.publicReads == 1 && guestTrace.hasSuffix(" W=ok"))
+    do {
+        _ = try await exhausted.playbackTrack(routes: [], identity: { guest.identity() },
+            mobile: { _ in throw URLError(.networkConnectionLost) }, publicEpisode: unexpectedPublicRead,
+            read: { _,_ in fatalError() }, use: { _ in fatalError() })
+        fatalError("Connection loss alone triggered the public source")
+    } catch let error as URLError { precondition(error.code == .networkConnectionLost) }
+    do {
+        _ = try await exhausted.playbackTrack(routes: [], pause: {}, identity: { guest.identity() },
+            mobile: { _ in .empty }, single: { _ in .invalid }, publicEpisode: unexpectedPublicRead,
+            read: { _,_ in fatalError() }, use: { _ in fatalError() })
+        fatalError("Malformed model triggered the public source")
+    } catch { precondition(error.localizedDescription == "服务暂未返回当前分集片源") }
+    do {
+        _ = try await exhausted.playbackTrack(routes: Array(DramaAPI.playbackRoutes.prefix(1)), pause: {}, identity: { guest.identity() },
+            mobile: { _ in .empty }, single: { _ in throw URLError(.serverCertificateUntrusted) }, publicEpisode: unexpectedPublicRead,
+            read: { _,_ in throw URLError(.timedOut) }, use: { _ in fatalError() })
+        fatalError("A transport timeout masked a certificate failure")
+    } catch let error as URLError { precondition(error.code == .serverCertificateUntrusted) }
+    let renew = Calls()
+    do {
+        _ = try await exhausted.playbackTrack(routes: DramaAPI.playbackRoutes.filter(\.renewsIdentity), pause: {},
+            identity: {
+                if renew.registered > 0 { throw DramaAPI.PlaybackRefusal(http: 401) }
+                return renew.identity()
+            }, mobile: { _ in .empty }, publicEpisode: unexpectedPublicRead,
+            read: { _,_ in fatalError("Registration refusal must stop compatibility requests") }, use: { _ in fatalError() })
+        fatalError("Registration refusal was ignored")
+    } catch is DramaAPI.PlaybackRefusal { }
+
+    let cutoff = Calls()
+    let deadline = ProcessInfo.processInfo.systemUptime + 1.2
+    let reserved = try await DramaAPI.$playbackDeadline.withValue(deadline) {
+        try await DramaAPI.withPlaybackBudget(5) {
+            try await exhausted.playbackTrack(routes: [], pause: {}, identity: { cutoff.identity() },
+                mobile: { _ in
+                    cutoff.singles += 1
+                    if cutoff.singles == 1 { return .empty }
+                    precondition((DramaAPI.playbackDeadline ?? .infinity) < deadline)
+                    try await Task.sleep(for: .seconds(5))
+                    fatalError("Slow mobile retry was not cancelled")
+                }, publicEpisode: {
+                    precondition((DramaAPI.playbackDeadline ?? .infinity) <= deadline)
+                    cutoff.publicReads += 1
+                    return track
+                }, read: { _,_ in fatalError() }, use: { _ in fatalError() })
+        }
+    }
+    precondition(reserved.url == track.url && cutoff.singles == 2 && cutoff.publicReads == 1)
+
     for status in [403,429] {
         let api = DramaAPI(resourceDirectory: resources), rejected = Calls()
         do {
             _ = try await api.playbackTrack(pause: {}, identity: { rejected.identity() }, single: { _ in
                 rejected.singles += 1; throw DramaAPI.PlaybackRefusal(http: status)
-            }, read: { _,_ in fatalError("Rejections must stop legacy requests") }, use: { _ in fatalError() })
+            }, publicEpisode: unexpectedPublicRead,
+            read: { _,_ in fatalError("Rejections must stop legacy requests") }, use: { _ in fatalError() })
             fatalError("HTTP refusal must fail")
         } catch let error as DramaAPI.PlaybackRefusal { precondition(error.localizedDescription.contains("\(status)")) }
         precondition(rejected.singles == 1 && rejected.registered == 1)
@@ -78,7 +140,8 @@ func playbackRecoveryChecks(resources: URL) async throws {
     for refusal in [DramaAPI.PlaybackRefusal(retryAfterStatus: 200), DramaAPI.PlaybackRefusal(http: 429)] {
         do {
             _ = try await reuse.playbackTrack(pause: {}, identity: { fatalError("Expected the previous session") },
-                mobile: { _ in .empty }, single: { _ in .empty }, read: { _,_ in throw refusal }, use: { _ in track })
+                mobile: { _ in .empty }, single: { _ in .empty },
+                publicEpisode: unexpectedPublicRead, read: { _,_ in throw refusal }, use: { _ in track })
             fatalError("Backoff must stop playback recovery")
         } catch let error as DramaAPI.PlaybackRefusal { precondition(error.isBackoff) }
         _ = try await reuse.playbackTrack(identity: { fatalError("Backoff must preserve the session") },
@@ -93,15 +156,16 @@ func playbackRecoveryChecks(resources: URL) async throws {
     let budgetAPI = DramaAPI(resourceDirectory: resources), budget = Calls()
     do {
         _ = try await budgetAPI.playbackTrack(budget: 1, now: { budget.time }, pause: { budget.time = 2 }, identity: { budget.identity() },
-            single: { _ in budget.singles += 1; return .empty }, read: { _,_ in fatalError("Budget exhausted") }, use: { _ in fatalError() })
+            single: { _ in budget.singles += 1; return .empty }, publicEpisode: unexpectedPublicRead,
+            read: { _,_ in fatalError("Budget exhausted") }, use: { _ in fatalError() })
         fatalError("Expired budget must fail")
-    } catch { precondition(error.localizedDescription.contains("空响应")) }
+    } catch let error as URLError { precondition(error.code == .timedOut) }
     precondition(budget.singles == 1 && budget.registered == 1)
 
     let cancelledAPI = DramaAPI(resourceDirectory: resources), cancelled = Calls()
     let task = Task {
         try await cancelledAPI.playbackTrack(pause: { withUnsafeCurrentTask { $0?.cancel() }; try Task.checkCancellation() },
-            identity: { cancelled.identity() }, single: { _ in cancelled.singles += 1; return .empty },
+            identity: { cancelled.identity() }, single: { _ in cancelled.singles += 1; return .empty }, publicEpisode: unexpectedPublicRead,
             read: { _,_ in fatalError("Cancelled recovery must stop") }, use: { _ in fatalError() })
     }
     do { _ = try await task.value; fatalError("Cancellation ignored") } catch is CancellationError { }
@@ -137,5 +201,5 @@ func playbackRecoveryChecks(resources: URL) async throws {
     }, read: { _,_ in fatalError() }, use: { _ in track })
     precondition(concurrent.registered == 2)
     entered.continuation.finish(); release.continuation.finish()
-    print("PASS playback recovery: same-session retry for first play and episode switch, bounded fallback, refusals, budget, cancellation and stale concurrent failure")
+    print("PASS playback recovery: same-session retries, guest playback after empty app replies, refusals, budget, cancellation and stale concurrent failure")
 }

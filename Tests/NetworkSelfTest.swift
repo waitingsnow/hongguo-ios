@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Offline protocol tests. All inputs are synthetic and no network request is dispatched.
+// Offline protocol tests using synthetic responses.
 import Foundation
 import JavaScriptCore
 import Openhongguo
@@ -32,6 +32,7 @@ import Openhongguo
             precondition(HGCrypto.sha256(Data(actual.utf8)).hexString == fixture["sha256"] as! String, "Node signing oracle mismatch")
             if timestamp == (fixtures.first!["timestamp"] as! NSNumber).int64Value { try await checkMobilePlayback(context: context, root: root) }
         }
+        checkDanmakuLogic()
         let precise = try ProtocolJSON.object(Data(#"{"id":18446744073709551615,"larger":123456789012345678901234567890,"text":"12345678901234567890","fraction":1234567890123456.5,"exponent":1234567890123456e2}"#.utf8))
         precondition(precise["id"] as? String == "18446744073709551615")
         precondition(precise["larger"] as? String == "123456789012345678901234567890")
@@ -52,6 +53,20 @@ import Openhongguo
             return try await DramaAPI(resourceDirectory: resources).home(feed: "recommend", offset: 0)
         }
         do { _ = try await cancelled.value; fatalError("Cancelled request was accepted") } catch is CancellationError { }
+        let detailAPI = DramaAPI(resourceDirectory: resources)
+        let noCast = await detailAPI.castMembers([:])
+        precondition(noCast.isEmpty)
+        let cast = await detailAPI.castMembers(["celebrities": [
+            ["celebrity_id": "7001", "nickname": " 范祺 ", "role_name": " 沈如锦 ",
+             "avatar": "https:\\/\\/p3-example.test\\/a.jpg", "intro": " <b>代表作</b>《测试》 "],
+            ["nickname": " \n ", "role_name": "应跳过"],
+            ["nickname": "聂禹琪", "intro": "<p> </p>"],
+        ]])
+        precondition(cast == [
+            CastMember(celebrityID: "7001", nickname: "范祺", roleName: "沈如锦",
+                       avatarURL: "https://p3-example.test/a.jpg", intro: "代表作《测试》"),
+            CastMember(celebrityID: "", nickname: "聂禹琪", roleName: "", avatarURL: "", intro: ""),
+        ])
         // 猜你喜欢: request shape for anonymous and signed-in rounds, parsing, and pager batching.
         let anonymous = try GuessFeed.request(account: nil, session: "", offset: 0, rticket: 1)
         let anonymousQuery = URLComponents(url: anonymous.url!, resolvingAgainstBaseURL: false)!.queryItems!
@@ -332,6 +347,13 @@ import Openhongguo
         // ByteVC2-only episodes say so; inline rows without encryption metadata may use a fully verified fallback.
         let trackAPI = DramaAPI(resourceDirectory: resources)
         let videoRow = { (codec: String, url: String, side: Int) -> [String: Any] in ["codec_type":codec,"vwidth":side,"vheight":side * 16 / 9,"definition":"\(side)p","main_url":url] }
+        var mirrored = videoRow("h264", "https://v1.qznovelvod.com/main.mp4", 1080)
+        mirrored["encrypt_info"] = ["encrypt": false]
+        mirrored["backup_url"] = "https://v2.fqnovelvod.com/same.mp4"
+        mirrored["backup_url_list"] = ["https://untrusted.test/m.mp4", "https://v2.fqnovelvod.com/same.mp4"]
+        let singleRow = try await trackAPI.modelTrack(["video_list": [mirrored,
+            videoRow("h265", "https://v3.qznovelvod.com/other.mp4", 720)]])
+        precondition(singleRow.backupURLs.map(\.absoluteString) == ["https://v2.fqnovelvod.com/same.mp4"])
         do {
             _ = try await trackAPI.modelTrack(["video_list":[videoRow("bytevc2","https://v1.qznovelvod.com/a.mp4",1080)]])
             fatalError("A ByteVC2-only episode has no playable track")
@@ -422,6 +444,14 @@ import Openhongguo
         precondition(above.url.lastPathComponent == "1080.mp4", above.url.absoluteString)
         let failedRead = try await trackAPI.modelTrack(incompleteModel) { _ in throw URLError(.timedOut) }
         precondition(failedRead.url.absoluteString == "https://v1.qznovelvod.com/nokey.mp4" && !failedRead.encrypted)
+        do {
+            _ = try await trackAPI.modelTrack(incompleteModel) { _ in throw DramaAPI.PlaybackRefusal(retryAfterStatus: 502) }
+            fatalError("A fallback that requested backoff must stop the lookup")
+        } catch is DramaAPI.PlaybackRefusal {}
+        do {
+            _ = try await trackAPI.modelTrack(incompleteModel) { _ in throw URLError(.cancelled) }
+            fatalError("A cancelled fallback must stop the lookup")
+        } catch is CancellationError {}
         // A keyed row still wins over an undeclared one of the same rank and size.
         var mixed = incompleteModel
         mixed["video_list"] = [videoRow("h264","https://v1.qznovelvod.com/nokey.mp4",1080), videoRow("h264","https://v1.qznovelvod.com/keyed.mp4",720).merging(["spade_a":spadeSample]) { $1 }]
@@ -526,11 +556,12 @@ import Openhongguo
         // A server rejection still ends the fetch at once.
         let rejectCalls = RouteCalls()
         do {
-            _ = try await trackAPI.playbackTrack(identity: { routeIdentity }, read: { route, _ in rejectCalls.routes.append(route); throw HGError.message("当前分集暂未提供播放信息") }, use: { _ in fatalError("No model") })
+            _ = try await trackAPI.playbackTrack(identity: { routeIdentity }, read: { route, _ in rejectCalls.routes.append(route); throw DramaAPI.PlaybackRefusal(code: 1003) }, use: { _ in fatalError("No model") })
             fatalError("Rejected episodes must fail")
-        } catch { precondition(error.localizedDescription == "当前分集暂未提供播放信息" && rejectCalls.routes.count == 1) }
+        } catch is DramaAPI.PlaybackRefusal { precondition(rejectCalls.routes.count == 1) }
         print("PASS: video_tab playback model request and parsing.")
         try await playbackRecoveryChecks(resources: resources)
+        try await checkPublicEpisodes(resources: resources)
         print("PASS: 4 original Node signing vectors; exact 20/30-digit IDs; numeric-token parsing; binary/gzip body digest; URL spaces; cancelled query rejects before HTTP.")
     }
 
